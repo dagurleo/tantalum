@@ -553,39 +553,55 @@ halved table memory (18.9 → 9.4 bytes per key at 1M keys): 2M × 16 B went fro
 A c7a.8xlarge: 32 AMD EPYC 9R14 cores (no SMT), Ubuntu 24.04, kernel 7.0.
 Servers pinned to cores 0..N-1 and memtier to cores 8-31 (24 threads × 10
 connections) at every N; Redis and Valkey get N I/O threads, Dragonfly N
-proactor threads (on io_uring), memcached `-t N`. 1M keys × 32 B, 1:10
-SET:GET, 2 rounds (`bench/aws/scale.sh`; raw output and caveats:
-`bench/aws/results-c7a-8xlarge.txt`). Total ops/s:
+proactor threads (on io_uring), memcached `-t N`, KeyDB `--server-threads N`,
+and Garnet sizes its thread pool to the N cores it may use. 1M keys × 32 B,
+1:10 SET:GET, means of 2 rotated rounds, Tantalum 0.16.0, 2026-11-04
+(`bench/aws/scale.sh`, Garnet and KeyDB from `bench/docker/others.Dockerfile`;
+raw output and caveats: `bench/aws/results-c7a-8xlarge.txt`). Total ops/s:
 
-| | 1 thread | 2 | 4 | 8 |
+| No pipelining | 1 thread | 2 | 4 | 8 |
 |---|---|---|---|---|
-| **Tantalum, io_uring**, no pipelining | **100k** | **239k** | **488k** | **825k** |
-| Tantalum, per-thread | 80k | 192k | 410k | 683k |
-| Dragonfly | 81k | 190k | 399k | 730k |
-| memcached | 77k | 190k | 387k | 650k |
-| Valkey | 81k | 107k | 303k | 575k |
-| Redis | 78k | 87k | 248k | 484k |
-| **Tantalum, io_uring**, pipeline 16 | **1.13M** | **2.71M** | **5.33M** | **8.36M** |
-| Tantalum, per-thread | 0.96M | 2.23M | 4.62M | 7.50M |
-| memcached | 0.54M | 1.27M | 2.38M | 3.98M |
-| Dragonfly | 0.43M | 1.03M | 1.94M | 3.20M |
-| Valkey | 0.83M | 1.31M | 3.09M | 2.51M |
-| Redis | 0.76M | 0.96M | 2.26M | 2.33M |
+| **Tantalum, io_uring** | **115k** | **233k** | **469k** | **962k** |
+| Tantalum, epoll (per-thread) | 91k | 183k | 391k | 808k |
+| Valkey 9.1.3 | 95k | 99k | 284k | 652k |
+| Redis 8.10.3 | 93k | 84k | 227k | 438k |
+| Dragonfly 2.0.2 | 94k | 188k | 378k | 712k |
+| memcached 1.6.38 | 93k | 185k | 380k | 780k |
+| KeyDB 6.3.4 | 42k | 173k | 343k | 608k |
+| Garnet 2.2.5 | 45k | 134k | 290k | 608k |
 
+| Pipeline 16 | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| **Tantalum, io_uring** | **1.35M** | **2.60M** | **5.12M** | **10.23M** |
+| Tantalum, epoll (per-thread) | 1.10M | 2.17M | 4.45M | 9.08M |
+| Valkey 9.1.3 | 0.99M | 1.25M | 2.85M | 2.70M |
+| Redis 8.10.3 | 0.90M | 0.92M | 2.22M | 2.57M |
+| Dragonfly 2.0.2 | 0.53M | 1.02M | 1.93M | 3.67M |
+| memcached 1.6.38 | 0.64M | 1.22M | 2.31M | 4.82M |
+| KeyDB 6.3.4 | 0.39M | 0.87M | 1.08M | 1.24M |
+| Garnet 2.2.5 | 0.54M | 1.43M | 3.08M | 6.41M |
+
+RSS after loading the 1M keys (1-thread pass): **Tantalum 68 MB**, Valkey 93,
+Redis 104, Dragonfly 123, memcached 131, KeyDB 136, Garnet 297.
+
+- Tantalum on io_uring is the fastest at every thread count: +21–24% over the
+  next server without pipelining, +36% (1 thread) to +81% pipelined.
+- Tantalum on epoll, the mode on hosts that block io_uring (Railway), trails
+  without pipelining at 1 and 2 threads: 91k against Valkey's 95k, 183k against
+  Dragonfly's 188k. It leads from 4 threads, and pipelined everywhere. A
+  profile at 1 thread: Tantalum and Valkey make the same syscalls (0.95
+  receives and sends per command) and Tantalum's own code takes less CPU (15%
+  of samples against 20%), but waking the client on each reply costs it more
+  in the kernel (15% against 10%). Valkey sends all of a loop's replies
+  together before it waits again (`beforeSleep`); Tantalum sends each as it's
+  ready. That's the lead to follow.
 - Per core, a cloud VM does about half the M1 VM's work (syscalls cost more),
   so compare these with each other, not with the tables below.
-- Tantalum on io_uring scales nearly linearly to 4 threads (~120k ops/core
-  without pipelining at 1, 2 and 4) and keeps ~85% per core at 8. Pipelined,
-  8 threads reached 8.4M with memtier near its limit, so that's a floor. A
-  profile at 8 threads showed no lock contention, mostly the kernel's
-  loopback TCP stack: the 20% per-core drop at 2 threads seen in the laptop
-  VM doesn't happen here.
-- The 1-thread column comes from a later pass that ran ~15% slower for every
-  server (a first pass had Tantalum io_uring at 121k / 1.39M and Valkey at
-  97k / 0.98M); the ratios between servers held.
-- With N I/O threads, an idle Valkey kept a core busy for 15+ s after its
-  fill, which skewed the first test of a round; Tantalum per-thread's numbers
-  from 2 threads up are from the second round only.
+- Pipelined at 8 threads Tantalum used 7.8 of 8 cores with memtier near its
+  limit, so those are floors. A profile at 8 threads (0.5.0) showed no lock
+  contention, mostly the kernel's loopback TCP stack.
+- Garnet and KeyDB do poorly with one core and 240 connections; they're built
+  to spread over many.
 
 ### io_uring (Docker Desktop, November 2026)
 

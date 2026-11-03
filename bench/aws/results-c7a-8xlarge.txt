@@ -282,3 +282,268 @@ round 3 new              P1   ops   393862 p50 0.607 p99 0.711 cpu 3.97 ops/core
 round 3 new              P16  ops  4470415 p50 0.855 p99 0.999 cpu 3.95 ops/core  1133009
 round 3 old              P1   ops   395459 p50 0.607 p99 0.711 cpu 3.97 ops/core    99737
 round 3 old              P16  ops  4526490 p50 0.839 p99 0.999 cpu 3.94 ops/core  1148446
+
+# Transactions + streams (0.16.0) against 0.14.0 (main), same box and setup, 2026-11-04, median / best round:
+#   1 thread:   per-thread P1 -0.5% / -3.1% (one high old round: 96.5k against 93-94k), P16 +0.3% / +0.2%;
+#               io_uring P1 -0.0% / -0.5%, P16 -1.2% / -0.6%
+#   4 threads:  per-thread P1 -0.0% / +0.1%, P16 +0.5% / +0.4%; io_uring P1 +0.8% / +1.1%, P16 -0.8% / -0.6%
+#   p99 unchanged; RSS after the fill 69 MB for both. Rows:
+### 1 thread(s)
+round 1 tantalum         P1   ops    93440 p50 2.559 p99 2.751 cpu 0.90 ops/core   103908
+round 1 tantalum         P16  ops  1125462 p50 3.407 p99 3.679 cpu 0.90 ops/core  1250537
+round 1 tantalum-b       P1   ops    96479 p50 2.479 p99 2.655 cpu 0.99 ops/core    97608
+round 1 tantalum-b       P16  ops  1122861 p50 3.407 p99 3.711 cpu 0.90 ops/core  1248768
+round 1 tantalum-uring   P1   ops   118894 p50 2.015 p99 2.223 cpu 0.99 ops/core   120516
+round 1 tantalum-uring   P16  ops  1379206 p50 2.767 p99 3.071 cpu 0.90 ops/core  1535591
+round 1 tantalum-b-uring P1   ops   119550 p50 1.999 p99 2.271 cpu 0.99 ops/core   121153
+round 1 tantalum-b-uring P16  ops  1388131 p50 2.751 p99 3.039 cpu 0.90 ops/core  1545417
+round 2 tantalum-b       P1   ops    93512 p50 2.543 p99 2.863 cpu 0.90 ops/core   104110
+round 2 tantalum-b       P16  ops  1099291 p50 3.487 p99 3.823 cpu 0.90 ops/core  1223946
+round 2 tantalum-uring   P1   ops   118609 p50 2.007 p99 2.287 cpu 0.99 ops/core   120230
+round 2 tantalum-uring   P16  ops  1344879 p50 2.847 p99 3.199 cpu 0.90 ops/core  1499082
+round 2 tantalum-b-uring P1   ops   118749 p50 1.999 p99 2.271 cpu 0.99 ops/core   120376
+round 2 tantalum-b-uring P16  ops  1357162 p50 2.815 p99 3.103 cpu 0.90 ops/core  1512664
+round 2 tantalum         P1   ops    92974 p50 2.559 p99 2.831 cpu 0.90 ops/core   103497
+round 2 tantalum         P16  ops  1104466 p50 3.471 p99 3.759 cpu 0.90 ops/core  1229758
+round 3 tantalum-uring   P1   ops   117912 p50 2.015 p99 2.271 cpu 0.99 ops/core   119530
+round 3 tantalum-uring   P16  ops  1346340 p50 2.831 p99 3.199 cpu 0.90 ops/core  1498858
+round 3 tantalum-b-uring P1   ops   117788 p50 2.015 p99 2.367 cpu 0.99 ops/core   119405
+round 3 tantalum-b-uring P16  ops  1362800 p50 2.799 p99 3.151 cpu 0.99 ops/core  1381478
+round 3 tantalum         P1   ops    93255 p50 2.559 p99 2.879 cpu 0.90 ops/core   103940
+round 3 tantalum         P16  ops  1103810 p50 3.471 p99 3.823 cpu 0.90 ops/core  1227562
+round 3 tantalum-b       P1   ops    93734 p50 2.543 p99 2.927 cpu 0.90 ops/core   104351
+round 3 tantalum-b       P16  ops  1102041 p50 3.471 p99 3.903 cpu 0.90 ops/core  1227076
+round 4 tantalum-b-uring P1   ops   116410 p50 2.047 p99 2.383 cpu 0.90 ops/core   129719
+round 4 tantalum-b-uring P16  ops  1360201 p50 2.815 p99 3.343 cpu 0.99 ops/core  1377653
+round 4 tantalum         P1   ops    92737 p50 2.575 p99 2.911 cpu 0.90 ops/core   103269
+round 4 tantalum         P16  ops  1101001 p50 3.471 p99 3.839 cpu 0.90 ops/core  1225730
+round 4 tantalum-b       P1   ops    93114 p50 2.559 p99 2.847 cpu 0.90 ops/core   103788
+round 4 tantalum-b       P16  ops  1094242 p50 3.503 p99 3.807 cpu 0.90 ops/core  1219484
+round 4 tantalum-uring   P1   ops   115580 p50 2.063 p99 2.319 cpu 0.99 ops/core   117156
+round 4 tantalum-uring   P16  ops  1343034 p50 2.847 p99 3.151 cpu 0.90 ops/core  1498308
+### 4 thread(s)
+round 1 tantalum         P1   ops   398285 p50 0.607 p99 0.671 cpu 3.97 ops/core   100364
+round 1 tantalum         P16  ops  4483388 p50 0.847 p99 0.999 cpu 3.94 ops/core  1138835
+round 1 tantalum-b       P1   ops   397973 p50 0.607 p99 0.671 cpu 3.97 ops/core   100315
+round 1 tantalum-b       P16  ops  4454281 p50 0.855 p99 1.007 cpu 3.94 ops/core  1129307
+round 1 tantalum-uring   P1   ops   482469 p50 0.511 p99 0.591 cpu 3.97 ops/core   121665
+round 1 tantalum-uring   P16  ops  5128313 p50 0.735 p99 0.935 cpu 3.93 ops/core  1303889
+round 1 tantalum-b-uring P1   ops   477199 p50 0.495 p99 0.615 cpu 3.97 ops/core   120295
+round 1 tantalum-b-uring P16  ops  5193428 p50 0.759 p99 0.983 cpu 3.93 ops/core  1320021
+round 2 tantalum-b       P1   ops   396716 p50 0.607 p99 0.695 cpu 3.97 ops/core   100028
+round 2 tantalum-b       P16  ops  4481358 p50 0.847 p99 0.999 cpu 3.94 ops/core  1137339
+round 2 tantalum-uring   P1   ops   477712 p50 0.511 p99 0.631 cpu 3.96 ops/core   120486
+round 2 tantalum-uring   P16  ops  5203073 p50 0.735 p99 0.903 cpu 3.93 ops/core  1322762
+round 2 tantalum-b-uring P1   ops   473819 p50 0.511 p99 0.663 cpu 3.96 ops/core   119529
+round 2 tantalum-b-uring P16  ops  5244049 p50 0.727 p99 0.887 cpu 3.93 ops/core  1334159
+round 2 tantalum         P1   ops   394825 p50 0.607 p99 0.703 cpu 3.96 ops/core    99587
+round 2 tantalum         P16  ops  4504025 p50 0.847 p99 0.999 cpu 3.94 ops/core  1142671
+round 3 tantalum-uring   P1   ops   474585 p50 0.495 p99 0.679 cpu 3.97 ops/core   119678
+round 3 tantalum-uring   P16  ops  5223124 p50 0.727 p99 0.887 cpu 3.93 ops/core  1330354
+round 3 tantalum-b-uring P1   ops   472697 p50 0.471 p99 0.727 cpu 3.96 ops/core   119228
+round 3 tantalum-b-uring P16  ops  5253254 p50 0.719 p99 0.967 cpu 3.94 ops/core  1333859
+round 3 tantalum         P1   ops   396626 p50 0.607 p99 0.695 cpu 3.97 ops/core   100014
+round 3 tantalum         P16  ops  4501880 p50 0.847 p99 0.991 cpu 3.94 ops/core  1142388
+round 3 tantalum-b       P1   ops   395670 p50 0.607 p99 0.703 cpu 3.97 ops/core    99748
+round 3 tantalum-b       P16  ops  4485085 p50 0.847 p99 0.999 cpu 3.94 ops/core  1137940
+
+# Against everything, Tantalum 0.16.0, same box, 2026-11-04: bench/aws/scale.sh with
+# SERVERS="tantalum-uring tantalum valkey redis dragonfly memcached keydb garnet", 2 rounds, in the image
+# bench/docker/others.Dockerfile builds (adds KeyDB 6.3.4 --server-threads N and Garnet 2.2.5 on .NET 10,
+# pinned like the rest). Means of the 2 rounds, ops/s:
+#                   P1:  1 thr    2      4      8       P16:  1 thr   2      4      8
+#   tantalum-uring        115k   233k   469k   962k           1.35M  2.60M  5.12M 10.23M
+#   tantalum (per-thr)     91k   183k   391k   808k           1.10M  2.17M  4.45M  9.08M
+#   valkey                 95k    99k   284k   652k           0.99M  1.25M  2.85M  2.70M
+#   redis                  93k    84k   227k   438k           0.90M  0.92M  2.22M  2.57M
+#   dragonfly              94k   188k   378k   712k           0.53M  1.02M  1.93M  3.67M
+#   memcached              93k   185k   380k   780k           0.64M  1.22M  2.31M  4.82M
+#   keydb                  42k   173k   343k   608k           0.39M  0.87M  1.08M  1.24M
+#   garnet                 45k   134k   290k   608k           0.54M  1.43M  3.08M  6.41M
+#
+# Profile, 1 thread, no pipelining, each server alone on core 0 (perf stat on syscall tracepoints, perf record):
+#   tantalum per-thread  92.9k ops/s: 0.951 recvfrom + 0.951 sendto + 0.016 epoll_wait per command;
+#                        84.9% kernel, 9.3% tantalum, 5.6% libc; _raw_spin_unlock_irqrestore 16.7%, of it
+#                        14.9% in __wake_up_sync_key <- sock_def_readable <- the reply's loopback delivery
+#   valkey               94.4k ops/s: 0.961 read + 0.960 write + 0.004 epoll_wait per command;
+#                        80.5% kernel, 13.6% valkey, 5.9% libc; _raw_spin_unlock_irqrestore 11.5%, 9.9% in the
+#                        same wakeup (from _writeToClient <- handleClientsWithPendingWrites <- beforeSleep)
+#   tantalum io_uring   117.8k ops/s: 0.008 io_uring_enter per command; 89.0% kernel, 10.4% tantalum
+#   Same syscalls and less of our own CPU; the gap is the cost of waking the client, which Valkey pays less
+#   for by sending all of a loop's replies together.
+### 1 server thread(s) on CPU 0-0; memtier on CPU 8-31
+# 7.0.0-1014-aws, 32 CPUs; 1 server thread(s), memtier 24 x 10 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# tantalum 0.16.0 listening on 127.0.0.1:7962 (1 threads, io_uring I/O, no memory limit)
+# tantalum-uring   RSS after the fill   69408 kB
+# tantalum         RSS after the fill   69320 kB
+# valkey           RSS after the fill   94976 kB
+# redis            RSS after the fill  106092 kB
+# dragonfly        RSS after the fill  125996 kB
+# memcached        RSS after the fill  134264 kB
+# keydb            RSS after the fill  139340 kB
+# garnet           RSS after the fill  304160 kB
+round 1 tantalum-uring   P1   ops   116578 p50 2.023 p99 2.255 cpu 0.98 ops/core   119511
+round 1 tantalum-uring   P16  ops  1355939 p50 2.783 p99 3.263 cpu 0.89 ops/core  1528424
+round 1 tantalum         P1   ops    90881 p50 2.559 p99 5.407 cpu 0.87 ops/core   104359
+round 1 tantalum         P16  ops  1110926 p50 3.375 p99 6.495 cpu 0.88 ops/core  1257161
+round 1 valkey           P1   ops    94506 p50 2.479 p99 4.991 cpu 0.89 ops/core   106728
+round 1 valkey           P16  ops   976419 p50 3.823 p99 7.711 cpu 0.89 ops/core  1101671
+round 1 redis            P1   ops    93111 p50 2.495 p99 5.215 cpu 0.88 ops/core   105507
+round 1 redis            P16  ops   896703 p50 4.159 p99 8.383 cpu 0.88 ops/core  1014981
+round 1 dragonfly        P1   ops    93444 p50 2.527 p99 2.799 cpu 0.88 ops/core   105622
+round 1 dragonfly        P16  ops   535023 p50 7.071 p99 11.135 cpu 0.89 ops/core   600592
+round 1 memcached        P1   ops    94121 p50 2.495 p99 4.063 cpu 0.97 ops/core    96998
+round 1 memcached        P16  ops   642387 p50 6.015 p99 11.647 cpu 0.88 ops/core   726309
+round 1 keydb            P1   ops    41887 p50 5.983 p99 9.471 cpu 0.90 ops/core    46510
+round 1 keydb            P16  ops   384862 p50 9.855 p99 20.095 cpu 0.88 ops/core   437020
+round 1 garnet           P1   ops    44115 p50 0.111 p99 0.359 cpu 0.89 ops/core    49395
+round 1 garnet           P16  ops   512806 p50 0.119 p99 307.199 cpu 0.88 ops/core   580507
+round 2 tantalum         P1   ops    91123 p50 2.575 p99 3.871 cpu 0.88 ops/core   103430
+round 2 tantalum         P16  ops  1088659 p50 3.471 p99 3.999 cpu 0.89 ops/core  1228433
+round 2 valkey           P1   ops    94827 p50 2.463 p99 5.119 cpu 0.88 ops/core   107554
+round 2 valkey           P16  ops  1000746 p50 3.743 p99 7.487 cpu 0.89 ops/core  1124661
+round 2 redis            P1   ops    92772 p50 2.527 p99 5.087 cpu 0.89 ops/core   104766
+round 2 redis            P16  ops   895060 p50 4.159 p99 8.575 cpu 0.88 ops/core  1015021
+round 2 dragonfly        P1   ops    94381 p50 2.495 p99 2.879 cpu 0.89 ops/core   106255
+round 2 dragonfly        P16  ops   527315 p50 7.167 p99 11.519 cpu 0.89 ops/core   593173
+round 2 memcached        P1   ops    92816 p50 2.543 p99 4.287 cpu 0.88 ops/core   104955
+round 2 memcached        P16  ops   629578 p50 6.047 p99 10.431 cpu 0.89 ops/core   710468
+round 2 keydb            P1   ops    41469 p50 5.983 p99 9.663 cpu 0.99 ops/core    41881
+round 2 keydb            P16  ops   393967 p50 9.855 p99 12.607 cpu 0.90 ops/core   437455
+round 2 garnet           P1   ops    45128 p50 0.679 p99 0.871 cpu 0.90 ops/core    50115
+round 2 garnet           P16  ops   560241 p50 0.343 p99 0.495 cpu 0.90 ops/core   621455
+round 2 tantalum-uring   P1   ops   112546 p50 2.039 p99 3.407 cpu 0.87 ops/core   129751
+round 2 tantalum-uring   P16  ops  1336624 p50 2.831 p99 3.231 cpu 0.89 ops/core  1500557
+### 2 server thread(s) on CPU 0-1; memtier on CPU 8-31
+# 7.0.0-1014-aws, 32 CPUs; 2 server thread(s), memtier 24 x 10 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# tantalum 0.16.0 listening on 127.0.0.1:7962 (2 threads, io_uring I/O, no memory limit)
+# tantalum-uring   RSS after the fill   73108 kB
+# tantalum         RSS after the fill   72812 kB
+# valkey           RSS after the fill   95928 kB
+# redis            RSS after the fill  107548 kB
+# dragonfly        RSS after the fill  128340 kB
+# memcached        RSS after the fill  134116 kB
+# keydb            RSS after the fill  140340 kB
+# garnet           RSS after the fill  307596 kB
+round 1 tantalum-uring   P1   ops   234183 p50 1.007 p99 1.199 cpu 1.95 ops/core   120381
+round 1 tantalum-uring   P16  ops  2626827 p50 1.431 p99 1.703 cpu 1.94 ops/core  1354843
+round 1 tantalum         P1   ops   183450 p50 1.279 p99 2.511 cpu 1.94 ops/core    94691
+round 1 tantalum         P16  ops  2189105 p50 1.735 p99 1.975 cpu 1.78 ops/core  1227298
+round 1 valkey           P1   ops    99037 p50 2.271 p99 8.255 cpu 1.82 ops/core    54485
+round 1 valkey           P16  ops  1251583 p50 2.943 p99 7.679 cpu 1.85 ops/core   677575
+round 1 redis            P1   ops    84824 p50 2.719 p99 5.567 cpu 0.89 ops/core    95329
+round 1 redis            P16  ops   963155 p50 4.255 p99 7.679 cpu 1.08 ops/core   894129
+round 1 dragonfly        P1   ops   188680 p50 1.287 p99 1.735 cpu 1.80 ops/core   104883
+round 1 dragonfly        P16  ops  1019599 p50 3.615 p99 7.615 cpu 1.77 ops/core   576882
+round 1 memcached        P1   ops   189500 p50 1.239 p99 1.519 cpu 1.95 ops/core    97395
+round 1 memcached        P16  ops  1221890 p50 2.799 p99 6.303 cpu 1.74 ops/core   702314
+round 1 keydb            P1   ops   175377 p50 1.303 p99 1.655 cpu 1.98 ops/core    88554
+round 1 keydb            P16  ops   862801 p50 4.319 p99 8.831 cpu 1.78 ops/core   483828
+round 1 garnet           P1   ops   146927 p50 1.599 p99 3.215 cpu 1.81 ops/core    81069
+round 1 garnet           P16  ops  1556277 p50 2.415 p99 4.095 cpu 1.80 ops/core   864857
+round 2 tantalum         P1   ops   182332 p50 1.279 p99 1.527 cpu 1.93 ops/core    94243
+round 2 tantalum         P16  ops  2160653 p50 1.751 p99 1.999 cpu 1.96 ops/core  1102600
+round 2 valkey           P1   ops    99671 p50 2.255 p99 8.255 cpu 1.90 ops/core    52505
+round 2 valkey           P16  ops  1253799 p50 2.959 p99 6.623 cpu 1.86 ops/core   675314
+round 2 redis            P1   ops    83628 p50 2.735 p99 5.759 cpu 0.89 ops/core    94350
+round 2 redis            P16  ops   882876 p50 4.351 p99 10.495 cpu 1.00 ops/core   884441
+round 2 dragonfly        P1   ops   188248 p50 1.295 p99 1.743 cpu 1.80 ops/core   104467
+round 2 dragonfly        P16  ops  1023503 p50 3.599 p99 7.615 cpu 1.76 ops/core   580403
+round 2 memcached        P1   ops   181061 p50 1.279 p99 3.231 cpu 1.93 ops/core    93868
+round 2 memcached        P16  ops  1225993 p50 2.783 p99 6.111 cpu 1.75 ops/core   701662
+round 2 keydb            P1   ops   171037 p50 1.327 p99 1.727 cpu 1.98 ops/core    86301
+round 2 keydb            P16  ops   869020 p50 4.351 p99 4.767 cpu 1.80 ops/core   482102
+round 2 garnet           P1   ops   121953 p50 2.063 p99 7.039 cpu 1.76 ops/core    69295
+round 2 garnet           P16  ops  1310131 p50 3.039 p99 9.215 cpu 1.75 ops/core   746566
+round 2 tantalum-uring   P1   ops   231875 p50 1.015 p99 1.207 cpu 1.95 ops/core   119069
+round 2 tantalum-uring   P16  ops  2575198 p50 1.463 p99 2.719 cpu 1.93 ops/core  1332217
+### 4 server thread(s) on CPU 0-3; memtier on CPU 8-31
+# 7.0.0-1014-aws, 32 CPUs; 4 server thread(s), memtier 24 x 10 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# tantalum 0.16.0 listening on 127.0.0.1:7962 (4 threads, io_uring I/O, no memory limit)
+# tantalum-uring   RSS after the fill   73756 kB
+# tantalum         RSS after the fill   73064 kB
+# valkey           RSS after the fill   96796 kB
+# redis            RSS after the fill  108196 kB
+# dragonfly        RSS after the fill  132088 kB
+# memcached        RSS after the fill  134392 kB
+# keydb            RSS after the fill  141836 kB
+# garnet           RSS after the fill  306100 kB
+round 1 tantalum-uring   P1   ops   471482 p50 0.479 p99 0.671 cpu 3.87 ops/core   121799
+round 1 tantalum-uring   P16  ops  5094040 p50 0.743 p99 0.967 cpu 3.90 ops/core  1307416
+round 1 tantalum         P1   ops   390845 p50 0.607 p99 0.759 cpu 3.91 ops/core   100088
+round 1 tantalum         P16  ops  4440234 p50 0.855 p99 1.023 cpu 3.92 ops/core  1133395
+round 1 valkey           P1   ops   283368 p50 0.783 p99 2.415 cpu 3.72 ops/core    76142
+round 1 valkey           P16  ops  2895975 p50 1.239 p99 4.543 cpu 3.89 ops/core   743768
+round 1 redis            P1   ops   227862 p50 0.887 p99 4.319 cpu 2.55 ops/core    89332
+round 1 redis            P16  ops  2229904 p50 1.319 p99 5.215 cpu 2.75 ops/core   812320
+round 1 dragonfly        P1   ops   360807 p50 0.607 p99 3.567 cpu 3.64 ops/core    99092
+round 1 dragonfly        P16  ops  1914869 p50 1.895 p99 4.319 cpu 3.45 ops/core   554597
+round 1 memcached        P1   ops   384744 p50 0.607 p99 1.183 cpu 3.92 ops/core    98110
+round 1 memcached        P16  ops  2308092 p50 1.351 p99 4.991 cpu 3.43 ops/core   672826
+round 1 keydb            P1   ops   341932 p50 0.623 p99 1.215 cpu 3.96 ops/core    86325
+round 1 keydb            P16  ops  1075827 p50 3.327 p99 6.719 cpu 3.61 ops/core   298150
+round 1 garnet           P1   ops   287448 p50 0.911 p99 1.959 cpu 3.55 ops/core    80934
+round 1 garnet           P16  ops  3050697 p50 1.319 p99 2.575 cpu 3.58 ops/core   851517
+round 2 tantalum         P1   ops   390590 p50 0.607 p99 0.719 cpu 3.92 ops/core    99642
+round 2 tantalum         P16  ops  4468351 p50 0.847 p99 1.015 cpu 3.91 ops/core  1141832
+round 2 valkey           P1   ops   284742 p50 0.775 p99 2.367 cpu 3.72 ops/core    76471
+round 2 valkey           P16  ops  2810435 p50 1.247 p99 5.375 cpu 3.87 ops/core   726823
+round 2 redis            P1   ops   225154 p50 0.895 p99 4.287 cpu 2.53 ops/core    89059
+round 2 redis            P16  ops  2214493 p50 1.239 p99 5.407 cpu 2.51 ops/core   880940
+round 2 dragonfly        P1   ops   395037 p50 0.615 p99 0.831 cpu 3.95 ops/core   100082
+round 2 dragonfly        P16  ops  1936194 p50 1.879 p99 4.191 cpu 3.46 ops/core   559897
+round 2 memcached        P1   ops   375392 p50 0.615 p99 1.183 cpu 3.91 ops/core    96049
+round 2 memcached        P16  ops  2302145 p50 1.351 p99 5.023 cpu 3.43 ops/core   670866
+round 2 keydb            P1   ops   344049 p50 0.623 p99 1.199 cpu 3.96 ops/core    86797
+round 2 keydb            P16  ops  1093873 p50 3.279 p99 6.559 cpu 3.61 ops/core   303116
+round 2 garnet           P1   ops   292934 p50 0.911 p99 1.455 cpu 3.93 ops/core    74474
+round 2 garnet           P16  ops  3114357 p50 1.247 p99 2.159 cpu 3.58 ops/core   868775
+round 2 tantalum-uring   P1   ops   466797 p50 0.527 p99 0.631 cpu 3.88 ops/core   120196
+round 2 tantalum-uring   P16  ops  5148226 p50 0.751 p99 0.967 cpu 3.90 ops/core  1320217
+### 8 server thread(s) on CPU 0-7; memtier on CPU 8-31
+# 7.0.0-1014-aws, 32 CPUs; 8 server thread(s), memtier 24 x 10 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# tantalum 0.16.0 listening on 127.0.0.1:7962 (8 threads, io_uring I/O, no memory limit)
+# tantalum-uring   RSS after the fill   74892 kB
+# tantalum         RSS after the fill   73796 kB
+# valkey           RSS after the fill   97468 kB
+# redis            RSS after the fill  110104 kB
+# dragonfly        RSS after the fill  138604 kB
+# memcached        RSS after the fill  134896 kB
+# keydb            RSS after the fill  145628 kB
+# garnet           RSS after the fill  296184 kB
+round 1 tantalum-uring   P1   ops   963100 p50 0.231 p99 0.375 cpu 7.84 ops/core   122799
+round 1 tantalum-uring   P16  ops 10071111 p50 0.375 p99 0.607 cpu 7.74 ops/core  1301396
+round 1 tantalum         P1   ops   808128 p50 0.295 p99 0.351 cpu 7.85 ops/core   102935
+round 1 tantalum         P16  ops  8968223 p50 0.415 p99 0.551 cpu 7.77 ops/core  1154483
+round 1 valkey           P1   ops   649902 p50 0.343 p99 1.159 cpu 7.35 ops/core    88406
+round 1 valkey           P16  ops  2649236 p50 1.391 p99 4.287 cpu 7.81 ops/core   339027
+round 1 redis            P1   ops   483845 p50 0.399 p99 3.247 cpu 5.29 ops/core    91428
+round 1 redis            P16  ops  2588027 p50 1.479 p99 1.735 cpu 3.47 ops/core   745756
+round 1 dragonfly        P1   ops   771147 p50 0.295 p99 1.615 cpu 7.61 ops/core   101315
+round 1 dragonfly        P16  ops  3681826 p50 1.007 p99 1.935 cpu 7.85 ops/core   469217
+round 1 memcached        P1   ops   782473 p50 0.279 p99 0.591 cpu 7.82 ops/core   100080
+round 1 memcached        P16  ops  4750083 p50 0.695 p99 2.447 cpu 7.54 ops/core   629657
+round 1 keydb            P1   ops   584271 p50 0.311 p99 0.783 cpu 7.92 ops/core    73790
+round 1 keydb            P16  ops  1248641 p50 2.703 p99 7.263 cpu 7.22 ops/core   173061
+round 1 garnet           P1   ops   604074 p50 0.391 p99 0.607 cpu 7.74 ops/core    78061
+round 1 garnet           P16  ops  6368808 p50 0.591 p99 0.847 cpu 7.73 ops/core   824239
+round 2 tantalum         P1   ops   808176 p50 0.295 p99 0.351 cpu 7.85 ops/core   102912
+round 2 tantalum         P16  ops  9185705 p50 0.407 p99 0.527 cpu 7.78 ops/core  1180672
+round 2 valkey           P1   ops   653254 p50 0.343 p99 1.151 cpu 7.37 ops/core    88688
+round 2 valkey           P16  ops  2750876 p50 1.383 p99 1.503 cpu 7.82 ops/core   351831
+round 2 redis            P1   ops   391236 p50 0.399 p99 3.775 cpu 4.36 ops/core    89683
+round 2 redis            P16  ops  2544613 p50 1.503 p99 1.759 cpu 3.43 ops/core   740965
+round 2 dragonfly        P1   ops   652997 p50 0.271 p99 3.215 cpu 6.71 ops/core    97360
+round 2 dragonfly        P16  ops  3648661 p50 1.015 p99 1.967 cpu 7.84 ops/core   465205
+round 2 memcached        P1   ops   778013 p50 0.287 p99 0.591 cpu 7.81 ops/core    99607
+round 2 memcached        P16  ops  4882979 p50 0.679 p99 2.591 cpu 7.54 ops/core   647961
+round 2 keydb            P1   ops   631424 p50 0.319 p99 0.719 cpu 7.92 ops/core    79711
+round 2 keydb            P16  ops  1239807 p50 2.735 p99 7.263 cpu 7.22 ops/core   171781
+round 2 garnet           P1   ops   610927 p50 0.391 p99 0.655 cpu 7.74 ops/core    78968
+round 2 garnet           P16  ops  6454693 p50 0.583 p99 0.991 cpu 7.76 ops/core   832191
+round 2 tantalum-uring   P1   ops   960683 p50 0.247 p99 0.367 cpu 7.81 ops/core   122977
+round 2 tantalum-uring   P16  ops 10386641 p50 0.359 p99 0.559 cpu 7.77 ops/core  1337030

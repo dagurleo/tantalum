@@ -50,6 +50,14 @@ start valkey 7964 valkey-server --port 7964 --save '' --appendonly no "${io_thre
 start redis 7967 redis-server --port 7967 --save '' --appendonly no "${io_threads[@]}"
 # Dragonfly on its default I/O: io_uring where allowed (--privileged here).
 start dragonfly 7968 dragonfly --bind 127.0.0.1 --port 7968 --proactor_threads "$THREADS" --dbfilename=
+# In the image bench/docker/others.Dockerfile builds. Garnet sizes its
+# thread pool to the cores it may use (SERVER_CPUS).
+if command -v keydb-server >/dev/null; then
+  start keydb 7969 keydb-server --port 7969 --save '' --appendonly no --server-threads "$THREADS"
+fi
+if [ -x /opt/garnet/GarnetServer ]; then
+  start garnet 7970 /opt/garnet/GarnetServer --bind 127.0.0.1 --port 7970
+fi
 if [ -n "${TANTALUM_B:-}" ]; then
   start tantalum-b 7965 "$TANTALUM_B" --port 7965 --threads "$THREADS" --io per-thread
   start tantalum-b-uring 7966 "$TANTALUM_B" --port 7966 --threads "$THREADS" --io uring
@@ -78,6 +86,9 @@ done
 # Let the servers settle: with I/O threads, Valkey keeps a core busy for a
 # while after the fill, taking it from whichever server is tested first.
 sleep "${SETTLE:-30}"
+for s in "${SERVERS[@]}"; do
+  printf '# %-16s RSS after the fill %7d kB\n' "$s" "$(awk '/^VmRSS/ { print $2 }' "/proc/${PID[$s]}/status")"
+done
 
 for round in $(seq 1 "$ROUNDS"); do
   n=${#SERVERS[@]}
