@@ -2,7 +2,7 @@
 //! every command run against a small store with a memory limit. Nothing may
 //! panic, and the parser must always make progress.
 //!
-//! cargo +nightly fuzz run commands -- -max_total_time=600
+//! cargo +nightly fuzz run commands corpus/commands seeds/commands -- -max_total_time=600
 
 #![no_main]
 

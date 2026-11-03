@@ -508,7 +508,7 @@ cargo clippy --all-targets
 # Run the tests under AddressSanitizer (needs a nightly toolchain):
 RUSTFLAGS=-Zsanitizer=address cargo +nightly test --lib --tests --target aarch64-apple-darwin --target-dir target/asan
 # Coverage-guided fuzzing of the parser and every command (cargo install cargo-fuzz):
-cd fuzz && cargo +nightly fuzz run commands -- -max_total_time=600
+cd fuzz && cargo +nightly fuzz run commands corpus/commands seeds/commands -- -max_total_time=600
 ```
 
 `tests/fuzz.rs` runs 300,000 random commands (valid and not) on every

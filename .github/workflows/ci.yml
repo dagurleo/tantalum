@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  fuzz:
+    name: Fuzz (2 minutes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      # New inputs go to the (ignored) corpus; the committed seeds are only read.
+      - run: mkdir -p corpus/commands && cargo fuzz run commands corpus/commands seeds/commands -- -max_total_time=120 -max_len=4096
+        working-directory: fuzz
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+  docker:
+    name: Deploy image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/Dockerfile -t tantalum .
+      # Starts, answers PING, and shuts down cleanly on SIGTERM.
+      - run: |
+          docker run -d --name t -p 6379:6379 tantalum
+          for i in $(seq 1 20); do
+            reply=$(printf 'PING\r\n' | timeout 2 nc -q 1 127.0.0.1 6379 || true)
+            [ "$reply" = "+PONG"$'\r' ] && break
+            sleep 0.5
+          done
+          echo "reply: $reply"
+          [ "$reply" = "+PONG"$'\r' ]
+          docker stop t
+          docker logs t
+          [ "$(docker inspect -f '{{.State.ExitCode}}' t)" = 0 ]

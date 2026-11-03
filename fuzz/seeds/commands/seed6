@@ -1,0 +1,15 @@
+*3
+$6
+CONFIG
+$3
+GET
+$4
+max*
+*1
+$4
+INFO
+*2
+$8
+FLUSHALL
+$5
+ASYNC
