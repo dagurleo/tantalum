@@ -32,7 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
@@ -53,7 +55,7 @@ jobs:
       - run: docker build -f deploy/Dockerfile -t tantalum .
       # Starts, answers PING, and shuts down cleanly on SIGTERM.
       - run: |
-          docker run -d --name t -p 6379:6379 tantalum
+          docker run -d --name tantalum-ci -p 6379:6379 tantalum
           for i in $(seq 1 20); do
             reply=$(printf 'PING\r\n' | timeout 2 nc -q 1 127.0.0.1 6379 || true)
             [ "$reply" = "+PONG"$'\r' ] && break
@@ -61,6 +63,6 @@ jobs:
           done
           echo "reply: $reply"
           [ "$reply" = "+PONG"$'\r' ]
-          docker stop t
-          docker logs t
-          [ "$(docker inspect -f '{{.State.ExitCode}}' t)" = 0 ]
+          docker stop tantalum-ci
+          docker logs tantalum-ci
+          [ "$(docker inspect -f '{{.State.ExitCode}}' tantalum-ci)" = 0 ]
