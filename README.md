@@ -21,6 +21,12 @@ redis-cli GET greeting
 
 Any Redis client, `redis-cli`, `redis-cli --pipe`, and `redis-benchmark` work as is.
 
+To deploy, `deploy/Dockerfile` builds a small image with just the binary
+(`docker build -f deploy/Dockerfile .`); on Railway, set
+`RAILWAY_DOCKERFILE_PATH=deploy/Dockerfile` and put options in the start
+command. It listens on `::` (IPv4 and IPv6) with no TLS, so keep it on a
+private network and set a password.
+
 ## Commands
 
 Replies match Redis 7 byte for byte, errors included, as far as the tests
@@ -64,7 +70,7 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   or three cache misses in turn, which cost ~45% of throughput (measured by
   shrinking the data to 10k keys). Prefetching won back +46% per core at
   pipeline 16 and lowered p99; a batch of one command skips it.
-- **An event loop per thread** (`--io per-thread`, the default), like memcached:
+- **An event loop per thread** (`--io per-thread`, the default where io_uring isn't available), like memcached:
   each thread runs its own single-threaded runtime, the main thread hands it
   connections round-robin, and a connection stays on that thread for life.
   Tokio's shared work-stealing runtime (`--io shared`) can run a ready
@@ -73,18 +79,19 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   syscalls, that overhead decided the race: per-thread was 19% faster and
   overtook memcached. The trade-off: a few very busy connections can't be
   rebalanced across threads.
-- **io_uring** (`--io uring`, experimental): per-thread loops on
-  [monoio](https://github.com/bytedance/monoio), which uses io_uring where
-  the kernel and container allow it, and otherwise falls back to epoll/kqueue.
-  The startup line says which one it got. The ring setup decides whether it
+- **io_uring** (`--io uring`, the default where the kernel and container
+  allow it): per-thread loops on [monoio](https://github.com/bytedance/monoio).
+  On a 32-core EPYC it beat the epoll loop at every thread count (+17–25%
+  without pipelining, +12–21% with, and lower p99; see below). The startup
+  line says which I/O it got. The ring setup decides whether it
   pays off: by default the kernel interrupts the thread to post each
   completion, which made io_uring 8–13% *slower* than the tokio loop. With
   `DEFER_TASKRUN` (Linux 6.1+, falling back to `COOP_TASKRUN`, then plain),
   completions are posted in one batch when the loop runs out of work, and it
   became 2–3% faster with ~20% lower p99 (see below). Docker's and Railway's
   default seccomp profiles block io_uring. monoio's epoll fallback was 17–22%
-  slower than the tokio loop, so where io_uring is unavailable, `--io uring`
-  says so and runs per-thread instead.
+  slower than the tokio loop, so where io_uring is unavailable Tantalum runs
+  per-thread instead (and says so if `--io uring` was asked for).
 - **Parser** (`src/resp.rs`): zero-copy and restartable. Arguments are ranges
   into the read buffer, so a command split across TCP reads costs nothing extra.
   Binary safe. Same limits as Redis (512 MB bulk, 64 KB inline, 1 GB query buffer).
@@ -131,9 +138,20 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   - `--timeout` closes idle connections (off by default), and
     `--tcp-keepalive` (300 s) probes idle ones so clients that vanished
     without closing don't hold a slot forever.
-  - Read and write buffers count toward `used_memory`, so eviction and the
-    limit leave room for them. That includes a half-received big value, up to
-    the 1 GB query buffer limit.
+  - Idle connections hold almost no buffer memory. On epoll (per-thread and
+    shared), a connection waits for data before taking a read buffer and hands
+    both buffers back once it has nothing left to process; mimalloc's
+    per-thread caches make that cheap. io_uring must post a read buffer before
+    data arrives, so an idle connection keeps 2 KB, grown as reads fill it.
+    10,000 idle connections on Linux: 14 MB on epoll and 43 MB on io_uring,
+    against 92 and 101 MB before (RSS; macOS showed 166 MB against 11 MB for
+    5,000). Paired runs on EC2 put the throughput cost at 0–1.7%
+    (`bench/aws/results-c7a-8xlarge.txt`).
+  - Buffers count toward `used_memory`, so eviction and the limit leave room
+    for them, including a half-received big value up to the 1 GB query buffer
+    limit. Each connection reports changes of 64 KB or more, so that buffers
+    coming and going with every request don't make each one write a shared
+    counter: `mem_clients_normal` shows big buffers, not small transient ones.
   - On SIGTERM or SIGINT, accepting stops and the read side of every socket is
     shut down: each connection finishes the commands it has read, replies,
     sees end of file and closes. Nothing checks a flag per request. The
@@ -272,7 +290,7 @@ how many keys fit in the same limit.
 > oldest inserts first. That skewed results by policy; Dragonfly even scored
 > above a perfect cache. The scripts now use `--randomize` for measured phases.
 
-**Throughput, per-thread I/O** (the default since v0.3;
+**Throughput, per-thread I/O** (the default from v0.3 until io_uring in v0.5;
 `bench/railway/results-io-ab.txt`): 1M keys of 32 bytes, uniform random keys,
 1:10 SET:GET, 4 threads each, three alternating rounds:
 
@@ -324,6 +342,45 @@ v0.1.1's pooled segments, written-page accounting and eager compaction then
 took the 1 GB-limit case from 172 to 155 bytes per key held. v0.2's cuckoo table
 halved table memory (18.9 → 9.4 bytes per key at 1M keys): 2M × 16 B went from
 116 to 97 MB, and the 1 GB-limit case went to 146 bytes per key held.
+
+### Multi-core, AWS EC2 (November 2026)
+
+A c7a.8xlarge: 32 AMD EPYC 9R14 cores (no SMT), Ubuntu 24.04, kernel 7.0.
+Servers pinned to cores 0..N-1 and memtier to cores 8-31 (24 threads × 10
+connections) at every N; Redis and Valkey get N I/O threads, Dragonfly N
+proactor threads (on io_uring), memcached `-t N`. 1M keys × 32 B, 1:10
+SET:GET, 2 rounds (`bench/aws/scale.sh`; raw output and caveats:
+`bench/aws/results-c7a-8xlarge.txt`). Total ops/s:
+
+| | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| **Tantalum, io_uring**, no pipelining | **100k** | **239k** | **488k** | **825k** |
+| Tantalum, per-thread | 80k | 192k | 410k | 683k |
+| Dragonfly | 81k | 190k | 399k | 730k |
+| memcached | 77k | 190k | 387k | 650k |
+| Valkey | 81k | 107k | 303k | 575k |
+| Redis | 78k | 87k | 248k | 484k |
+| **Tantalum, io_uring**, pipeline 16 | **1.13M** | **2.71M** | **5.33M** | **8.36M** |
+| Tantalum, per-thread | 0.96M | 2.23M | 4.62M | 7.50M |
+| memcached | 0.54M | 1.27M | 2.38M | 3.98M |
+| Dragonfly | 0.43M | 1.03M | 1.94M | 3.20M |
+| Valkey | 0.83M | 1.31M | 3.09M | 2.51M |
+| Redis | 0.76M | 0.96M | 2.26M | 2.33M |
+
+- Per core, a cloud VM does about half the M1 VM's work (syscalls cost more),
+  so compare these with each other, not with the tables below.
+- Tantalum on io_uring scales nearly linearly to 4 threads (~120k ops/core
+  without pipelining at 1, 2 and 4) and keeps ~85% per core at 8. Pipelined,
+  8 threads reached 8.4M with memtier near its limit, so that's a floor. A
+  profile at 8 threads showed no lock contention, mostly the kernel's
+  loopback TCP stack: the 20% per-core drop at 2 threads seen in the laptop
+  VM doesn't happen here.
+- The 1-thread column comes from a later pass that ran ~15% slower for every
+  server (a first pass had Tantalum io_uring at 121k / 1.39M and Valkey at
+  97k / 0.98M); the ratios between servers held.
+- With N I/O threads, an idle Valkey kept a core busy for 15+ s after its
+  fill, which skewed the first test of a round; Tantalum per-thread's numbers
+  from 2 threads up are from the second round only.
 
 ### io_uring (Docker Desktop, November 2026)
 
@@ -415,10 +472,10 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
-- **io_uring is measured only in a laptop VM**: +12–17% per core saturated,
-  +2–3% and ~20% lower p99 when not. It needs a real Linux host with io_uring
-  allowed to say whether it should be the default there. Untried: multishot
-  receive and registered buffers.
+- **io_uring extras untried**: multishot receive and registered or provided
+  buffers, which could also let idle connections hold no read buffer.
+- **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
+  of cores before Tantalum does. It needs a separate client machine.
 - **Short pipelined batches start cold**: a batch is one connection's read, so
   with pipeline 16 the first few commands' buckets are requested just before
   they're needed. In 0.4's profile at pipeline 16, the entry prefetch step
@@ -436,10 +493,6 @@ hit rates share the seeding flaw described above.
   might remove them.
 - **Table resizes still rebuild a whole shard's table** (25% at a time, without reading
   keys): sub-millisecond at today's sizes, but a few ms per shard at 100M keys.
-- **Idle connections keep their buffers**: about 32 KB each (16 KB to read
-  into, 16 KB of reply buffer), now counted in `used_memory`. 10,000 idle
-  pooled connections hold ~320 MB; Redis frees idle query buffers after a few
-  seconds.
 - No `instantaneous_ops_per_sec`, latency histograms or a slow log.
 - The server binds to `127.0.0.1` by default. If you expose it, set a password:
   traffic isn't encrypted (no TLS), so keep it on a private network.

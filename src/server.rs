@@ -44,12 +44,18 @@ use crate::store::{KeyHash, Millis, Store};
 
 /// Minimum free space in the read buffer before each read.
 const READ_RESERVE: usize = 16 * 1024;
+/// A reply buffer's first allocation.
+const WRITE_RESERVE: usize = 16 * 1024;
+/// The read buffer an idle io_uring connection keeps posted: a read must
+/// have its buffer in flight before data arrives. It grows as reads fill it.
+const URING_READ_BUFFER: usize = 2 * 1024;
 /// Flush mid-batch once this many reply bytes are queued, so a pipeline of
 /// big replies can't buffer unbounded memory.
 const FLUSH_THRESHOLD: usize = 64 * 1024;
 /// Max buffered bytes of not-yet-complete commands, as Redis' `client-query-buffer-limit`.
 const MAX_QUERY_BUFFER: usize = 1024 * 1024 * 1024;
-/// Idle buffers larger than this are released after a big request or reply.
+/// Buffers larger than this are released after a big request or reply, even
+/// mid-stream.
 const SHRINK_ABOVE: usize = 1024 * 1024;
 /// Most commands parsed ahead at once, which bounds a batch's memory.
 const MAX_BATCH: usize = 256;
@@ -446,12 +452,13 @@ async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::
     }
     let store = &*ctx.store;
     let mut session = client.session();
-    let mut rbuf: Vec<u8> = Vec::with_capacity(READ_RESERVE);
-    let mut wbuf: Vec<u8> = Vec::with_capacity(READ_RESERVE);
+    let mut rbuf: Vec<u8> = Vec::with_capacity(URING_READ_BUFFER);
+    let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
     loop {
-        if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
-            rbuf.reserve(READ_RESERVE);
+        // Grow by doubling when reads fill it (a big value, a long pipeline).
+        if rbuf.capacity() - rbuf.len() < URING_READ_BUFFER / 2 {
+            rbuf.reserve(rbuf.capacity().max(URING_READ_BUFFER));
         }
         client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
         let filled = rbuf.len();
@@ -466,6 +473,9 @@ async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::
         rbuf = slice.into_inner();
         if result? == 0 {
             return Ok(());
+        }
+        if wbuf.capacity() == 0 {
+            wbuf.reserve(WRITE_RESERVE);
         }
         let now = store.now();
         let mut pos = 0;
@@ -514,11 +524,14 @@ async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::
             flush(&mut socket, wbuf).await?;
             return Ok(());
         }
-        if rbuf.is_empty() && rbuf.capacity() > SHRINK_ABOVE {
-            rbuf = Vec::with_capacity(READ_RESERVE);
-        }
-        if wbuf.capacity() > SHRINK_ABOVE {
-            wbuf = Vec::with_capacity(READ_RESERVE);
+        if rbuf.is_empty() {
+            // Idle until the next request: keep only a small read buffer.
+            if rbuf.capacity() > READ_RESERVE {
+                rbuf = Vec::with_capacity(URING_READ_BUFFER);
+            }
+            wbuf = Vec::new();
+        } else if wbuf.capacity() > SHRINK_ABOVE {
+            wbuf = Vec::new();
         }
     }
 }
@@ -535,28 +548,39 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
     set_keepalive(socket2::SockRef::from(&socket), ctx.settings.tcp_keepalive);
     let store = &*ctx.store;
     let mut session = client.session();
-    // A Vec rather than a BytesMut: after a big request, a BytesMut keeps the
+    // Vecs rather than a BytesMut: after a big request, a BytesMut keeps the
     // whole allocation but reports only its unused tail as capacity, so the
-    // shrink below (and the memory accounting) would miss it.
-    let mut rbuf: Vec<u8> = Vec::with_capacity(READ_RESERVE);
-    let mut wbuf: Vec<u8> = Vec::with_capacity(READ_RESERVE);
+    // shrinking below (and the memory accounting) would miss it. Both are
+    // empty, holding no memory, while the connection waits for a request.
+    let mut rbuf: Vec<u8> = Vec::new();
+    let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
 
     loop {
+        // Wait for data before taking a buffer to read it into. (Not
+        // `readable()`, which queues each wait on a locked list: through
+        // `poll_read_ready` it takes the reader's own waker slot, as reads do.)
+        let ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx));
+        match ctx.settings.timeout {
+            None => ready.await?,
+            Some(timeout) => match tokio::time::timeout(timeout, ready).await {
+                Ok(ready) => ready?,
+                Err(_) => return Ok(()),
+            },
+        }
         if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
             rbuf.reserve(READ_RESERVE);
         }
         client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
-        let read = socket.read_buf(&mut rbuf);
-        let n = match ctx.settings.timeout {
-            None => read.await?,
-            Some(timeout) => match tokio::time::timeout(timeout, read).await {
-                Ok(n) => n?,
-                Err(_) => return Ok(()),
-            },
-        };
-        if n == 0 {
+        // Data is ready, so this reads at once. Through `read_buf` (unlike
+        // `try_read_buf`), a short read tells tokio the socket is drained, so
+        // the next wait doesn't first try a read that finds nothing: that
+        // cost an extra syscall per request.
+        if socket.read_buf(&mut rbuf).await? == 0 {
             return Ok(());
+        }
+        if wbuf.capacity() == 0 {
+            wbuf.reserve(WRITE_RESERVE);
         }
         // One clock read per batch, like Redis' cached time per event loop tick.
         let now = store.now();
@@ -619,11 +643,13 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
             socket.write_all(&wbuf).await?;
             return Ok(());
         }
-        if rbuf.is_empty() && rbuf.capacity() > SHRINK_ABOVE {
-            rbuf = Vec::with_capacity(READ_RESERVE);
-        }
-        if wbuf.capacity() > SHRINK_ABOVE {
-            wbuf = Vec::with_capacity(READ_RESERVE);
+        if rbuf.is_empty() {
+            // Idle until the next request: hold no buffers.
+            rbuf = Vec::new();
+            wbuf = Vec::new();
+            client.set_buffer_bytes(0);
+        } else if wbuf.capacity() > SHRINK_ABOVE {
+            wbuf = Vec::new();
         }
     }
 }

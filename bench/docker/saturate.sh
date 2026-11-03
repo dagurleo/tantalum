@@ -13,6 +13,9 @@
 # --privileged allows both io_uring and perf. TANTALUM can point at a build
 # with frame pointers and line tables for readable profiles. TANTALUM_B adds
 # a second build as tantalum-b and tantalum-b-uring, for A/B runs.
+# SERVER_CPUS and CLIENT_CPUS (taskset lists, e.g. 0-3 and 8-31) pin the
+# servers and memtier to separate cores. With THREADS > 1, Redis and Valkey
+# get that many I/O threads.
 set -uo pipefail
 
 THREADS=${THREADS:-1}
@@ -25,23 +28,30 @@ PROFILE=${PROFILE:-}
 read -ra SERVERS <<<"${SERVERS:-tantalum tantalum-uring memcached valkey}"
 read -ra TESTS <<<"${TESTS:-P1:1 P16:16}"
 
+server_pin=()
+client_pin=()
+[ -n "${SERVER_CPUS:-}" ] && server_pin=(taskset -c "$SERVER_CPUS")
+[ -n "${CLIENT_CPUS:-}" ] && client_pin=(taskset -c "$CLIENT_CPUS")
+io_threads=()
+((THREADS > 1)) && io_threads=(--io-threads "$THREADS")
+
 declare -A PID PORT
 start() {
   local name=$1 port=$2
   shift 2
-  "$@" >"/tmp/$name.log" 2>&1 &
+  "${server_pin[@]}" "$@" >"/tmp/$name.log" 2>&1 &
   PID[$name]=$!
   PORT[$name]=$port
 }
-start tantalum 7961 "$TANTALUM" --port 7961 --threads "$THREADS"
+start tantalum 7961 "$TANTALUM" --port 7961 --threads "$THREADS" --io per-thread
 start tantalum-uring 7962 "$TANTALUM" --port 7962 --threads "$THREADS" --io uring
 start memcached 7963 memcached -u root -l 127.0.0.1 -p 7963 -U 0 -t "$THREADS" -c 4096 -m 8192
-start valkey 7964 valkey-server --port 7964 --save '' --appendonly no
-start redis 7967 redis-server --port 7967 --save '' --appendonly no
+start valkey 7964 valkey-server --port 7964 --save '' --appendonly no "${io_threads[@]}"
+start redis 7967 redis-server --port 7967 --save '' --appendonly no "${io_threads[@]}"
 # Dragonfly on its default I/O: io_uring where allowed (--privileged here).
 start dragonfly 7968 dragonfly --bind 127.0.0.1 --port 7968 --proactor_threads "$THREADS" --dbfilename=
 if [ -n "${TANTALUM_B:-}" ]; then
-  start tantalum-b 7965 "$TANTALUM_B" --port 7965 --threads "$THREADS"
+  start tantalum-b 7965 "$TANTALUM_B" --port 7965 --threads "$THREADS" --io per-thread
   start tantalum-b-uring 7966 "$TANTALUM_B" --port 7966 --threads "$THREADS" --io uring
 fi
 sleep 2
@@ -54,7 +64,7 @@ hz=$(getconf CLK_TCK)
 memtier() {
   local s=$1
   shift
-  memtier_benchmark -s 127.0.0.1 -p "${PORT[$s]}" --protocol="$(proto "$s")" --hide-histogram \
+  "${client_pin[@]}" memtier_benchmark -s 127.0.0.1 -p "${PORT[$s]}" --protocol="$(proto "$s")" --hide-histogram \
     --distinct-client-seed --key-minimum 1 --key-maximum ${KEYS:-1000000} --data-size 32 --random-data "$@"
 }
 
@@ -65,6 +75,9 @@ for s in "${SERVERS[@]}"; do
   memtier "$s" --threads 4 --clients 25 --pipeline 64 --ratio 1:0 --key-pattern P:P -n allkeys \
     >/dev/null 2>&1
 done
+# Let the servers settle: with I/O threads, Valkey keeps a core busy for a
+# while after the fill, taking it from whichever server is tested first.
+sleep "${SETTLE:-30}"
 
 for round in $(seq 1 "$ROUNDS"); do
   n=${#SERVERS[@]}
@@ -110,4 +123,6 @@ if [ -n "$PROFILE" ]; then
       --percent-limit 0.7 2>/dev/null | grep -v '^#' | grep -v '^$' | head -45
   done
 fi
+# Wait until they are gone, so a following run can bind the same ports.
 kill -9 "${PID[@]}" 2>/dev/null
+wait 2>/dev/null

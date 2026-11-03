@@ -1372,7 +1372,8 @@ async fn info_metrics() {
     assert_eq!(info_field(&info, "total_commands_processed"), 7);
     assert_eq!(info_field(&info, "connected_clients"), 1);
     assert_eq!(info_field(&info, "total_connections_received"), 1);
-    assert!(info_field(&info, "mem_clients_normal") >= 32 * 1024);
+    // An idle connection holds no buffers (and small ones aren't counted).
+    assert_eq!(info_field(&info, "mem_clients_normal"), 0);
     assert!(info_field(&info, "process_id") > 0);
 }
 

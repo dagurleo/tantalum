@@ -44,6 +44,13 @@ impl Default for Settings {
     }
 }
 
+/// A connection reports its buffer memory to the store only once it has
+/// changed by this much: buffers come and go with every request (an idle
+/// connection holds none), and reporting each would make every request
+/// write one shared counter. So the count shows big buffers (a large value
+/// or reply), within this much per connection.
+const CLIENT_MEMORY_SLACK: usize = 64 * 1024;
+
 /// Counter slots, one per thread (modulo this), so threads don't contend on
 /// the counters' cache lines.
 const COUNTER_SLOTS: usize = 64;
@@ -122,7 +129,7 @@ impl Context {
         Some(Client {
             ctx: self,
             id,
-            buffers: 0,
+            reported: 0,
         })
     }
 
@@ -225,8 +232,8 @@ pub struct ServerStats {
 pub struct Client<'a> {
     ctx: &'a Context,
     id: u64,
-    /// The connection's buffer bytes, as counted against `maxmemory`.
-    buffers: usize,
+    /// The connection's buffer bytes as last reported to the store.
+    reported: usize,
 }
 
 impl Client<'_> {
@@ -244,20 +251,24 @@ impl Client<'_> {
     }
 
     /// Records the connection's buffer capacity, which counts against
-    /// `maxmemory` like stored data, as in Redis.
+    /// `maxmemory` like stored data, as in Redis (see `CLIENT_MEMORY_SLACK`).
     pub fn set_buffer_bytes(&mut self, bytes: usize) {
-        if bytes != self.buffers {
-            self.ctx
-                .store
-                .add_client_memory(bytes as isize - self.buffers as isize);
-            self.buffers = bytes;
+        if bytes.abs_diff(self.reported) >= CLIENT_MEMORY_SLACK {
+            self.report(bytes);
         }
+    }
+
+    fn report(&mut self, bytes: usize) {
+        self.ctx
+            .store
+            .add_client_memory(bytes as isize - self.reported as isize);
+        self.reported = bytes;
     }
 }
 
 impl Drop for Client<'_> {
     fn drop(&mut self) {
-        self.set_buffer_bytes(0);
+        self.report(0);
         self.ctx.clients.lock().remove(&self.id);
         self.ctx.connected.fetch_sub(1, Relaxed);
     }

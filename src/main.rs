@@ -17,12 +17,12 @@ Options:
   --bind <ADDR>     Address to listen on [default: 127.0.0.1]
   --port <PORT>     Port to listen on [default: 6379]
   --threads <N>     Worker threads [default: number of CPUs]
-  --io <MODE>       per-thread: an event loop per thread, each connection
-                    pinned to one; shared: one work-stealing runtime, which
-                    balances a few very busy connections better; uring
-                    (experimental): per-thread on io_uring where the kernel
-                    and container allow it, otherwise the same as per-thread
-                    [default: per-thread]
+  --io <MODE>       uring: an event loop per thread on io_uring, each
+                    connection pinned to one; per-thread: the same on
+                    epoll/kqueue; shared: one work-stealing runtime, which
+                    balances a few very busy connections better
+                    [default: uring where the kernel and container allow it,
+                    otherwise per-thread]
   --shards <N>      Store shards, rounded up to a power of two
                     [default: 256, or 1 per 4 MB of --maxmemory between 16 and 256]
   --maxmemory <SIZE>
@@ -51,7 +51,8 @@ struct Config {
     bind: String,
     port: u16,
     threads: usize,
-    io: Io,
+    /// `None`: io_uring where available, otherwise per-thread.
+    io: Option<Io>,
     store: store::Config,
     settings: Settings,
 }
@@ -123,9 +124,7 @@ fn parse_args() -> Result<Config, String> {
         bind: "127.0.0.1".into(),
         port: 6379,
         threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
-        // Faster than shared in every benchmark so far: +19% without
-        // pipelining, +8% with.
-        io: Io::PerThread,
+        io: None,
         store: store::Config::default(),
         settings: Settings {
             password: std::env::var("TANTALUM_REQUIREPASS")
@@ -149,12 +148,12 @@ fn parse_args() -> Result<Config, String> {
             "--threads" => config.threads = value.parse::<usize>().map_err(|_| bad(()))?.max(1),
             "--shards" => config.store.shards = value.parse().map_err(|_| bad(()))?,
             "--io" => {
-                config.io = match value.as_str() {
+                config.io = Some(match value.as_str() {
                     "shared" => Io::Shared,
                     "per-thread" => Io::PerThread,
                     "uring" => Io::Uring,
                     _ => return Err(bad(())),
-                }
+                })
             }
             "--maxmemory" => config.store.maxmemory = parse_size(&value).ok_or_else(|| bad(()))?,
             "--maxmemory-policy" => {
@@ -194,13 +193,19 @@ fn main() -> std::io::Result<()> {
         eprintln!("error: {e}\n\n{USAGE}");
         std::process::exit(2);
     });
-    // monoio's own fallback (epoll/kqueue) is slower than the tokio loop.
+    // io_uring beat the epoll loop at every thread count on a 32-core EPYC
+    // (bench/aws): +17-25% without pipelining, +12-21% with, lower p99.
+    // Where it's unavailable, monoio's own fallback (epoll/kqueue) is slower
+    // than the tokio loop, so use that instead.
+    let uring = monoio::utils::detect_uring();
     let io = match config.io {
-        Io::Uring if !monoio::utils::detect_uring() => {
+        None if uring => Io::Uring,
+        None => Io::PerThread,
+        Some(Io::Uring) if !uring => {
             eprintln!("io_uring is unavailable here (kernel or seccomp): using per-thread I/O");
             Io::PerThread
         }
-        io => io,
+        Some(io) => io,
     };
     #[cfg(unix)]
     raise_open_file_limit(config.settings.maxclients);
