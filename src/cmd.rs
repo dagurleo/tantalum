@@ -4,6 +4,7 @@ mod hash;
 mod keys;
 mod list;
 mod set;
+mod zset;
 
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -208,6 +209,38 @@ static COMMANDS: &[Command] = &[
     Command { name: "lmove", arity: 5, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::lmove },
     Command { name: "rpoplpush", arity: 3, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::rpoplpush },
     Command { name: "lmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: list::lmpop },
+    Command { name: "zadd", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: zset::zadd },
+    Command { name: "zscore", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zscore },
+    Command { name: "zrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrange },
+    Command { name: "zincrby", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: zset::zincrby },
+    Command { name: "zrem", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zrem },
+    Command { name: "zcard", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zcard },
+    Command { name: "zrank", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zrank },
+    Command { name: "zrevrank", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zrevrank },
+    Command { name: "zrevrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrevrange },
+    Command { name: "zrangebyscore", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrangebyscore },
+    Command { name: "zrevrangebyscore", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrevrangebyscore },
+    Command { name: "zrangebylex", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrangebylex },
+    Command { name: "zrevrangebylex", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrevrangebylex },
+    Command { name: "zrangestore", arity: -5, flags: &["write", "denyoom"], keys: (1, 2, 1), run: zset::zrangestore },
+    Command { name: "zcount", arity: 4, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zcount },
+    Command { name: "zlexcount", arity: 4, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zlexcount },
+    Command { name: "zmscore", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zmscore },
+    Command { name: "zremrangebyrank", arity: 4, flags: &["write"], keys: ONE_KEY, run: zset::zremrangebyrank },
+    Command { name: "zremrangebyscore", arity: 4, flags: &["write"], keys: ONE_KEY, run: zset::zremrangebyscore },
+    Command { name: "zremrangebylex", arity: 4, flags: &["write"], keys: ONE_KEY, run: zset::zremrangebylex },
+    Command { name: "zpopmin", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zpopmin },
+    Command { name: "zpopmax", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zpopmax },
+    Command { name: "zmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: zset::zmpop },
+    Command { name: "zrandmember", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: zset::zrandmember },
+    Command { name: "zscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: zset::zscan },
+    Command { name: "zunion", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zunion },
+    Command { name: "zinter", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zinter },
+    Command { name: "zdiff", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zdiff },
+    Command { name: "zunionstore", arity: -4, flags: &["write", "denyoom"], keys: ONE_KEY, run: zset::zunionstore },
+    Command { name: "zinterstore", arity: -4, flags: &["write", "denyoom"], keys: ONE_KEY, run: zset::zinterstore },
+    Command { name: "zdiffstore", arity: -4, flags: &["write", "denyoom"], keys: ONE_KEY, run: zset::zdiffstore },
+    Command { name: "zintercard", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zintercard },
 ];
 
 /// Runs one command and writes its reply to `out`. `args` must be non-empty.

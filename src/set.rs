@@ -276,7 +276,8 @@ impl BigSet {
         read_member(&self.bytes, self.offsets[i])
     }
 
-    fn position(&self, member: &[u8]) -> Option<usize> {
+    /// Where `member` is in the set's order.
+    pub fn position(&self, member: &[u8]) -> Option<usize> {
         let (bytes, offsets) = (&self.bytes, &self.offsets);
         self.index
             .find(self.hash(member), |&i| {

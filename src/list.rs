@@ -236,6 +236,9 @@ impl Chunk {
 pub struct BigList {
     chunks: VecDeque<Chunk>,
     len: usize,
+    /// The chunks' bytes, all told, kept as they change so the size is
+    /// O(1) to tell.
+    bytes: usize,
 }
 
 impl BigList {
@@ -249,6 +252,7 @@ impl BigList {
                 count: packed.len(),
             });
             list.len = packed.len();
+            list.bytes = packed.body.len();
         }
         list.split_big_chunks();
         list
@@ -268,7 +272,7 @@ impl BigList {
     }
 
     fn packed_len(&self) -> usize {
-        varint_len(self.len) + self.chunks.iter().map(|c| c.bytes.len()).sum::<usize>()
+        varint_len(self.len) + self.bytes
     }
 
     /// In the packed format, however long, for snapshots and small lists.
@@ -347,6 +351,7 @@ impl BigList {
 
     pub fn push_front(&mut self, element: &[u8]) {
         let size = encoded_len(element);
+        self.bytes += size;
         match self.chunks.front_mut() {
             Some(chunk) if chunk.bytes.len() + size <= CHUNK_MAX => {
                 let mut encoded = Vec::with_capacity(size);
@@ -365,6 +370,7 @@ impl BigList {
 
     pub fn push_back(&mut self, element: &[u8]) {
         let size = encoded_len(element);
+        self.bytes += size;
         match self.chunks.back_mut() {
             Some(chunk) if chunk.bytes.len() + size <= CHUNK_MAX => {
                 encode(&mut chunk.bytes, element);
@@ -426,6 +432,7 @@ impl BigList {
         let range = chunk.span(at);
         let mut encoded = Vec::with_capacity(encoded_len(element));
         encode(&mut encoded, element);
+        self.bytes = self.bytes - range.len() + encoded.len();
         chunk.bytes.splice(range, encoded);
         self.split_big_chunks();
         true
@@ -444,6 +451,7 @@ impl BigList {
         let offset = chunk.span(at).start;
         let mut encoded = Vec::with_capacity(encoded_len(element));
         encode(&mut encoded, element);
+        self.bytes += encoded.len();
         chunk.bytes.splice(offset..offset, encoded);
         chunk.count += 1;
         self.len += 1;
@@ -456,6 +464,7 @@ impl BigList {
         let chunk = &mut self.chunks[c];
         let range = chunk.span(at);
         let element = chunk.bytes[element_at(&chunk.bytes, range.start).0].to_vec();
+        self.bytes -= range.len();
         chunk.bytes.drain(range);
         chunk.count -= 1;
         self.len -= 1;
@@ -532,13 +541,10 @@ impl BigList {
             .flat_map(|chunk| elements(&chunk.bytes).rev())
     }
 
+    /// Memory it takes, in O(1), as every change asks: the chunks' bytes
+    /// plus an eighth for growth room, and their headers.
     pub fn allocation_size(&self) -> usize {
-        self.chunks.capacity() * size_of::<Chunk>()
-            + self
-                .chunks
-                .iter()
-                .map(|c| c.bytes.capacity())
-                .sum::<usize>()
+        self.chunks.capacity() * size_of::<Chunk>() + self.bytes + self.bytes / 8
     }
 }
 
@@ -822,6 +828,11 @@ mod tests {
             assert_eq!(
                 list.chunks.iter().map(|c| c.count).sum::<usize>(),
                 list.len()
+            );
+            assert_eq!(
+                list.chunks.iter().map(|c| c.bytes.len()).sum::<usize>(),
+                list.bytes,
+                "step {step}: byte count"
             );
             if step % 1_000 == 0 {
                 assert_eq!(all(&list), Vec::from(model.clone()), "step {step}");

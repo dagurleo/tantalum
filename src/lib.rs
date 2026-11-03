@@ -15,3 +15,4 @@ mod set;
 pub mod snapshot;
 pub mod store;
 mod table;
+mod zset;

@@ -5,11 +5,13 @@
 use crate::list::{self, BigList};
 use crate::segment::Kind;
 use crate::set::{self, BigSet};
+use crate::zset::{self, BigZSet};
 
 #[derive(Clone)]
 pub enum Collection {
     List(BigList),
     Set(BigSet),
+    ZSet(BigZSet),
 }
 
 impl std::fmt::Debug for Collection {
@@ -28,6 +30,7 @@ impl Collection {
         match self {
             Collection::List(_) => Kind::List,
             Collection::Set(_) => Kind::Set,
+            Collection::ZSet(_) => Kind::ZSet,
         }
     }
 
@@ -36,6 +39,7 @@ impl Collection {
         match self {
             Collection::List(list) => list.allocation_size(),
             Collection::Set(set) => set.allocation_size(),
+            Collection::ZSet(set) => set.allocation_size(),
         }
     }
 
@@ -45,6 +49,7 @@ impl Collection {
         match self {
             Collection::List(list) => list.to_packed(),
             Collection::Set(set) => set.to_compact(),
+            Collection::ZSet(set) => set.to_packed(),
         }
     }
 
@@ -53,6 +58,7 @@ impl Collection {
         match kind {
             Kind::List => Collection::List(BigList::from_packed(bytes)),
             Kind::Set => Collection::Set(BigSet::from_compact(bytes)),
+            Kind::ZSet => Collection::ZSet(BigZSet::from_packed(bytes)),
             other => unreachable!("{} isn't a collection", other.name()),
         }
     }
@@ -64,6 +70,7 @@ pub fn fits_compact(kind: Kind, bytes: &[u8]) -> bool {
     match kind {
         Kind::List => list::fits_packed(bytes),
         Kind::Set => set::fits_compact(bytes),
+        Kind::ZSet => zset::fits_packed(bytes),
         _ => true,
     }
 }
@@ -73,6 +80,7 @@ pub fn is_valid(kind: Kind, bytes: &[u8]) -> bool {
     match kind {
         Kind::List => list::is_valid(bytes),
         Kind::Set => set::is_valid(bytes),
+        Kind::ZSet => zset::is_valid(bytes),
         _ => false,
     }
 }

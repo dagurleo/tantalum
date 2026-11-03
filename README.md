@@ -3,7 +3,7 @@
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
-lists, and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
+lists, sorted sets, and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
 optional snapshots to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
@@ -73,8 +73,15 @@ recorded from Redis 7.0 with `tools/redis-diff.py`).
 | `LRANGE key start stop`, `LINDEX`, `LLEN`, `LPOS key element [RANK r] [COUNT n] [MAXLEN m]` | |
 | `LSET`, `LINSERT key BEFORE\|AFTER pivot element`, `LREM key count element`, `LTRIM` | |
 | `LMOVE source destination LEFT\|RIGHT LEFT\|RIGHT`, `RPOPLPUSH` | Atomic: holds both keys' shards |
+| `ZADD key [NX\|XX] [GT\|LT] [CH] [INCR] score member ...`, `ZINCRBY`, `ZREM`, `ZSCORE`, `ZMSCORE`, `ZCARD` | Scores print as Redis 7.2 prints doubles (`1.1`, `1e+21`), and parse as it does (`inf`, hex, no NaN). RESP3 replies doubles |
+| `ZRANGE key min max [BYSCORE\|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]`, `ZRANGESTORE`, and `ZRANGEBYSCORE`, `ZREVRANGE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX` | RESP3 gives `WITHSCORES` as pairs, as Redis does |
+| `ZRANK`, `ZREVRANK key member [WITHSCORE]`, `ZCOUNT`, `ZLEXCOUNT` | |
+| `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` | |
+| `ZPOPMIN`, `ZPOPMAX key [count]`, `ZMPOP numkeys key ... MIN\|MAX [COUNT n]`, `ZRANDMEMBER key [count [WITHSCORES]]` | No blocking forms yet (`BZPOPMIN` and the rest) |
+| `ZUNION`, `ZINTER`, `ZDIFF numkeys key ... [WEIGHTS ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]`, their `STORE` forms, `ZINTERCARD` | Sets count as sorted sets with scores of 1, as in Redis. Each key is read on its own |
+| `ZSCAN key cursor [MATCH pattern] [COUNT n]` | As `SSCAN` |
 | `SSCAN key cursor [MATCH pattern] [COUNT n]` | Small sets come whole with cursor 0, as in Redis; big ones `COUNT` at a time, each member there throughout returned at least once |
-| `TYPE key` | `string`, `hash`, `list`, `set` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
+| `TYPE key` | `string`, `hash`, `list`, `set`, `zset` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
 | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | A whole scan returns every key that existed throughout exactly once (Redis may repeat keys), and any cursor is safe. `COUNT` is about how many keys a call looks at, as in Redis; for big shards a call looks at a 1024th of the shard at least. Cursors are Tantalum's own and stay under 2^53, so clients that read them as JavaScript numbers work |
 | `KEYS pattern` | Every match at once, like Redis: it holds each shard's lock in turn while reading it, so prefer `SCAN` on big stores |
 | `RENAME key newkey`, `RENAMENX key newkey` | Atomic across shards; keeps the type and TTL. As in Redis, it overwrites `newkey` of any type and ignores `maxmemory` |
@@ -175,6 +182,20 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   lists of ten 8-byte elements take 13.4 bytes per element (Redis 17.8),
   one of 1M take 9.0 (Redis 9.0). In-process on 200k elements, `LPUSH`
   ~500 ns, `RPOP` ~290 ns, `LINDEX` ~760 ns, `LRANGE -10 -1` ~530 ns.
+- **Sorted sets** (`src/zset.rs`) are packed while small (up to 128
+  members of up to 64 bytes, Redis' listpack limits), in order, each entry
+  a score and a member; a whole score below 2^52 is a varint of a byte or
+  two, any other 8 bytes. A bigger one keeps its members as a big set does
+  (a buffer, offsets, a table of positions), a score per position, and its
+  order as chunks of positions with a Fenwick tree of chunk sizes, so
+  ranks are O(log n). Against Redis 7.2.4: 100k sorted sets of ten 8-byte
+  members take 13.4 bytes per member with whole scores (Redis 19.4) and
+  22.3 with fractional ones (Redis 25.8); one of 1M takes 36.4 (Redis 93.4,
+  its skiplist and dict). In-process on 500k members: `ZADD` of a new
+  member ~790 ns, `ZINCRBY` ~1.3 µs, `ZSCORE` ~400 ns, `ZREVRANK` ~1 µs,
+  `ZREVRANGE 0 9 WITHSCORES` ~1 µs, `ZREM` ~1.6 µs. Scores reply exactly
+  as Redis 7.2 prints them: shortest digits, laid out as JavaScript's
+  `Number.prototype.toString` (plain from 1e-6 up to 1e21).
 - **`SCAN` goes in hash order** (`Store::scan`): a cursor is a shard and a
   32-bit slot hash, and each call takes the keys with the next smallest
   hashes in that shard, every key with the same hash at once, under its
@@ -615,11 +636,16 @@ hit rates share the seeding flaw described above.
   commands on that shard wait out, and a whole scan reads each table up to
   1024 times.
 - **Multi-key set commands read one key at a time** (`SINTER`, `SUNION`,
-  `SDIFF` and their stores), as `MSET` writes one at a time; `SMOVE` and
-  `RENAME` are atomic.
-- **No blocking list commands** (`BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`,
-  `BRPOPLPUSH`): they need connections to wait inside the I/O loops.
-- An append-only log (snapshots only), replication, sorted sets,
+  `SDIFF`, `ZUNION`, `ZINTER`, `ZDIFF` and their stores), as `MSET` writes
+  one at a time; `SMOVE`, `LMOVE` and `RENAME` are atomic.
+- **No blocking commands** (`BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`,
+  `BRPOPLPUSH`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`): they need connections
+  to wait inside the I/O loops.
+- **Writes to a small collection decode it whole**: a list, set or sorted
+  set packed in its entry is decoded, changed and packed again on every
+  write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
+  listpacks in place.
+- An append-only log (snapshots only), replication,
   ACL users, Lua, pub/sub, `COPY`, `RANDOMKEY`, `OBJECT`, `DUMP`/`RESTORE`.
 - LFU and random eviction policies, `CONFIG SET` at runtime.
 

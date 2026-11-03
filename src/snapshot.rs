@@ -637,6 +637,51 @@ mod tests {
     }
 
     #[test]
+    fn sorted_sets_roundtrip() {
+        use crate::collection::Collection;
+        use crate::store::Update;
+        use crate::zset::BigZSet;
+        let path = temp_path("zsets");
+        let s = Store::new(2);
+        let now = s.now();
+        let mut small = BigZSet::default();
+        small.insert(b"a", 1.5);
+        small.insert(b"b", f64::NEG_INFINITY);
+        s.restore(b"small", Kind::ZSet, &small.to_packed(), Expiry::Never, now)
+            .unwrap();
+        let mut big = BigZSet::default();
+        for i in 0..3_000 {
+            big.insert(format!("member {i}").as_bytes(), (i % 17) as f64 * 0.5);
+        }
+        let packed = big.to_packed();
+        let mut made = Some(Collection::ZSet(big));
+        s.update_collection(s.key(b"big"), now, false, |_| {
+            (Update::Object(made.take().unwrap()), ())
+        })
+        .unwrap();
+        save(&s, &path).unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        let t = Store::new(4);
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
+        assert_eq!(
+            kind_and_value(&t, b"small"),
+            Some((Kind::ZSet, small.to_packed()))
+        );
+        let reloaded = t
+            .update_collection(t.key(b"big"), t.now(), false, |entry| {
+                match entry.unwrap().value {
+                    crate::store::EntryValue::Object(Collection::ZSet(set)) => {
+                        (Update::Peek, set.to_packed())
+                    }
+                    _ => panic!("not big"),
+                }
+            })
+            .unwrap();
+        assert_eq!(reloaded, packed);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn lists_roundtrip() {
         use crate::collection::Collection;
         use crate::list::BigList;

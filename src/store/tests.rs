@@ -1431,7 +1431,13 @@ fn big_collections_keep_the_books() {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         let mut now: Millis = 1;
         let big = |n: u64, tag: u64| {
-            if tag.is_multiple_of(2) {
+            if tag % 3 == 2 {
+                let mut set = crate::zset::BigZSet::default();
+                for i in 0..n {
+                    set.insert(format!("{tag}-{i}").as_bytes(), i as f64);
+                }
+                Collection::ZSet(set)
+            } else if tag.is_multiple_of(2) {
                 let mut set = BigSet::with_capacity(n as usize);
                 for i in 0..n {
                     set.insert(format!("{tag}-{i}").as_bytes());
@@ -1466,6 +1472,16 @@ fn big_collections_keep_the_books() {
                                 set.insert(format!("x{step}-{i}").as_bytes());
                             }
                             set.remove(b"0-0");
+                            (Update::Changed, ())
+                        }
+                        Some(Entry {
+                            value: EntryValue::Object(Collection::ZSet(set)),
+                            ..
+                        }) => {
+                            for i in 0..extra {
+                                set.insert(format!("x{step}-{i}").as_bytes(), -(i as f64));
+                            }
+                            set.remove(b"2-0");
                             (Update::Changed, ())
                         }
                         Some(Entry {
@@ -1552,6 +1568,7 @@ fn big_collections_keep_the_books() {
                     assert!(crate::list::is_valid(value));
                     lists += 1;
                 }
+                Kind::ZSet => assert!(crate::zset::is_valid(value)),
                 _ => {}
             });
         }
@@ -1681,6 +1698,38 @@ mod random_commands {
         b"LMOVE",
         b"RPOPLPUSH",
         b"LMPOP",
+        b"ZADD",
+        b"ZINCRBY",
+        b"ZREM",
+        b"ZCARD",
+        b"ZSCORE",
+        b"ZMSCORE",
+        b"ZRANK",
+        b"ZREVRANK",
+        b"ZRANGE",
+        b"ZRANGESTORE",
+        b"ZREVRANGE",
+        b"ZRANGEBYSCORE",
+        b"ZREVRANGEBYSCORE",
+        b"ZRANGEBYLEX",
+        b"ZREVRANGEBYLEX",
+        b"ZCOUNT",
+        b"ZLEXCOUNT",
+        b"ZREMRANGEBYRANK",
+        b"ZREMRANGEBYSCORE",
+        b"ZREMRANGEBYLEX",
+        b"ZPOPMIN",
+        b"ZPOPMAX",
+        b"ZMPOP",
+        b"ZRANDMEMBER",
+        b"ZSCAN",
+        b"ZUNION",
+        b"ZINTER",
+        b"ZDIFF",
+        b"ZUNIONSTORE",
+        b"ZINTERSTORE",
+        b"ZDIFFSTORE",
+        b"ZINTERCARD",
         b"hget",
         b"get",
         b"sEt",
@@ -1740,6 +1789,23 @@ mod random_commands {
         b"AFTER",
         b"RANK",
         b"MAXLEN",
+        b"WITHSCORES",
+        b"BYSCORE",
+        b"BYLEX",
+        b"REV",
+        b"INCR",
+        b"CH",
+        b"WEIGHTS",
+        b"AGGREGATE",
+        b"MIN",
+        b"MAX",
+        b"inf",
+        b"-inf",
+        b"(1",
+        b"[a",
+        b"+",
+        b"-",
+        b"0.5",
         b"-5",
         b"TYPE",
         b"string",
