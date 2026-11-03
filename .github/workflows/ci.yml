@@ -39,7 +39,11 @@ jobs:
         with:
           workspaces: fuzz
       # New inputs go to the (ignored) corpus; the committed seeds are only read.
-      - run: mkdir -p corpus/commands && cargo fuzz run commands corpus/commands seeds/commands -- -max_total_time=120 -max_len=4096
+      # The prebuilt cargo-fuzz targets musl by default, which can't sanitize.
+      - run: >-
+          mkdir -p corpus/commands &&
+          cargo fuzz run --target x86_64-unknown-linux-gnu commands corpus/commands seeds/commands
+          -- -max_total_time=120 -max_len=4096
         working-directory: fuzz
       - if: failure()
         uses: actions/upload-artifact@v4
