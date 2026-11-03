@@ -12,6 +12,15 @@ struct Server {
     log: std::sync::mpsc::Receiver<String>,
 }
 
+/// A test that fails mid-way mustn't leave its server running (it would
+/// keep the test runner's output open).
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tantalum-persist-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
