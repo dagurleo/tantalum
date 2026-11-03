@@ -1,0 +1,26 @@
+[package]
+name = "tantalum"
+version = "0.5.0"
+edition = "2024"
+
+[dependencies]
+foldhash = "0.2.0"
+allocator-api2 = { version = "0.2.9", default-features = false, features = ["alloc"] }
+itoa = "1.0.18"
+memchr = "2.8.3"
+mimalloc = "0.1.52"
+parking_lot = "0.13.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
+socket2 = "0.6"
+monoio = "0.2.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The version monoio uses, to pass it ring setup flags.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6.4"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

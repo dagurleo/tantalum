@@ -1,0 +1,96 @@
+# Railway, 2026-11-02: memtier client and servers in separate services over the
+# private network (~2.2 ms round trip). AMD EPYC 9655P client host, Redis 8.10.3.
+# Raw log lines; Railway's log order is not always the order they were printed.
+
+Starting Container
+### client: 48 CPUs, AMD EPYC 9655P 96-Core Processor
+### server: redis_version:8.10.3 os:Linux 6.18.5+deb13-cloud-amd64 x86_64 arch_bits:64
+### ferrokv: prefill 1M keys, 32-byte values
+Sets       864995.03          ---          ---         7.37223         4.01500        12.35100       544.76700     65794.43 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Totals     864995.03         0.00         0.00         7.37223         4.01500        12.35100       544.76700     65794.43 
+used_memory:67148099
+used_memory_rss:172802048
+maxmemory:0
+expired_keys:0
+evicted_keys:0
+db0:keys=1000000,expires=0,avg_ttl=0
+### ferrokv: 1 client, no pipelining (round-trip latency)
+Sets           37.50          ---          ---         2.44733         2.20700         4.83100         7.39100         2.85 
+Gets          374.36       374.36         0.00         2.42421         2.19100         5.08700         6.55900        26.65 
+Totals        411.85       374.36         0.00         2.42631         2.19100         5.08700         6.75100        29.50 
+### ferrokv: 200 clients, pipeline 1, 1:10 set:get
+Sets         5323.72          ---          ---         3.54550         3.50300         5.66300        79.87100       404.94 
+Gets        53186.03     53186.03         0.00         3.40487         3.48700         5.43900         8.95900      3785.84 
+Totals      58509.75     53186.03         0.00         3.41766         3.48700         5.43900         9.34300      4190.78 
+### ferrokv: 200 clients, pipeline 16, 1:10 set:get
+Totals    1044925.73    949927.86         0.00         3.05827         2.97500         5.08700         8.06300     74842.25 
+### redis: prefill 1M keys, 32-byte values
+Sets       742509.56          ---          ---         8.58842         8.63900        13.18300        17.15100     56477.78 
+Sets        94997.87          ---          ---         3.05864         2.97500         5.08700         8.12700      7225.83 
+Gets       949927.86    949927.86         0.00         3.05824         2.97500         5.08700         8.06300     67616.42 
+expired_keys:0
+evicted_keys:0
+db0:keys=1000000,expires=0,avg_ttl=0,subexpiry=0
+### redis: 1 client, no pipelining (round-trip latency)
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Totals     742509.56         0.00         0.00         8.58842         8.63900        13.18300        17.15100     56477.78 
+used_memory:94117672
+used_memory_rss:113283072
+maxmemory:0
+Sets           39.40          ---          ---         2.30650         2.20700         3.87100         5.50300         3.00 
+Gets          393.36       393.36         0.00         2.30880         2.19100         4.31900         6.49500        28.00 
+Totals        432.75       393.36         0.00         2.30859         2.19100         4.28700         6.49500        30.99 
+### redis: 200 clients, pipeline 1, 1:10 set:get
+Sets         5942.79          ---          ---         3.06452         2.97500         5.24700         7.13500       452.02 
+Gets        59377.32     59377.32         0.00         3.06104         2.97500         5.11900         7.16700      4226.54 
+Totals      65320.11     59377.32         0.00         3.06136         2.97500         5.15100         7.16700      4678.56 
+### redis: 200 clients, pipeline 16, 1:10 set:get
+Sets        58001.91          ---          ---         5.01202         4.92700         7.67900        10.04700      4411.81 
+Gets       579967.89    579967.89         0.00         5.01185         4.92700         7.67900        10.04700     41282.40 
+Totals     637969.81    579967.89         0.00         5.01186         4.92700         7.67900        10.04700     45694.21 
+### redis-io-threads: prefill 1M keys, 32-byte values
+Sets       849677.59          ---          ---         7.51526         7.58300        15.48700        21.63100     64629.34 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Totals     849677.59         0.00         0.00         7.51526         7.58300        15.48700        21.63100     64629.34 
+used_memory:94603360
+used_memory_rss:115699712
+maxmemory:0
+expired_keys:0
+evicted_keys:0
+db0:keys=1000000,expires=0,avg_ttl=0,subexpiry=0
+### redis-io-threads: 1 client, no pipelining (round-trip latency)
+### redis-io-threads: 200 clients, pipeline 1, 1:10 set:get
+Sets           39.30          ---          ---         2.32590         2.22300         3.80700         5.50300         2.99 
+Gets          392.07       392.07         0.00         2.31560         2.22300         4.22300         7.19900        27.91 
+Totals        431.37       392.07         0.00         2.31654         2.22300         4.19100         7.19900        30.90 
+Sets         5967.36          ---          ---         3.05527         2.94300         5.37500         8.12700       453.89 
+Gets        59623.32     59623.32         0.00         3.04798         2.92700         5.24700         8.09500      4244.05 
+Totals      65590.68     59623.32         0.00         3.04864         2.92700         5.24700         8.12700      4697.94 
+### redis-io-threads: 200 clients, pipeline 16, 1:10 set:get
+Sets        88505.16          ---          ---         3.28327         3.16700         5.95100         9.34300      6731.97 
+Gets       885001.29    885001.29         0.00         3.28312         3.16700         5.95100         9.40700     62994.89 
+Totals     973506.46    885001.29         0.00         3.28314         3.16700         5.95100         9.40700     69726.86 
+### ferrokv-lru: warm-up, maxmemory 64mb, 4M-key gaussian keyspace, 100-byte values
+### ferrokv-lru: measured run
+Sets        11613.42          ---          ---         3.44866         3.53500         5.08700         8.38300      1677.76 
+Gets        46439.90      4716.15     41723.75         3.44356         3.53500         5.05500         7.51900      2285.43 
+Totals      58053.32      4716.15     41723.75         3.44458         3.53500         5.05500         7.64700      3963.19 
+used_memory:49524002
+used_memory_rss:76169216
+maxmemory:67108864
+expired_keys:0
+evicted_keys:0
+db0:keys=324021,expires=0,avg_ttl=0
+### redis-lru: warm-up, maxmemory 64mb, 4M-key gaussian keyspace, 100-byte values
+### redis-lru: measured run
+Sets        12950.71          ---          ---         3.09357         2.97500         5.50300         7.96700      1870.95 
+Gets        51789.48      5826.52     45962.96         3.08763         2.97500         5.43900         7.99900      2605.73 
+Totals      64740.19      5826.52     45962.96         3.08882         2.97500         5.47100         7.99900      4476.68 
+used_memory:61083752
+used_memory_rss:72749056
+maxmemory:67108864
+expired_keys:0
+evicted_keys:0
+db0:keys=358412,expires=0,avg_ttl=0,subexpiry=0
+### DONE

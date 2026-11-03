@@ -1,0 +1,155 @@
+# Railway, 2026-11-02: ROLE=local, ROUNDS=2, EVICTION_MAXMEMORY=16mb. Client and
+# servers in one 32-vCPU container over loopback. Intel Xeon Platinum 8581C, Redis 8.10.3.
+# Raw log lines; Railway's log order is not always the order they were printed, so
+# match results to tests by their header and server_cpu_cores lines.
+
+Starting Container
+ferrokv 0.0.2 listening on [::]:6379 (4 threads, no memory limit)
+ferrokv 0.0.2 listening on [::]:6382 (4 threads, maxmemory 16777216 bytes, allkeys-lru)
+### client: 32 CPUs, INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.10GHz
+### server: redis_version:8.10.3 os:Linux 6.18.15+deb13-cloud-amd64 x86_64 arch_bits:64
+### ferrokv: prefill 1M keys, 32-byte values
+Sets      1811994.68          ---          ---         3.50175         2.47900        14.20700        21.75900    137826.41 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Totals    1811994.68         0.00         0.00         3.50175         2.47900        14.20700        21.75900    137826.41 
+used_memory:67148618
+used_memory_rss:168939520
+maxmemory:0
+expired_keys:0
+evicted_keys:0
+db0:keys=1000000,expires=0,avg_ttl=0
+### redis: prefill 1M keys, 32-byte values
+evicted_keys:0
+db0:keys=1000000,expires=0,avg_ttl=0,subexpiry=0
+### redis-io-threads: prefill 1M keys, 32-byte values
+Sets       583304.31          ---          ---        10.92771        10.11100        25.21500        29.31100     44368.09 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Totals     583304.31         0.00         0.00        10.92771        10.11100        25.21500        29.31100     44368.09 
+used_memory:94115128
+used_memory_rss:114577408
+maxmemory:0
+expired_keys:0
+Sets       763964.70          ---          ---         8.34532         7.77500        21.24700        27.77500     58109.73 
+Gets            0.00         0.00         0.00             ---             ---             ---             ---         0.00 
+Totals     763964.70         0.00         0.00         8.34532         7.77500        21.24700        27.77500     58109.73 
+used_memory:94604992
+used_memory_rss:122392576
+maxmemory:0
+expired_keys:0
+evicted_keys:0
+db0:keys=1000000,expires=0,avg_ttl=0,subexpiry=0
+### round 1, ferrokv: 1 client, no pipelining (round-trip latency)
+Sets         2698.90          ---          ---         0.03458         0.03100         0.10300         0.26300       205.29 
+Gets        26988.89     26988.89         0.00         0.03318         0.03100         0.10300         0.21500      1921.04 
+Totals      29687.79     26988.89         0.00         0.03331         0.03100         0.10300         0.21500      2126.33 
+server_cpu_cores: 0.40
+### round 1, ferrokv: 200 clients, pipeline 1, 1:10 set:get
+Totals     308841.56    280760.29         0.00         0.64711         0.53500         3.05500         6.39900     22120.57 
+server_cpu_cores: 3.04
+### round 1, ferrokv: 200 clients, pipeline 16, 1:10 set:get
+Sets        28081.27          ---          ---         0.64760         0.53500         3.05500         6.39900      2135.95 
+Gets       280760.29    280760.29         0.00         0.64706         0.53500         3.05500         6.39900     19984.62 
+Sets       267521.98          ---          ---         1.08128         0.87900         4.83100         9.21500     20348.63 
+Gets      2675171.54   2675171.54         0.00         1.08117         0.87900         4.83100         9.21500    190420.02 
+Totals    2942693.52   2675171.54         0.00         1.08118         0.87900         4.83100         9.21500    210768.65 
+server_cpu_cores: 3.19
+### round 1, redis: 1 client, no pipelining (round-trip latency)
+Sets         2244.50          ---          ---         0.04235         0.03900         0.14300         0.30300       170.72 
+Gets        22444.76     22444.76         0.00         0.03963         0.03900         0.13500         0.26300      1597.60 
+Totals      24689.26     22444.76         0.00         0.03988         0.03900         0.13500         0.27100      1768.32 
+server_cpu_cores: 0.44
+### round 1, redis: 200 clients, pipeline 1, 1:10 set:get
+Sets         6701.94          ---          ---         2.71143         2.30300         8.89500        17.53500       509.77 
+Gets        66967.96     66967.96         0.00         2.71381         2.30300         8.76700        17.79100      4766.84 
+Totals      73669.90     66967.96         0.00         2.71359         2.30300         8.76700        17.79100      5276.61 
+server_cpu_cores: 0.88
+### round 1, redis: 200 clients, pipeline 16, 1:10 set:get
+Sets        65144.80          ---          ---         4.45860         3.69500        10.36700        15.29500      4955.11 
+Gets       651396.89    651396.89         0.00         4.45946         3.69500        10.36700        15.61500     46366.75 
+Totals     716541.70    651396.89         0.00         4.45938         3.69500        10.36700        15.55100     51321.87 
+server_cpu_cores: 0.96
+### round 1, redis-io-threads: 1 client, no pipelining (round-trip latency)
+Sets         1126.40          ---          ---         0.08288         0.05500         0.49500         3.32700        85.68 
+Gets        11263.10     11263.10         0.00         0.07963         0.05500         0.51900         3.85500       801.70 
+Totals      12389.50     11263.10         0.00         0.07992         0.05500         0.51100         3.82300       887.37 
+server_cpu_cores: 0.45
+### round 1, redis-io-threads: 200 clients, pipeline 1, 1:10 set:get
+Sets        13043.89          ---          ---         1.39573         0.93500         6.49500        11.26300       992.15 
+Gets       130386.61    130386.61         0.00         1.39328         0.93500         6.52700        11.45500      9280.99 
+Totals     143430.50    130386.61         0.00         1.39350         0.93500         6.52700        11.45500     10273.15 
+server_cpu_cores: 1.95
+### round 1, redis-io-threads: 200 clients, pipeline 16, 1:10 set:get
+### round 2, ferrokv: 1 client, no pipelining (round-trip latency)
+Sets       125875.31          ---          ---         2.30482         2.07900         8.09500        15.42300      9574.47 
+Gets      1258698.41   1258698.41         0.00         2.30476         2.07900         8.09500        15.42300     89594.87 
+Totals    1384573.72   1258698.41         0.00         2.30477         2.07900         8.09500        15.42300     99169.34 
+server_cpu_cores: 2.53
+Sets         2703.39          ---          ---         0.03484         0.03100         0.11900         0.61500       205.63 
+Gets        27033.74     27033.74         0.00         0.03356         0.03100         0.11100         0.63900      1924.24 
+Totals      29737.13     27033.74         0.00         0.03368         0.03100         0.11100         0.63900      2129.87 
+server_cpu_cores: 0.37
+### round 2, ferrokv: 200 clients, pipeline 1, 1:10 set:get
+server_cpu_cores: 2.98
+### round 2, ferrokv: 200 clients, pipeline 16, 1:10 set:get
+Sets        25335.42          ---          ---         0.71721         0.58300         3.56700         6.59100      1927.09 
+Gets       253301.27    253301.27         0.00         0.71727         0.58300         3.58300         6.52700     18030.09 
+Totals     278636.68    253301.27         0.00         0.71726         0.58300         3.58300         6.52700     19957.17 
+Gets      1525651.89   1525651.89         0.00         1.89956         1.13500        10.36700        18.43100    108596.72 
+Totals    1678222.52   1525651.89         0.00         1.89956         1.13500        10.36700        18.43100    120201.74 
+server_cpu_cores: 1.94
+### round 2, redis: 1 client, no pipelining (round-trip latency)
+Sets       152570.63          ---          ---         1.89959         1.13500        10.36700        18.43100     11605.02 
+Totals      25002.95     22729.96         0.00         0.03940         0.03900         0.13500         0.35900      1790.79 
+server_cpu_cores: 0.43
+### round 2, redis: 200 clients, pipeline 1, 1:10 set:get
+Sets         2273.00          ---          ---         0.04256         0.03900         0.14300         0.39100       172.89 
+Gets        22729.96     22729.96         0.00         0.03909         0.03900         0.13500         0.35100      1617.91 
+Sets         8476.84          ---          ---         2.14232         1.83900         5.79100        10.30300       644.78 
+Gets        84715.86     84715.86         0.00         2.14553         1.83900         5.79100        10.87900      6030.13 
+Totals      93192.70     84715.86         0.00         2.14524         1.83900         5.79100        10.81500      6674.91 
+server_cpu_cores: 0.95
+### round 2, redis: 200 clients, pipeline 16, 1:10 set:get
+Sets        45040.28          ---          ---         6.45192         5.82300        15.74300        27.13500      3425.92 
+Gets       450353.47    450353.47         0.00         6.45149         5.82300        15.74300        27.26300     32056.37 
+Totals     495393.75    450353.47         0.00         6.45153         5.82300        15.74300        27.26300     35482.29 
+server_cpu_cores: 0.79
+### round 2, redis-io-threads: 1 client, no pipelining (round-trip latency)
+Sets          920.84          ---          ---         0.10595         0.06300         0.88700         5.27900        70.04 
+Gets         9207.52      9207.52         0.00         0.09704         0.06300         0.71100         4.86300       655.38 
+Totals      10128.36      9207.52         0.00         0.09785         0.06300         0.71900         4.89500       725.42 
+server_cpu_cores: 0.39
+### round 2, redis-io-threads: 200 clients, pipeline 1, 1:10 set:get
+Sets        21252.86          ---          ---         0.85663         0.72700         3.98300         7.67900      1616.57 
+Gets       212481.03    212481.03         0.00         0.85486         0.71900         3.98300         7.80700     15124.50 
+Totals     233733.88    212481.03         0.00         0.85502         0.71900         3.98300         7.80700     16741.07 
+server_cpu_cores: 2.83
+### round 2, redis-io-threads: 200 clients, pipeline 16, 1:10 set:get
+Sets        79247.66          ---          ---         3.66431         2.55900        14.27100        25.85500      6027.82 
+Gets       792426.63    792426.63         0.00         3.66361         2.55900        14.20700        25.98300     56405.35 
+Totals     871674.29    792426.63         0.00         3.66368         2.55900        14.20700        25.98300     62433.17 
+server_cpu_cores: 1.83
+### ferrokv-lru: warm-up, maxmemory 16mb, gaussian keys (sigma 100k), 100-byte values
+### ferrokv-lru: measured run
+Totals     274825.75     70367.54    149490.36         0.72719         0.57500         3.91900         7.77500     23610.76 
+server_cpu_cores: 2.83
+used_memory:16777354
+used_memory_rss:38531072
+Sets        54967.86          ---          ---         0.72828         0.57500         3.91900         7.87100      7944.57 
+maxmemory:16777216
+Gets       219857.89     70367.54    149490.36         0.72692         0.57500         3.91900         7.74300     15666.18 
+expired_keys:0
+evicted_keys:1747628
+db0:keys=97744,expires=0,avg_ttl=0
+### redis-lru: warm-up, maxmemory 16mb, gaussian keys (sigma 100k), 100-byte values
+### redis-lru: measured run
+Sets        18507.11          ---          ---         2.17232         1.87100         6.17500        13.88700      2674.86 
+Gets        74015.01     18971.32     55043.69         2.15776         1.87100         6.07900        12.22300      4799.46 
+Totals      92522.12     18971.32     55043.69         2.16067         1.87100         6.11100        12.47900      7474.32 
+server_cpu_cores: 0.94
+used_memory:16253904
+used_memory_rss:31608832
+maxmemory:16777216
+expired_keys:0
+evicted_keys:589549
+db0:keys=89912,expires=0,avg_ttl=0,subexpiry=0
+### DONE

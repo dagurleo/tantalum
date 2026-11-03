@@ -1,0 +1,163 @@
+# Per-core throughput and batch prefetching, Docker Desktop on an Apple M1 Pro (Linux 6.12
+# VM, 8 vCPUs), 2026-11-03, container run --privileged (io_uring and perf allowed).
+# Script: bench/docker/saturate.sh. Each server gets 1 (or 2) threads and memtier 6 x 33
+# clients, so the server is the bottleneck (cpu ~1.0 per thread). "tantalum" is 0.3.0
+# before prefetching; "tantalum-b" is the prefetching build (0.4.0: buckets 8 commands
+# ahead, entries 4 ahead). Rounds rotate the order.
+#
+# Why prefetch: with 10k keys (all in cache) vs 1M keys, pipeline 16, ops per core,
+# before prefetching (3 rounds each):
+#   10k keys: tantalum-uring 3.14M, 3.35M, 3.05M   valkey 1.89M, 1.83M, 1.85M
+#   1M keys:  tantalum-uring 1.70M, 1.71M, 1.79M   valkey 1.76M, 1.82M, 1.75M
+# so cache misses cost Tantalum ~45% at 1M keys (Valkey ~5%).
+#
+# Steps, pipeline 16, uring, median ops per core:
+#   no prefetch 1.74M; buckets only (4 ahead) 1.98M; plus entries (2 ahead) 2.46-2.49M;
+#   distances 6/2 2.48M, 8/4 2.54M (within noise; 8/4 kept).
+#
+# Final A/B:
+# 6.12.76-linuxkit, 8 CPUs; 1 server thread(s), memtier 6 x 33 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# tantalum 0.3.0 listening on 127.0.0.1:7962 (1 threads, io_uring I/O, no memory limit)
+round 1 tantalum-uring   P1   ops   278298 p50 0.671 p99 1.631 cpu 0.99 ops/core   281119
+round 1 tantalum-uring   P16  ops  1840047 p50 1.695 p99 2.271 cpu 1.00 ops/core  1847994
+round 1 tantalum-b-uring P1   ops   275598 p50 0.679 p99 1.759 cpu 0.98 ops/core   280132
+round 1 tantalum-b-uring P16  ops  2627314 p50 1.191 p99 1.495 cpu 1.00 ops/core  2634279
+round 1 tantalum         P1   ops   236528 p50 0.799 p99 1.743 cpu 0.99 ops/core   239774
+round 1 tantalum         P16  ops  1554654 p50 2.007 p99 2.559 cpu 0.99 ops/core  1563235
+round 1 tantalum-b       P1   ops   247487 p50 0.775 p99 1.719 cpu 0.99 ops/core   250563
+round 1 tantalum-b       P16  ops  2179396 p50 1.431 p99 1.903 cpu 0.99 ops/core  2195050
+round 1 valkey           P1   ops   221815 p50 0.831 p99 1.887 cpu 0.99 ops/core   225020
+round 1 valkey           P16  ops  1786884 p50 1.751 p99 3.103 cpu 0.99 ops/core  1798798
+round 1 memcached        P1   ops   229775 p50 0.807 p99 1.783 cpu 1.00 ops/core   229600
+round 1 memcached        P16  ops  1045124 p50 2.863 p99 6.175 cpu 1.24 ops/core   842673
+round 2 tantalum-b-uring P1   ops   297558 p50 0.647 p99 0.983 cpu 0.99 ops/core   301082
+round 2 tantalum-b-uring P16  ops  2471757 p50 1.207 p99 2.671 cpu 0.99 ops/core  2489451
+round 2 tantalum         P1   ops   257405 p50 0.751 p99 1.087 cpu 1.00 ops/core   258425
+round 2 tantalum         P16  ops  1435932 p50 2.063 p99 5.599 cpu 1.00 ops/core  1441798
+round 2 tantalum-b       P1   ops   251451 p50 0.791 p99 0.943 cpu 1.00 ops/core   252389
+round 2 tantalum-b       P16  ops  2022519 p50 1.447 p99 3.487 cpu 0.99 ops/core  2038678
+round 2 valkey           P1   ops   231113 p50 0.823 p99 1.687 cpu 0.99 ops/core   232637
+round 2 valkey           P16  ops  1762219 p50 1.727 p99 4.287 cpu 1.00 ops/core  1769436
+round 2 memcached        P1   ops   225351 p50 0.855 p99 1.719 cpu 1.05 ops/core   214461
+round 2 memcached        P16  ops  1024471 p50 2.879 p99 6.975 cpu 1.25 ops/core   818030
+round 2 tantalum-uring   P1   ops   290114 p50 0.679 p99 0.831 cpu 1.00 ops/core   291296
+round 2 tantalum-uring   P16  ops  1687717 p50 1.735 p99 4.831 cpu 1.00 ops/core  1693962
+round 3 tantalum         P1   ops   262342 p50 0.743 p99 0.975 cpu 1.00 ops/core   263483
+round 3 tantalum         P16  ops  1433244 p50 2.079 p99 4.927 cpu 1.00 ops/core  1438748
+round 3 tantalum-b       P1   ops   241665 p50 0.783 p99 1.295 cpu 0.99 ops/core   243740
+round 3 tantalum-b       P16  ops  2119403 p50 1.447 p99 2.319 cpu 0.99 ops/core  2134152
+round 3 valkey           P1   ops   220107 p50 0.839 p99 1.807 cpu 0.99 ops/core   222400
+round 3 valkey           P16  ops  1788051 p50 1.751 p99 2.847 cpu 1.00 ops/core  1795400
+round 3 memcached        P1   ops   226342 p50 0.815 p99 1.879 cpu 1.04 ops/core   216852
+round 3 memcached        P16  ops  1110109 p50 2.703 p99 5.791 cpu 1.26 ops/core   884396
+round 3 tantalum-uring   P1   ops   289376 p50 0.655 p99 1.071 cpu 0.99 ops/core   292029
+round 3 tantalum-uring   P16  ops  1769754 p50 1.735 p99 2.367 cpu 1.00 ops/core  1774488
+round 3 tantalum-b-uring P1   ops   275172 p50 0.671 p99 1.719 cpu 0.98 ops/core   279439
+round 3 tantalum-b-uring P16  ops  2573902 p50 1.207 p99 1.567 cpu 0.99 ops/core  2590001
+
+# 6.12.76-linuxkit, 8 CPUs; 2 server thread(s), memtier 6 x 33 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# tantalum 0.3.0 listening on 127.0.0.1:7962 (2 threads, io_uring I/O, no memory limit)
+round 1 tantalum-uring   P1   ops   492272 p50 0.383 p99 1.015 cpu 1.94 ops/core   253161
+round 1 tantalum-uring   P16  ops  2950407 p50 0.991 p99 2.479 cpu 1.94 ops/core  1519226
+round 1 tantalum-b-uring P1   ops   488577 p50 0.383 p99 1.103 cpu 1.95 ops/core   250733
+round 1 tantalum-b-uring P16  ops  3783961 p50 0.743 p99 2.399 cpu 1.82 ops/core  2077548
+round 1 tantalum         P1   ops   477938 p50 0.399 p99 1.055 cpu 1.93 ops/core   247900
+round 1 tantalum         P16  ops  2614304 p50 1.103 p99 3.391 cpu 1.93 ops/core  1354127
+round 1 tantalum-b       P1   ops   488479 p50 0.391 p99 0.783 cpu 1.97 ops/core   248154
+round 1 tantalum-b       P16  ops  3450284 p50 0.799 p99 2.527 cpu 1.81 ops/core  1907846
+round 2 tantalum-b-uring P1   ops   512268 p50 0.375 p99 0.751 cpu 1.98 ops/core   258403
+round 2 tantalum-b-uring P16  ops  3665891 p50 0.759 p99 2.671 cpu 1.79 ops/core  2053297
+round 2 tantalum         P1   ops   486668 p50 0.399 p99 0.847 cpu 1.97 ops/core   247071
+round 2 tantalum         P16  ops  2516445 p50 1.127 p99 3.583 cpu 1.90 ops/core  1322052
+round 2 tantalum-b       P1   ops   478353 p50 0.399 p99 0.831 cpu 1.96 ops/core   243654
+round 2 tantalum-b       P16  ops  3557184 p50 0.783 p99 2.943 cpu 1.86 ops/core  1915140
+round 2 tantalum-uring   P1   ops   471044 p50 0.399 p99 1.119 cpu 1.94 ops/core   242688
+round 2 tantalum-uring   P16  ops  2974418 p50 0.991 p99 2.223 cpu 1.93 ops/core  1539123
+round 3 tantalum         P1   ops   444474 p50 0.399 p99 1.247 cpu 1.89 ops/core   234861
+round 3 tantalum         P16  ops  2667154 p50 1.119 p99 1.991 cpu 1.93 ops/core  1381465
+round 3 tantalum-b       P1   ops   445303 p50 0.407 p99 1.087 cpu 1.88 ops/core   237035
+round 3 tantalum-b       P16  ops  3800582 p50 0.775 p99 1.903 cpu 1.91 ops/core  1990891
+round 3 tantalum-uring   P1   ops   466793 p50 0.391 p99 1.191 cpu 1.94 ops/core   241084
+round 3 tantalum-uring   P16  ops  3048928 p50 0.983 p99 2.239 cpu 1.95 ops/core  1561051
+round 3 tantalum-b-uring P1   ops   465506 p50 0.375 p99 1.567 cpu 1.93 ops/core   241713
+round 3 tantalum-b-uring P16  ops  4243140 p50 0.719 p99 1.551 cpu 1.92 ops/core  2207001
+
+
+# Stage 1 only (buckets 4 ahead) as tantalum-b:
+# 6.12.76-linuxkit, 8 CPUs; 1 server thread(s), memtier 6 x 33 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# tantalum 0.3.0 listening on 127.0.0.1:7962 (1 threads, io_uring I/O, no memory limit)
+round 1 tantalum-uring   P1   ops   293288 p50 0.647 p99 1.319 cpu 0.98 ops/core   298016
+round 1 tantalum-uring   P16  ops  1728419 p50 1.743 p99 2.703 cpu 0.99 ops/core  1737640
+round 1 tantalum-b-uring P1   ops   286975 p50 0.663 p99 1.335 cpu 0.99 ops/core   290456
+round 1 tantalum-b-uring P16  ops  1972952 p50 1.535 p99 2.319 cpu 1.00 ops/core  1978927
+round 1 tantalum         P1   ops   263072 p50 0.719 p99 1.399 cpu 0.99 ops/core   264908
+round 1 tantalum         P16  ops  1510959 p50 1.999 p99 3.503 cpu 1.00 ops/core  1518174
+round 1 tantalum-b       P1   ops   262576 p50 0.727 p99 1.159 cpu 0.99 ops/core   264481
+round 1 tantalum-b       P16  ops  1748273 p50 1.751 p99 2.351 cpu 1.00 ops/core  1755759
+round 2 tantalum-b-uring P1   ops   296489 p50 0.623 p99 1.639 cpu 0.99 ops/core   299859
+round 2 tantalum-b-uring P16  ops  2061531 p50 1.519 p99 1.895 cpu 1.00 ops/core  2067284
+round 2 tantalum         P1   ops   234400 p50 0.799 p99 1.895 cpu 0.99 ops/core   236664
+round 2 tantalum         P16  ops  1550818 p50 2.023 p99 2.415 cpu 1.00 ops/core  1554118
+round 2 tantalum-b       P1   ops   241740 p50 0.791 p99 1.775 cpu 0.99 ops/core   245290
+round 2 tantalum-b       P16  ops  1712186 p50 1.839 p99 2.111 cpu 1.00 ops/core  1715866
+round 2 tantalum-uring   P1   ops   272426 p50 0.687 p99 1.647 cpu 0.99 ops/core   275472
+round 2 tantalum-uring   P16  ops  1802717 p50 1.711 p99 2.303 cpu 1.00 ops/core  1804757
+round 3 tantalum         P1   ops   242859 p50 0.791 p99 1.719 cpu 0.99 ops/core   244881
+round 3 tantalum         P16  ops  1497224 p50 2.039 p99 3.583 cpu 1.00 ops/core  1504564
+round 3 tantalum-b       P1   ops   256947 p50 0.751 p99 1.087 cpu 1.00 ops/core   257768
+round 3 tantalum-b       P16  ops  1672485 p50 1.823 p99 3.503 cpu 1.00 ops/core  1679490
+round 3 tantalum-uring   P1   ops   295041 p50 0.647 p99 1.143 cpu 0.99 ops/core   298764
+round 3 tantalum-uring   P16  ops  1709795 p50 1.751 p99 3.711 cpu 1.00 ops/core  1715217
+round 3 tantalum-b-uring P1   ops   284559 p50 0.679 p99 0.991 cpu 0.99 ops/core   286731
+round 3 tantalum-b-uring P16  ops  1906583 p50 1.543 p99 4.159 cpu 0.99 ops/core  1920421
+
+# 0.4.1 (hash keys once, short-header parser fast path, hand-formatted bulk headers)
+# as tantalum-b vs 0.4 as tantalum, 4 rotated rounds, 1 server thread, 1M keys. Per-core medians
+# and every round, in round order:
+# tantalum          P1   ops/core median    248532  all 261k 257k 240k 238k  p99 1.203
+# tantalum          P16  ops/core median   2086960  all 2052k 2071k 2103k 2174k  p99 2.975
+# tantalum-b        P1   ops/core median    271310  all 280k 281k 262k 249k  p99 0.971
+# tantalum-b        P16  ops/core median   2272266  all 2271k 2224k 2273k 2348k  p99 2.663
+# tantalum-b-uring  P1   ops/core median    301298  all 305k 307k 298k 272k  p99 1.067
+# tantalum-b-uring  P16  ops/core median   2710880  all 2677k 2589k 2744k 2787k  p99 1.979
+# tantalum-uring    P1   ops/core median    287762  all 290k 297k 286k 278k  p99 1.123
+# tantalum-uring    P16  ops/core median   2480985  all 2472k 2452k 2490k 2608k  p99 2.415
+# 
+# Raw rounds:
+# 6.12.76-linuxkit, 8 CPUs; 1 server thread(s), memtier 6 x 33 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+round 1 tantalum-uring   P1   ops   286510 p50 0.663 p99 1.031 cpu 0.99 ops/core   289790
+round 1 tantalum-uring   P16  ops  2461837 p50 1.223 p99 2.607 cpu 1.00 ops/core  2471820
+round 1 tantalum-b-uring P1   ops   301138 p50 0.639 p99 1.023 cpu 0.99 ops/core   304738
+round 1 tantalum-b-uring P16  ops  2661718 p50 1.119 p99 2.415 cpu 0.99 ops/core  2677408
+round 1 tantalum         P1   ops   259218 p50 0.743 p99 1.039 cpu 0.99 ops/core   260722
+round 1 tantalum         P16  ops  2028525 p50 1.447 p99 3.551 cpu 0.99 ops/core  2051880
+round 1 tantalum-b       P1   ops   279749 p50 0.711 p99 0.903 cpu 1.00 ops/core   280219
+round 1 tantalum-b       P16  ops  2252982 p50 1.327 p99 3.183 cpu 0.99 ops/core  2271238
+round 2 tantalum-b-uring P1   ops   304067 p50 0.639 p99 0.863 cpu 0.99 ops/core   306920
+round 2 tantalum-b-uring P16  ops  2560187 p50 1.151 p99 3.151 cpu 0.99 ops/core  2589289
+round 2 tantalum         P1   ops   256322 p50 0.775 p99 0.911 cpu 1.00 ops/core   257076
+round 2 tantalum         P16  ops  2051905 p50 1.447 p99 3.887 cpu 0.99 ops/core  2070621
+round 2 tantalum-b       P1   ops   280007 p50 0.703 p99 0.895 cpu 1.00 ops/core   280604
+round 2 tantalum-b       P16  ops  2205423 p50 1.351 p99 3.423 cpu 0.99 ops/core  2223870
+round 2 tantalum-uring   P1   ops   294504 p50 0.663 p99 0.903 cpu 0.99 ops/core   297148
+round 2 tantalum-uring   P16  ops  2429325 p50 1.223 p99 3.087 cpu 0.99 ops/core  2451774
+round 3 tantalum         P1   ops   238549 p50 0.815 p99 1.367 cpu 0.99 ops/core   239989
+round 3 tantalum         P16  ops  2094865 p50 1.463 p99 2.399 cpu 1.00 ops/core  2103300
+round 3 tantalum-b       P1   ops   258946 p50 0.743 p99 1.039 cpu 0.99 ops/core   262400
+round 3 tantalum-b       P16  ops  2261883 p50 1.359 p99 2.143 cpu 0.99 ops/core  2273293
+round 3 tantalum-uring   P1   ops   283695 p50 0.679 p99 1.215 cpu 0.99 ops/core   285734
+round 3 tantalum-uring   P16  ops  2474806 p50 1.231 p99 2.223 cpu 0.99 ops/core  2490150
+round 3 tantalum-b-uring P1   ops   295321 p50 0.639 p99 1.111 cpu 0.99 ops/core   297858
+round 3 tantalum-b-uring P16  ops  2724619 p50 1.135 p99 1.543 cpu 0.99 ops/core  2744353
+round 4 tantalum-b       P1   ops   246932 p50 0.759 p99 1.799 cpu 0.99 ops/core   249463
+round 4 tantalum-b       P16  ops  2343155 p50 1.343 p99 1.583 cpu 1.00 ops/core  2347766
+round 4 tantalum-uring   P1   ops   275017 p50 0.687 p99 1.487 cpu 0.99 ops/core   277764
+round 4 tantalum-uring   P16  ops  2600730 p50 1.207 p99 1.479 cpu 1.00 ops/core  2608438
+round 4 tantalum-b-uring P1   ops   269450 p50 0.671 p99 2.319 cpu 0.99 ops/core   272083
+round 4 tantalum-b-uring P16  ops  2772400 p50 1.127 p99 1.455 cpu 0.99 ops/core  2786571
+round 4 tantalum         P1   ops   235820 p50 0.799 p99 1.615 cpu 0.99 ops/core   238302
+round 4 tantalum         P16  ops  2170186 p50 1.447 p99 1.719 cpu 1.00 ops/core  2174299

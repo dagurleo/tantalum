@@ -1,0 +1,204 @@
+# Docker Desktop on an Apple M1 Pro (Linux VM: 8 vCPUs, 8 GB), 2026-11-02, container run
+# with seccomp=unconfined so io_uring is allowed. Servers and memtier share the VM.
+# Run 1: Tantalum 0.3.0 with monoio's default ring setup; dragonfly-ep is --force_epoll.
+# 6.12.76-linuxkit, 8 CPUs, 4 server threads; tantalum 0.3.0 listening on 127.0.0.1:7962 (4 threads, io_uring I/O, no memory limit)
+# per-thread: pid 40, io_uring fds: 0
+# uring: pid 41, io_uring fds: 4
+# memcached: pid 42, io_uring fds: 0
+# dragonfly: pid 43, io_uring fds: 4
+# dragonfly-ep: pid 44, io_uring fds: 0
+# 1M keys x 32 B, 1:10 SET:GET, 12 s per run; P1-200: no pipelining, 200 clients;
+# P1-50: 50 clients; P16-200: pipeline 16. p50/p99 in ms; cpu = server cores used.
+round 1 per-thread   P1-200  ops    529957 p50 0.223 p99 2.463 cpu 2.61
+round 1 per-thread   P1-50   ops    306029 p50 0.159 p99 0.303 cpu 1.80
+round 1 per-thread   P16-200 ops   3500861 p50 0.711 p99 3.583 cpu 2.77
+round 1 uring        P1-200  ops    470216 p50 0.287 p99 2.415 cpu 2.77
+round 1 uring        P1-50   ops    269928 p50 0.183 p99 0.343 cpu 1.90
+round 1 uring        P16-200 ops   3380281 p50 0.839 p99 2.895 cpu 2.81
+round 1 memcached    P1-200  ops    504087 p50 0.239 p99 2.367 cpu 2.76
+round 1 memcached    P1-50   ops    286339 p50 0.167 p99 0.327 cpu 1.94
+round 1 memcached    P16-200 ops   2199557 p50 1.303 p99 4.047 cpu 3.32
+round 1 dragonfly    P1-200  ops    429029 p50 0.391 p99 1.871 cpu 2.66
+round 1 dragonfly    P1-50   ops    312199 p50 0.151 p99 0.391 cpu 3.00
+round 1 dragonfly    P16-200 ops   1928745 p50 1.519 p99 4.127 cpu 3.44
+round 1 dragonfly-ep P1-200  ops    356764 p50 0.455 p99 2.095 cpu 2.73
+round 1 dragonfly-ep P1-50   ops    272184 p50 0.167 p99 0.479 cpu 2.57
+round 1 dragonfly-ep P16-200 ops   1886100 p50 1.527 p99 4.383 cpu 3.45
+round 2 per-thread   P1-200  ops    522430 p50 0.215 p99 2.463 cpu 2.65
+round 2 per-thread   P1-50   ops    296554 p50 0.167 p99 0.311 cpu 1.80
+round 2 per-thread   P16-200 ops   3412269 p50 0.719 p99 3.775 cpu 2.73
+round 2 uring        P1-200  ops    445976 p50 0.303 p99 2.527 cpu 2.70
+round 2 uring        P1-50   ops    268682 p50 0.183 p99 0.351 cpu 1.93
+round 2 uring        P16-200 ops   3103432 p50 0.895 p99 3.263 cpu 2.72
+round 2 memcached    P1-200  ops    480625 p50 0.247 p99 2.527 cpu 2.72
+round 2 memcached    P1-50   ops    286259 p50 0.167 p99 0.335 cpu 1.94
+round 2 memcached    P16-200 ops   2135678 p50 1.311 p99 4.447 cpu 3.34
+round 2 dragonfly    P1-200  ops    410091 p50 0.415 p99 1.839 cpu 2.58
+round 2 dragonfly    P1-50   ops    310671 p50 0.151 p99 0.391 cpu 2.97
+round 2 dragonfly    P16-200 ops   1977844 p50 1.487 p99 3.983 cpu 3.55
+round 2 dragonfly-ep P1-200  ops    371568 p50 0.447 p99 2.063 cpu 2.82
+round 2 dragonfly-ep P1-50   ops    289393 p50 0.159 p99 0.487 cpu 3.01
+round 2 dragonfly-ep P16-200 ops   1784329 p50 1.543 p99 4.959 cpu 3.42
+round 3 per-thread   P1-200  ops    519745 p50 0.231 p99 2.511 cpu 2.62
+round 3 per-thread   P1-50   ops    296472 p50 0.167 p99 0.319 cpu 1.82
+round 3 per-thread   P16-200 ops   3317028 p50 0.759 p99 3.727 cpu 2.73
+round 3 uring        P1-200  ops    429305 p50 0.319 p99 2.511 cpu 2.65
+round 3 uring        P1-50   ops    266772 p50 0.183 p99 0.359 cpu 1.93
+round 3 uring        P16-200 ops   3239932 p50 0.863 p99 2.959 cpu 2.76
+round 3 memcached    P1-200  ops    481343 p50 0.239 p99 2.575 cpu 2.70
+round 3 memcached    P1-50   ops    286946 p50 0.167 p99 0.343 cpu 1.94
+round 3 memcached    P16-200 ops   1895049 p50 1.415 p99 5.983 cpu 3.10
+round 3 dragonfly    P1-200  ops    328879 p50 0.463 p99 2.799 cpu 2.41
+round 3 dragonfly    P1-50   ops    248932 p50 0.175 p99 0.687 cpu 2.64
+round 3 dragonfly    P16-200 ops   1689115 p50 1.631 p99 5.407 cpu 3.20
+round 3 dragonfly-ep P1-200  ops    344274 p50 0.471 p99 2.111 cpu 2.65
+round 3 dragonfly-ep P1-50   ops    302455 p50 0.151 p99 0.447 cpu 2.79
+round 3 dragonfly-ep P16-200 ops   1847560 p50 1.559 p99 4.447 cpu 3.45
+
+# Run 2: ring setups (uring = DEFER_TASKRUN + SINGLE_ISSUER, uring-coop = COOP_TASKRUN,
+# uring-plain = monoio's default, as in run 1). Host load average 27-45 from macOS background
+# jobs during this run: rounds 1-2 are disturbed (see memcached round 2); round 3 is clean.
+# 6.12.76-linuxkit, 8 CPUs, 4 server threads; tantalum 0.3.0 listening on 127.0.0.1:7962 (4 threads, io_uring I/O, no memory limit)
+# per-thread: pid 13, io_uring fds: 0
+# uring: pid 14, io_uring fds: 4
+# uring-coop: pid 15, io_uring fds: 4
+# uring-plain: pid 16, io_uring fds: 4
+# memcached: pid 17, io_uring fds: 0
+# dragonfly: pid 18, io_uring fds: 4
+# 1M keys x 32 B, 1:10 SET:GET, 12 s per run; P1-200: no pipelining, 200 clients;
+# P1-50: 50 clients; P16-200: pipeline 16. p50/p99 in ms; cpu = server cores used.
+round 1 per-thread   P1-200  ops    500897 p50 0.207 p99 2.991 cpu 2.55
+round 1 per-thread   P1-50   ops    275687 p50 0.167 p99 0.495 cpu 1.94
+round 1 per-thread   P16-200 ops   2503550 p50 0.943 p99 5.663 cpu 2.41
+round 1 uring        P1-200  ops    464954 p50 0.263 p99 2.671 cpu 2.30
+round 1 uring        P1-50   ops    268782 p50 0.167 p99 0.631 cpu 1.86
+round 1 uring        P16-200 ops   3084313 p50 0.879 p99 3.503 cpu 2.62
+round 1 uring-coop   P1-200  ops    379077 p50 0.295 p99 3.375 cpu 2.10
+round 1 uring-coop   P1-50   ops    273130 p50 0.159 p99 0.631 cpu 1.84
+round 1 uring-coop   P16-200 ops   2669917 p50 0.991 p99 4.639 cpu 2.35
+round 1 uring-plain  P1-200  ops    330837 p50 0.343 p99 3.999 cpu 2.21
+round 1 uring-plain  P1-50   ops    269837 p50 0.175 p99 0.407 cpu 1.96
+round 1 uring-plain  P16-200 ops   2565264 p50 1.007 p99 4.639 cpu 2.50
+round 1 memcached    P1-200  ops    451953 p50 0.231 p99 2.687 cpu 2.62
+round 1 memcached    P1-50   ops    276594 p50 0.167 p99 0.463 cpu 2.02
+round 1 memcached    P16-200 ops   1863035 p50 1.439 p99 5.855 cpu 3.15
+round 1 dragonfly    P1-200  ops    391993 p50 0.415 p99 1.991 cpu 2.66
+round 1 dragonfly    P1-50   ops    309308 p50 0.159 p99 0.391 cpu 2.94
+round 1 dragonfly    P16-200 ops   1891136 p50 1.551 p99 4.191 cpu 3.41
+round 2 per-thread   P1-200  ops    405099 p50 0.223 p99 2.975 cpu 2.28
+round 2 per-thread   P1-50   ops    288373 p50 0.167 p99 0.335 cpu 1.82
+round 2 per-thread   P16-200 ops   2345806 p50 0.991 p99 5.727 cpu 2.27
+round 2 uring        P1-200  ops    442322 p50 0.295 p99 2.623 cpu 2.22
+round 2 uring        P1-50   ops    308332 p50 0.159 p99 0.383 cpu 1.98
+round 2 uring        P16-200 ops   3002315 p50 0.951 p99 3.231 cpu 2.41
+round 2 uring-coop   P1-200  ops    446388 p50 0.303 p99 2.495 cpu 2.27
+round 2 uring-coop   P1-50   ops    316938 p50 0.159 p99 0.327 cpu 2.11
+round 2 uring-coop   P16-200 ops   2748482 p50 1.007 p99 3.775 cpu 2.31
+round 2 uring-plain  P1-200  ops    377863 p50 0.375 p99 2.703 cpu 2.40
+round 2 uring-plain  P1-50   ops    271313 p50 0.175 p99 0.391 cpu 2.12
+round 2 uring-plain  P16-200 ops   1606377 p50 1.159 p99 16.767 cpu 1.93
+round 2 memcached    P1-200  ops     37261 p50 0.175 p99 132.095 cpu 1.27
+round 2 memcached    P1-50   ops     21402 p50 0.655 p99 15.807 cpu 0.50
+round 2 memcached    P16-200 ops    426877 p50 2.735 p99 76.799 cpu 1.48
+round 2 dragonfly    P1-200  ops    119407 p50 0.583 p99 16.127 cpu 1.28
+round 2 dragonfly    P1-50   ops    273642 p50 0.167 p99 0.487 cpu 2.99
+round 2 dragonfly    P16-200 ops   1660305 p50 1.687 p99 5.375 cpu 3.19
+round 3 per-thread   P1-200  ops    501084 p50 0.215 p99 2.767 cpu 2.55
+round 3 per-thread   P1-50   ops    288327 p50 0.159 p99 0.351 cpu 1.80
+round 3 per-thread   P16-200 ops   3562034 p50 0.695 p99 3.647 cpu 2.80
+round 3 uring        P1-200  ops    547402 p50 0.247 p99 2.127 cpu 2.62
+round 3 uring        P1-50   ops    316757 p50 0.159 p99 0.295 cpu 1.86
+round 3 uring        P16-200 ops   3512882 p50 0.791 p99 2.911 cpu 2.69
+round 3 uring-coop   P1-200  ops    540567 p50 0.231 p99 2.367 cpu 2.61
+round 3 uring-coop   P1-50   ops    320526 p50 0.159 p99 0.287 cpu 1.88
+round 3 uring-coop   P16-200 ops   3650815 p50 0.767 p99 2.783 cpu 2.72
+round 3 uring-plain  P1-200  ops    466520 p50 0.279 p99 2.559 cpu 2.77
+round 3 uring-plain  P1-50   ops    267574 p50 0.183 p99 0.375 cpu 1.95
+round 3 uring-plain  P16-200 ops   3282804 p50 0.863 p99 2.943 cpu 2.73
+round 3 memcached    P1-200  ops    494616 p50 0.239 p99 2.335 cpu 2.73
+round 3 memcached    P1-50   ops    289045 p50 0.167 p99 0.319 cpu 1.96
+round 3 memcached    P16-200 ops   2126296 p50 1.311 p99 4.639 cpu 3.32
+round 3 dragonfly    P1-200  ops    400505 p50 0.407 p99 2.111 cpu 2.58
+round 3 dragonfly    P1-50   ops    309719 p50 0.159 p99 0.391 cpu 2.96
+round 3 dragonfly    P16-200 ops   1897037 p50 1.519 p99 4.383 cpu 3.44
+# per-thread thread cpu s: 62 58 63 63 
+# uring thread cpu s: 1 62 57 64 66 
+# uring-coop thread cpu s: 1 64 58 66 55 
+# uring-plain thread cpu s: 66 64 59 60 
+# memcached thread cpu s: 51 55 53 54 2 21 
+# dragonfly thread cpu s: 78 79 79 80 
+
+# Run 3: Tantalum only, 5 rounds of 10 s with the order rotated each round, host load
+# average ~25. Medians vs per-thread: uring P1-200 +1.8%, P1-50 +3.3%, P16-200 +2.1%;
+# uring-coop +2.0%, +4.4%, -0.4%; uring-plain -13.2%, -8.8%, -7.6%.
+# 6.12.76-linuxkit, 8 CPUs, 4 server threads; tantalum 0.3.0 listening on 127.0.0.1:7962 (4 threads, io_uring I/O, no memory limit)
+# per-thread: pid 1291, io_uring fds: 0
+# uring: pid 1292, io_uring fds: 4
+# uring-coop: pid 1293, io_uring fds: 4
+# uring-plain: pid 1294, io_uring fds: 4
+# 1M keys x 32 B, 1:10 SET:GET, 10 s per run; P1-200: no pipelining, 200 clients;
+# P1-50: 50 clients; P16-200: pipeline 16. p50/p99 in ms; cpu = server cores used.
+round 1 per-thread   P1-200  ops    517659 p50 0.215 p99 2.719 cpu 2.56
+round 1 per-thread   P1-50   ops    301940 p50 0.159 p99 0.311 cpu 1.84
+round 1 per-thread   P16-200 ops   3558133 p50 0.695 p99 3.647 cpu 2.79
+round 1 uring        P1-200  ops    544617 p50 0.247 p99 2.159 cpu 2.55
+round 1 uring        P1-50   ops    312820 p50 0.159 p99 0.295 cpu 1.87
+round 1 uring        P16-200 ops   3666289 p50 0.759 p99 2.719 cpu 2.72
+round 1 uring-coop   P1-200  ops    532719 p50 0.231 p99 2.335 cpu 2.55
+round 1 uring-coop   P1-50   ops    310040 p50 0.159 p99 0.295 cpu 1.86
+round 1 uring-coop   P16-200 ops   3629146 p50 0.767 p99 2.847 cpu 2.69
+round 1 uring-plain  P1-200  ops    467601 p50 0.255 p99 2.991 cpu 2.72
+round 1 uring-plain  P1-50   ops    263353 p50 0.183 p99 0.407 cpu 1.94
+round 1 uring-plain  P16-200 ops   3204643 p50 0.887 p99 2.911 cpu 2.80
+round 2 uring        P1-200  ops    530069 p50 0.247 p99 2.111 cpu 2.50
+round 2 uring        P1-50   ops    305092 p50 0.159 p99 0.319 cpu 1.92
+round 2 uring        P16-200 ops   3608230 p50 0.775 p99 2.735 cpu 2.70
+round 2 uring-coop   P1-200  ops    561123 p50 0.231 p99 2.143 cpu 2.66
+round 2 uring-coop   P1-50   ops    319324 p50 0.159 p99 0.287 cpu 1.89
+round 2 uring-coop   P16-200 ops   3629904 p50 0.751 p99 3.007 cpu 2.68
+round 2 uring-plain  P1-200  ops    477899 p50 0.287 p99 2.351 cpu 2.80
+round 2 uring-plain  P1-50   ops    277716 p50 0.175 p99 0.335 cpu 1.96
+round 2 uring-plain  P16-200 ops   3402147 p50 0.823 p99 2.879 cpu 2.79
+round 2 per-thread   P1-200  ops    544426 p50 0.207 p99 2.607 cpu 2.72
+round 2 per-thread   P1-50   ops    301236 p50 0.159 p99 0.303 cpu 1.85
+round 2 per-thread   P16-200 ops   3658951 p50 0.679 p99 3.519 cpu 2.82
+round 3 uring-coop   P1-200  ops    530868 p50 0.231 p99 2.271 cpu 2.59
+round 3 uring-coop   P1-50   ops    314612 p50 0.159 p99 0.295 cpu 1.85
+round 3 uring-coop   P16-200 ops   3613452 p50 0.767 p99 2.799 cpu 2.72
+round 3 uring-plain  P1-200  ops    464725 p50 0.295 p99 2.383 cpu 2.76
+round 3 uring-plain  P1-50   ops    274642 p50 0.183 p99 0.343 cpu 1.97
+round 3 uring-plain  P16-200 ops   3368123 p50 0.839 p99 2.879 cpu 2.78
+round 3 per-thread   P1-200  ops    538833 p50 0.207 p99 2.607 cpu 2.72
+round 3 per-thread   P1-50   ops    296680 p50 0.167 p99 0.311 cpu 1.81
+round 3 per-thread   P16-200 ops   3635983 p50 0.695 p99 3.487 cpu 2.82
+round 3 uring        P1-200  ops    550650 p50 0.239 p99 2.223 cpu 2.59
+round 3 uring        P1-50   ops    311279 p50 0.159 p99 0.319 cpu 1.88
+round 3 uring        P16-200 ops   3737951 p50 0.743 p99 2.767 cpu 2.76
+round 4 uring-plain  P1-200  ops    470473 p50 0.287 p99 2.367 cpu 2.81
+round 4 uring-plain  P1-50   ops    276168 p50 0.175 p99 0.343 cpu 1.95
+round 4 uring-plain  P16-200 ops   3403365 p50 0.823 p99 2.879 cpu 2.82
+round 4 per-thread   P1-200  ops    539268 p50 0.199 p99 2.831 cpu 2.80
+round 4 per-thread   P1-50   ops    298493 p50 0.167 p99 0.311 cpu 1.86
+round 4 per-thread   P16-200 ops   3644623 p50 0.687 p99 3.503 cpu 2.81
+round 4 uring        P1-200  ops    548590 p50 0.231 p99 2.223 cpu 2.65
+round 4 uring        P1-50   ops    314312 p50 0.159 p99 0.287 cpu 1.84
+round 4 uring        P16-200 ops   3743809 p50 0.751 p99 2.575 cpu 2.72
+round 4 uring-coop   P1-200  ops    549541 p50 0.223 p99 2.303 cpu 2.65
+round 4 uring-coop   P1-50   ops    309982 p50 0.159 p99 0.295 cpu 1.87
+round 4 uring-coop   P16-200 ops   3636852 p50 0.759 p99 2.831 cpu 2.70
+round 5 per-thread   P1-200  ops    531271 p50 0.207 p99 2.687 cpu 2.71
+round 5 per-thread   P1-50   ops    303672 p50 0.159 p99 0.303 cpu 1.85
+round 5 per-thread   P16-200 ops   3675711 p50 0.679 p99 3.519 cpu 2.83
+round 5 uring        P1-200  ops    554503 p50 0.239 p99 2.143 cpu 2.64
+round 5 uring        P1-50   ops    302229 p50 0.167 p99 0.303 cpu 1.81
+round 5 uring        P16-200 ops   3721772 p50 0.751 p99 2.687 cpu 2.75
+round 5 uring-coop   P1-200  ops    553202 p50 0.231 p99 2.223 cpu 2.65
+round 5 uring-coop   P1-50   ops    318478 p50 0.159 p99 0.279 cpu 1.84
+round 5 uring-coop   P16-200 ops   3677350 p50 0.743 p99 3.071 cpu 2.70
+round 5 uring-plain  P1-200  ops    464467 p50 0.287 p99 2.479 cpu 2.78
+round 5 uring-plain  P1-50   ops    260246 p50 0.183 p99 0.399 cpu 1.98
+round 5 uring-plain  P16-200 ops   3299957 p50 0.847 p99 3.023 cpu 2.81
+# per-thread thread cpu s: 93 94 88 95 
+# uring thread cpu s: 92 94 89 87 
+# uring-coop thread cpu s: 84 95 90 92 
+# uring-plain thread cpu s: 90 98 93 98 

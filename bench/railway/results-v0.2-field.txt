@@ -1,0 +1,203 @@
+# Railway, 2026-11-02: ROLE=suite with v0.2.0 (cuckoo table, pool with a 4 MB hot list).
+# AMD EPYC 9655P host. Raw log lines sorted by timestamp; match results to tests by their
+# ### header and server_cpu_cores lines.
+
+Starting Container
+### client: 48 CPUs, AMD EPYC 9655P 96-Core Processor
+### versions: redis v=8.10.3, Valkey server v=9.1.3, memcached 1.6.38, dragonfly [0;32mv2.0.2-8ce4bbb106586057fbd85f71ed353c60d0d5bf87[m
+### memory value=16 keys=2000000 server=ferrokv idle_mb=7.3 rss_mb=101.7 stored=2000000
+### memory value=16 keys=2000000 server=redis idle_mb=18.7 rss_mb=158.8 stored=2000000
+### memory value=16 keys=2000000 server=valkey idle_mb=23.7 rss_mb=154.1 stored=2000000
+### memory value=16 keys=2000000 server=memcached idle_mb=6.0 rss_mb=208.5 stored=2000000
+### memory value=16 keys=2000000 server=dragonfly idle_mb=133.6 rss_mb=270.3 stored=2000000
+### memory value=100 keys=1000000 server=ferrokv idle_mb=7.4 rss_mb=141.4 stored=1000000
+### memory value=100 keys=1000000 server=redis idle_mb=18.8 rss_mb=183.1 stored=1000000
+### memory value=100 keys=1000000 server=valkey idle_mb=23.5 rss_mb=185.6 stored=1000000
+### memory value=100 keys=1000000 server=memcached idle_mb=6.0 rss_mb=200.5 stored=1000000
+### memory value=100 keys=1000000 server=dragonfly idle_mb=133.6 rss_mb=295.4 stored=1000000
+### memory value=1024 keys=200000 server=ferrokv idle_mb=7.3 rss_mb=227.1 stored=200000
+### memory value=1024 keys=200000 server=redis idle_mb=18.8 rss_mb=276.9 stored=200000
+### memory value=1024 keys=200000 server=valkey idle_mb=23.7 rss_mb=280.2 stored=200000
+### memory value=1024 keys=200000 server=memcached idle_mb=5.9 rss_mb=236.8 stored=200000
+### memory value=1024 keys=200000 server=dragonfly idle_mb=133.6 rss_mb=355.0 stored=200000
+### memory value=10240 keys=20000 server=ferrokv idle_mb=7.3 rss_mb=215.4 stored=20000
+### memory value=10240 keys=20000 server=redis idle_mb=18.8 rss_mb=258.1 stored=20000
+### memory value=10240 keys=20000 server=valkey idle_mb=23.7 rss_mb=262.0 stored=20000
+### memory value=10240 keys=20000 server=memcached idle_mb=6.0 rss_mb=222.1 stored=20000
+### memory value=10240 keys=20000 server=dragonfly idle_mb=133.5 rss_mb=409.6 stored=20000
+### versions: ferrokv_version:0.2.0
+### throughput round=1 server=ferrokv pipeline=1
+Sets        33679.64          ---          ---         0.53976         0.51900         1.17500         2.35100      2561.78 
+Gets       336730.95    336730.95         0.00         0.53986         0.51900         1.17500         2.43100     23968.65 
+Totals     370410.59    336730.95         0.00         0.53985         0.51900         1.17500         2.43100     26530.42 
+server_cpu_cores: 3.79
+### throughput round=1 server=ferrokv pipeline=16
+Sets       258228.90          ---          ---         1.12308         1.07900         2.49500         4.79900     19641.77 
+Gets      2582219.45   2582219.45         0.00         1.12324         1.07900         2.51100         4.79900    183803.76 
+Totals    2840448.35   2582219.45         0.00         1.12323         1.07900         2.49500         4.79900    203445.53 
+server_cpu_cores: 3.81
+### throughput round=1 server=redis pipeline=1
+Totals     104515.06     95007.71         0.00         1.91316         1.80700         4.01500         5.88700      7485.88 
+server_cpu_cores: 0.98
+### throughput round=1 server=redis pipeline=16
+Sets         9507.34          ---          ---         1.91560         1.80700         4.03100         6.07900       723.16 
+Gets        95007.71     95007.71         0.00         1.91291         1.80700         4.01500         5.85500      6762.73 
+Sets        80233.17          ---          ---         3.62067         3.27900         7.90300        12.35100      6102.78 
+Gets       802265.96    802265.96         0.00         3.62082         3.27900         7.90300        12.41500     57105.68 
+Totals     882499.13    802265.96         0.00         3.62080         3.27900         7.90300        12.41500     63208.46 
+server_cpu_cores: 0.91
+### throughput round=1 server=valkey pipeline=1
+Sets        12544.64          ---          ---         1.44966         1.34300         3.23100         5.69500       954.19 
+Gets       125381.04    125381.04         0.00         1.44980         1.34300         3.26300         5.50300      8924.69 
+Totals     137925.68    125381.04         0.00         1.44979         1.34300         3.26300         5.53500      9878.88 
+server_cpu_cores: 0.98
+### throughput round=1 server=valkey pipeline=16
+Gets      1092496.26   1092496.26         0.00         2.65882         2.46300         5.47100         7.90300     77764.48 
+Totals    1201752.45   1092496.26         0.00         2.65883         2.46300         5.47100         7.90300     86074.83 
+server_cpu_cores: 0.98
+Sets       109256.19          ---          ---         2.65889         2.46300         5.47100         7.90300      8310.36 
+### throughput round=1 server=memcached pipeline=1
+Sets        39422.91          ---          ---         0.46302         0.41500         1.19100         3.26300      2652.14 
+Gets       394158.95    394158.95         0.00         0.46076         0.40700         1.18300         3.19900     33017.55 
+Totals     433581.86    394158.95         0.00         0.46096         0.40700         1.18300         3.19900     35669.70 
+server_cpu_cores: 4.00
+### throughput round=1 server=memcached pipeline=16
+Sets       199728.92          ---          ---         1.44903         1.29500         3.80700         7.61500     13436.59 
+Gets      1997223.99   1997223.99         0.00         1.44813         1.29500         3.79100         7.61500    167302.10 
+Totals    2196952.91   1997223.99         0.00         1.44821         1.29500         3.79100         7.61500    180738.69 
+server_cpu_cores: 4.62
+### throughput round=1 server=dragonfly pipeline=1
+Sets        23469.72          ---          ---         0.77218         0.73500         1.80700         7.80700      1785.19 
+Gets       234635.90    234635.90         0.00         0.77494         0.73500         1.81500         9.21500     16701.50 
+Totals     258105.62    234635.90         0.00         0.77468         0.73500         1.81500         8.89500     18486.69 
+server_cpu_cores: 3.70
+### throughput round=1 server=dragonfly pipeline=16
+Sets       120250.12          ---          ---         2.41480         2.09500         6.55900        43.51900      9146.59 
+Gets      1202434.64   1202434.64         0.00         2.41508         2.09500         6.55900        43.51900     85589.97 
+Totals    1322684.77   1202434.64         0.00         2.41506         2.09500         6.55900        43.51900     94736.55 
+server_cpu_cores: 3.69
+### throughput round=1 server=redis-io pipeline=1
+Sets        24316.72          ---          ---         0.75036         0.67900         1.88700         4.60700      1849.62 
+Gets       243100.28    243100.28         0.00         0.74743         0.67900         1.87900         4.47900     17304.00 
+Totals     267417.00    243100.28         0.00         0.74770         0.67900         1.87900         4.51100     19153.62 
+server_cpu_cores: 3.19
+### throughput round=1 server=redis-io pipeline=16
+Sets       145928.69          ---          ---         1.98949         1.87100         4.35100         8.51100     11099.79 
+Gets      1459223.49   1459223.49         0.00         1.98945         1.87100         4.35100         8.51100    103868.31 
+Totals    1605152.18   1459223.49         0.00         1.98945         1.87100         4.35100         8.51100    114968.10 
+server_cpu_cores: 2.62
+### throughput round=2 server=ferrokv pipeline=1
+Sets        31438.99          ---          ---         0.57926         0.55100         1.33500         3.03900      2391.35 
+Gets       314325.32    314325.32         0.00         0.57809         0.55100         1.33500         3.02300     22373.82 
+Totals     345764.31    314325.32         0.00         0.57820         0.55100         1.33500         3.02300     24765.17 
+server_cpu_cores: 3.77
+### throughput round=2 server=ferrokv pipeline=16
+Sets       248504.93          ---          ---         1.16701         1.11100         2.71900         5.47100     18902.14 
+Gets      2484986.65   2484986.65         0.00         1.16690         1.11100         2.71900         5.50300    176882.66 
+Totals    2733491.58   2484986.65         0.00         1.16691         1.11100         2.71900         5.50300    195784.80 
+server_cpu_cores: 3.78
+### throughput round=2 server=redis pipeline=1
+Sets        10298.70          ---          ---         1.76785         1.63900         3.85500         6.01500       783.35 
+Gets       102921.87    102921.87         0.00         1.76589         1.63900         3.83900         5.95100      7326.05 
+Totals     113220.57    102921.87         0.00         1.76607         1.63900         3.83900         5.95100      8109.40 
+server_cpu_cores: 0.91
+### throughput round=2 server=redis pipeline=16
+Sets        78798.32          ---          ---         3.68718         3.34300         7.58300        10.30300      5993.65 
+Gets       787912.62    787912.62         0.00         3.68768         3.34300         7.58300        10.30300     56084.00 
+Totals     866710.95    787912.62         0.00         3.68763         3.34300         7.58300        10.30300     62077.65 
+server_cpu_cores: 0.92
+### throughput round=2 server=valkey pipeline=1
+Sets        10564.60          ---          ---         1.72318         1.63900         3.72700         6.07900       803.58 
+Gets       105575.07    105575.07         0.00         1.72148         1.63900         3.69500         6.04700      7514.90 
+Totals     116139.67    105575.07         0.00         1.72164         1.63900         3.69500         6.04700      8318.48 
+server_cpu_cores: 0.91
+### throughput round=2 server=valkey pipeline=16
+Sets        99925.56          ---          ---         2.90740         2.63900         6.14300         9.59900      7600.65 
+Gets       999191.10    999191.10         0.00         2.90724         2.63900         6.14300         9.59900     71122.95 
+Totals    1099116.66    999191.10         0.00         2.90726         2.63900         6.14300         9.59900     78723.60 
+server_cpu_cores: 0.97
+### throughput round=2 server=memcached pipeline=1
+Sets        40624.70          ---          ---         0.44935         0.40700         1.07900         2.83100      2732.99 
+Gets       406177.47    406177.47         0.00         0.44723         0.40700         1.06300         2.73500     34024.33 
+Totals     446802.17    406177.47         0.00         0.44742         0.40700         1.06300         2.75100     36757.32 
+server_cpu_cores: 4.02
+### throughput round=2 server=memcached pipeline=16
+Totals    2452747.87   2229764.76         0.00         1.29781         1.19100         3.18300         6.17500    201782.45 
+server_cpu_cores: 4.66
+### throughput round=2 server=dragonfly pipeline=1
+Sets       222983.12          ---          ---         1.29831         1.19100         3.18300         6.17500     15001.03 
+Gets      2229764.76   2229764.76         0.00         1.29776         1.19100         3.18300         6.17500    186781.42 
+Sets        25915.85          ---          ---         0.70109         0.67100         1.33500        12.86300      1971.25 
+Gets       259090.55    259090.55         0.00         0.70179         0.67100         1.33500        17.66300     18442.18 
+Totals     285006.40    259090.55         0.00         0.70172         0.67100         1.33500        17.53500     20413.43 
+server_cpu_cores: 3.71
+### throughput round=2 server=dragonfly pipeline=16
+Sets       139560.04          ---          ---         2.07952         1.82300         5.79100        38.39900     10615.36 
+Gets      1395533.43   1395533.43         0.00         2.08090         1.82300         5.79100        38.65500     99334.84 
+Totals    1535093.46   1395533.43         0.00         2.08077         1.82300         5.79100        38.65500    109950.20 
+server_cpu_cores: 3.71
+### throughput round=2 server=redis-io pipeline=1
+Sets        26564.37          ---          ---         0.68543         0.61500         1.54300         3.88700      2020.58 
+Gets       265576.94    265576.94         0.00         0.68453         0.61500         1.54300         3.87100     18903.88 
+Totals     292141.31    265576.94         0.00         0.68462         0.61500         1.54300         3.87100     20924.46 
+server_cpu_cores: 3.24
+### throughput round=2 server=redis-io pipeline=16
+Sets       160846.05          ---          ---         1.80567         1.71900         3.43900         7.29500     12234.46 
+Gets      1608392.53   1608392.53         0.00         1.80548         1.71900         3.43900         7.26300    114486.26 
+Totals    1769238.57   1608392.53         0.00         1.80550         1.71900         3.43900         7.26300    126720.72 
+server_cpu_cores: 2.56
+### eviction server=ferrokv limit_mb=1024
+Sets        81220.78          ---          ---         0.49292         0.47100         1.07100         2.43100     11817.86 
+Gets       324869.37    100922.49    223946.89         0.49242         0.47100         1.07100         2.41500     23157.24 
+Totals     406090.15    100922.49    223946.89         0.49252         0.47100         1.07100         2.41500     34975.10 
+server_cpu_cores: 3.81
+### eviction-state server=ferrokv keys=7592413 rss_mb=1054.3
+### eviction server=redis limit_mb=1024
+Sets        24078.67          ---          ---         1.67507         1.63100         3.42300         4.47900      3503.52 
+Gets        96302.39     23829.55     72472.85         1.65785         1.62300         3.40700         4.35100      6252.30 
+Totals     120381.06     23829.55     72472.85         1.66129         1.62300         3.40700         4.35100      9755.82 
+server_cpu_cores: 0.98
+### eviction-state server=redis keys=6281778 rss_mb=1068.1
+### eviction server=valkey limit_mb=1024
+Sets        23889.59          ---          ---         1.68367         1.63100         3.35900         4.51100      3476.00 
+Gets        95545.91     24335.40     71210.50         1.67217         1.62300         3.34300         4.28700      6272.89 
+Totals     119435.50     24335.40     71210.50         1.67447         1.62300         3.34300         4.31900      9748.89 
+server_cpu_cores: 0.99
+### eviction-state server=valkey keys=6477655 rss_mb=1053.3
+### eviction server=memcached limit_mb=1024
+server_cpu_cores: 3.97
+### eviction-state server=memcached keys=5592064 rss_mb=1065.3
+Sets        89925.09          ---          ---         0.44657         0.41500         1.00700         2.38300     12294.00 
+Gets       359687.52     79495.79    280191.73         0.44444         0.41500         0.99900         2.36700     19729.67 
+Totals     449612.61     79495.79    280191.73         0.44486         0.41500         0.99900         2.36700     32023.67 
+### eviction server=dragonfly limit_mb=1024
+Sets        57774.84          ---          ---         0.69257         0.68700         1.28700         4.86300      8406.41 
+Gets       231085.21     64553.21    166532.00         0.69237         0.68700         1.28700         4.92700     15744.45 
+Totals     288860.05     64553.21    166532.00         0.69241         0.68700         1.28700         4.92700     24150.86 
+server_cpu_cores: 3.79
+### eviction-state server=dragonfly keys=7145925 rss_mb=1164.6
+### churn t=30s ferrokv=1054.3MB redis=1065.0MB valkey=1067.3MB memcached=1040.8MB dragonfly=1191.8MB
+### churn t=60s ferrokv=1053.9MB redis=1065.9MB valkey=1067.9MB memcached=1040.8MB dragonfly=1196.3MB
+### churn t=90s ferrokv=1055.2MB redis=1065.8MB valkey=1068.0MB memcached=1040.8MB dragonfly=1198.2MB
+### churn t=120s ferrokv=1054.4MB redis=1066.2MB valkey=1067.9MB memcached=1040.8MB dragonfly=1200.3MB
+### churn t=150s ferrokv=1054.7MB redis=1067.0MB valkey=1068.3MB memcached=1040.8MB dragonfly=1200.3MB
+### churn t=180s ferrokv=1054.9MB redis=1066.5MB valkey=1068.3MB memcached=1040.8MB dragonfly=1204.3MB
+### churn t=210s ferrokv=1054.4MB redis=1066.8MB valkey=1068.7MB memcached=1040.8MB dragonfly=1204.3MB
+### churn t=240s ferrokv=1054.7MB redis=1066.6MB valkey=1069.0MB memcached=1040.8MB dragonfly=1204.3MB
+### churn t=270s ferrokv=1054.6MB redis=1067.1MB valkey=1069.1MB memcached=1040.8MB dragonfly=1204.5MB
+### churn t=300s ferrokv=1054.9MB redis=1067.4MB valkey=1068.6MB memcached=1040.8MB dragonfly=1198.9MB
+### churn-final server=ferrokv keys=926901 rss_mb=1054.9 ops=552972.32
+### churn-final server=redis keys=899610 rss_mb=1067.4 ops=268282.61
+### churn-final server=valkey keys=904611 rss_mb=1068.6 ops=272743.48
+### churn-final server=memcached keys=858349 rss_mb=1040.8 ops=546616.78
+### churn-final server=dragonfly keys=904196 rss_mb=1198.9 ops=485882.86
+### DONE
+
+# After rounding table sizes to whole pages (same host type, ferrokv alone, filled
+# once, RSS after 5 s; memcached at 1 KB and 10 KB as a reference):
+### memory value=16 keys=2000000 server=ferrokv rss_mb=97.3 segment_bytes:67555328 table_bytes:19922944
+### memory value=100 keys=1000000 server=ferrokv rss_mb=136.0 segment_bytes:117526528 table_bytes:9437184
+### memory value=1024 keys=200000 server=ferrokv rss_mb=223.3 segment_bytes:214142976 table_bytes:2097152
+### memory value=1024 keys=200000 server=memcached rss_mb=236.2
+### memory value=10240 keys=20000 server=ferrokv rss_mb=214.2 segment_bytes:211857408 table_bytes:187648
+### memory value=10240 keys=20000 server=memcached rss_mb=221.4

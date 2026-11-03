@@ -1,0 +1,24 @@
+# Railway, 2026-11-02, same container as results-v0.1-field.txt (AMD EPYC 9655P).
+# Each server alone, 1 GB limit (allkeys-lru; memcached -m 1024; Dragonfly cache_mode),
+# 100-byte random values, gaussian keys (sigma 7M over 56M). 25 s pipelined fill, then
+# 30 s measured with --randomize so requests are independent of the fill sequence.
+# memtier columns: Ops/sec Hits/sec Misses/sec Avg p50 p99 p99.9 KB/sec
+### fair-eviction-state server=ferrokv keys=6695868 rss_mb=1099
+Gets 336895.65 92095.37 244800.28 0.47466 0.45500 0.96700 2.28700 22750.82
+Totals 421122.97 92095.37 244800.28 0.47502 0.46300 0.96700 2.30300 35006.13
+### fair-eviction-state server=redis keys=6279934 rss_mb=1068
+Gets 96257.59 23783.67 72473.92 1.65841 1.63900 3.32700 4.35100 6245.89
+Totals 120325.23 23783.67 72473.92 1.66213 1.63900 3.32700 4.41500 9747.80
+### fair-eviction-state server=valkey keys=6477712 rss_mb=1052
+Gets 105915.07 26977.16 78937.90 1.50687 1.46300 3.15100 4.60700 6953.74
+Totals 132397.14 26977.16 78937.90 1.51051 1.46300 3.15100 4.67100 10806.95
+### fair-eviction-state server=memcached keys=5592064 rss_mb=1065
+Gets 339283.75 74969.77 264313.98 0.47086 0.42300 1.35100 3.75900 18608.34
+Totals 424107.86 74969.77 264313.98 0.47156 0.42300 1.35100 3.77500 30204.97
+### fair-eviction-state server=dragonfly keys=7104857 rss_mb=1164
+Gets 214029.79 59719.92 154309.86 0.74675 0.69500 2.35100 10.04700 14575.47
+Totals 267540.63 59719.92 154309.86 0.74746 0.69500 2.35100 10.43100 22361.50
+
+# ferrokv alone at the limit after 60 s of the churn workload (INFO):
+# used_memory 1073610752, segment_bytes 1052770304, segment_live_bytes 938418971,
+# table_bytes 19922944, used_memory_rss 1167503360, keys 886070

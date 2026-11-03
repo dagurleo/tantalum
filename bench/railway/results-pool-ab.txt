@@ -1,0 +1,71 @@
+# Railway, 2026-11-02, AMD EPYC 9655P. ferrokv v0.1.1 with the segment pool on (default),
+# off (FERROKV_SEGMENT_POOL=off) and keeping freed pages (=keep-pages), plus memcached
+# (-t 4) as a reference; all up at once, 1M keys x 32 B, 1:10 SET:GET, 200 clients,
+# 15 s per run, 4 alternating rounds. faults/s = minor page faults per second.
+round 1 pool-on    P16 ops   2718324 p50 1.127 cpu 3.86 faults/s 9919
+round 1 pool-on    P1  ops    379871 p50 0.503 cpu 3.60 faults/s 1340
+round 1 pool-off   P16 ops   3219688 p50 0.951 cpu 3.85 faults/s 830
+round 1 pool-off   P1  ops    397575 p50 0.479 cpu 3.84 faults/s 38
+round 1 keep-pages P16 ops   3006158 p50 1.015 cpu 3.84 faults/s 765
+round 1 keep-pages P1  ops    408181 p50 0.471 cpu 3.85 faults/s 7
+round 1 memcached  P16 ops   2672397 p50 1.127 cpu 4.61 faults/s 6
+round 1 memcached  P1  ops    495824 p50 0.367 cpu 4.13 faults/s 0
+round 2 pool-on    P16 ops   3033825 p50 1.015 cpu 3.87 faults/s 10920
+round 2 pool-on    P1  ops    412662 p50 0.471 cpu 3.82 faults/s 1447
+round 2 pool-off   P16 ops   3272454 p50 0.943 cpu 3.86 faults/s 27
+round 2 pool-off   P1  ops    419788 p50 0.455 cpu 3.80 faults/s 9
+round 2 keep-pages P16 ops   3241755 p50 0.951 cpu 3.86 faults/s 20
+round 2 keep-pages P1  ops    422453 p50 0.455 cpu 3.83 faults/s 2
+round 2 memcached  P16 ops   2713671 p50 1.095 cpu 4.67 faults/s 4
+round 2 memcached  P1  ops    450440 p50 0.399 cpu 4.11 faults/s 0
+round 3 pool-on    P16 ops   2719017 p50 1.119 cpu 3.83 faults/s 9361
+round 3 pool-on    P1  ops    391368 p50 0.487 cpu 3.80 faults/s 1371
+round 3 pool-off   P16 ops   2580136 p50 1.159 cpu 3.82 faults/s 20
+round 3 pool-off   P1  ops    396698 p50 0.479 cpu 3.83 faults/s 6
+round 3 keep-pages P16 ops   3060566 p50 0.991 cpu 3.84 faults/s 1
+round 3 keep-pages P1  ops    407058 p50 0.471 cpu 3.84 faults/s 0
+round 3 memcached  P16 ops   2623413 p50 1.119 cpu 4.61 faults/s 0
+round 3 memcached  P1  ops    477452 p50 0.383 cpu 4.11 faults/s 0
+round 4 pool-on    P16 ops   2928095 p50 1.047 cpu 3.86 faults/s 10064
+round 4 pool-on    P1  ops    410815 p50 0.463 cpu 3.82 faults/s 1432
+round 4 pool-off   P16 ops   3084169 p50 0.991 cpu 3.85 faults/s 5
+round 4 pool-off   P1  ops    407189 p50 0.471 cpu 3.82 faults/s 0
+round 4 keep-pages P16 ops   3103532 p50 0.983 cpu 3.85 faults/s 1
+round 4 keep-pages P1  ops    407017 p50 0.471 cpu 3.83 faults/s 2
+round 4 memcached  P16 ops   2577274 p50 1.119 cpu 4.58 faults/s 0
+round 4 memcached  P1  ops    462429 p50 0.391 cpu 4.11 faults/s 0
+
+# v0.2.0 (cuckoo table; pool keeps up to 4 MB of freed blocks resident), same host type.
+# Run A (pool first):
+round 1 pool-hot   P16 ops   2047183 p50 1.503 cpu 3.83 faults/s 6885
+round 1 pool-hot   P1  ops    215471 p50 0.887 cpu 3.87 faults/s 861
+round 1 keep-pages P16 ops   2693358 p50 1.135 cpu 3.82 faults/s 738
+round 1 keep-pages P1  ops    379185 p50 0.503 cpu 3.81 faults/s 7
+round 1 memcached  P16 ops   2344705 p50 1.239 cpu 4.27 faults/s 9
+round 1 memcached  P1  ops    454487 p50 0.399 cpu 4.07 faults/s 0
+round 2 pool-hot   P16 ops   2311415 p50 1.343 cpu 3.85 faults/s 8599
+round 2 pool-hot   P1  ops    261743 p50 0.735 cpu 3.88 faults/s 1009
+round 2 keep-pages P16 ops   2904922 p50 1.047 cpu 3.81 faults/s 12
+round 2 keep-pages P1  ops    363192 p50 0.527 cpu 3.80 faults/s 1
+round 2 memcached  P16 ops   2434739 p50 1.191 cpu 4.56 faults/s 0
+round 2 memcached  P1  ops    422008 p50 0.423 cpu 4.04 faults/s 0
+round 3 pool-hot   P16 ops   2040082 p50 1.495 cpu 3.82 faults/s 7232
+round 3 pool-hot   P1  ops    225703 p50 0.847 cpu 3.86 faults/s 818
+round 3 keep-pages P16 ops   2772783 p50 1.095 cpu 3.82 faults/s 3
+round 3 keep-pages P1  ops    377535 p50 0.511 cpu 3.55 faults/s 0
+round 3 memcached  P16 ops   2368330 p50 1.215 cpu 4.26 faults/s 0
+round 3 memcached  P1  ops    417153 p50 0.431 cpu 4.04 faults/s 0
+# Run B (order reversed, pool last) did not reproduce run A's gap:
+round 1 keep-pages P1  ops    368774 p50 0.519 cpu 3.80 faults/s 385
+round 1 keep-pages P16 ops   2514444 p50 1.199 cpu 3.45 faults/s 488
+round 1 pool-off   P1  ops    363758 p50 0.527 cpu 3.51 faults/s 392
+round 1 pool-off   P16 ops   2838942 p50 1.071 cpu 3.79 faults/s 587
+round 1 pool-hot   P1  ops    356038 p50 0.535 cpu 3.77 faults/s 385
+round 1 pool-hot   P16 ops   2442241 p50 1.255 cpu 3.80 faults/s 7742
+round 2 keep-pages P1  ops    338241 p50 0.567 cpu 3.79 faults/s 5
+round 2 keep-pages P16 ops   2477209 p50 1.231 cpu 3.80 faults/s 9
+round 2 pool-off   P1  ops    332039 p50 0.575 cpu 3.76 faults/s 19
+round 2 pool-off   P16 ops   2443860 p50 1.255 cpu 3.79 faults/s 37
+round 2 pool-hot   P1  ops    326690 p50 0.583 cpu 3.79 faults/s 1299
+round 2 pool-hot   P16 ops   2425443 p50 1.255 cpu 3.49 faults/s 8273
+# RSS after run B: keep-pages 119.1 MB, pool-off 98.8 MB, pool-hot 95.9 MB (used_memory ~75.8 MB each).

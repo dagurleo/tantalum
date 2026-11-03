@@ -1,0 +1,58 @@
+# Railway, 2026-11-02, AMD EPYC 9655P. Tantalum 0.2.0 with the shared work-stealing
+# runtime (--io shared) and an event loop per thread (--io per-thread), plus memcached
+# (-t 4); all up at once, 4 threads each, 1M keys x 32 B, 1:10 SET:GET, 12 s per run,
+# 3 alternating rounds. P1-200: no pipelining, 200 clients; P1-50: 50 clients;
+# P16-200: pipeline 16, 200 clients. p50/p99 in ms; cpu = server cores used.
+round 1 shared     P1-200  ops    393971 p50 0.487 p99 1.079 cpu 3.83
+round 1 shared     P1-50   ops    198656 p50 0.231 p99 0.551 cpu 2.31
+round 1 shared     P16-200 ops   2785817 p50 1.103 p99 2.559 cpu 3.83
+round 1 per-thread P1-200  ops    457975 p50 0.423 p99 0.839 cpu 3.93
+round 1 per-thread P1-50   ops    188811 p50 0.247 p99 0.567 cpu 1.66
+round 1 per-thread P16-200 ops   3081800 p50 1.007 p99 1.903 cpu 3.59
+round 1 memcached  P1-200  ops    433679 p50 0.423 p99 1.063 cpu 4.05
+round 1 memcached  P1-50   ops    178819 p50 0.263 p99 0.599 cpu 1.87
+round 1 memcached  P16-200 ops   2216093 p50 1.319 p99 3.343 cpu 4.36
+round 2 shared     P1-200  ops    389145 p50 0.495 p99 1.055 cpu 3.84
+round 2 shared     P1-50   ops    182985 p50 0.255 p99 0.503 cpu 2.41
+round 2 shared     P16-200 ops   3072437 p50 0.999 p99 2.319 cpu 3.85
+round 2 per-thread P1-200  ops    492901 p50 0.391 p99 0.783 cpu 3.94
+round 2 per-thread P1-50   ops    210005 p50 0.239 p99 0.415 cpu 1.76
+round 2 per-thread P16-200 ops   3434112 p50 0.911 p99 1.479 cpu 3.91
+round 2 memcached  P1-200  ops    491527 p50 0.375 p99 0.887 cpu 4.11
+round 2 memcached  P1-50   ops    214816 p50 0.223 p99 0.447 cpu 1.86
+round 2 memcached  P16-200 ops   2713495 p50 1.111 p99 2.447 cpu 4.76
+round 3 shared     P1-200  ops    423165 p50 0.455 p99 0.943 cpu 3.84
+round 3 shared     P1-50   ops    202771 p50 0.231 p99 0.535 cpu 2.38
+round 3 shared     P16-200 ops   3069087 p50 1.015 p99 2.175 cpu 3.87
+round 3 per-thread P1-200  ops    487547 p50 0.399 p99 0.703 cpu 3.93
+round 3 per-thread P1-50   ops    202371 p50 0.231 p99 0.575 cpu 1.75
+round 3 per-thread P16-200 ops   3168499 p50 0.975 p99 1.879 cpu 3.88
+round 3 memcached  P1-200  ops    461445 p50 0.399 p99 1.015 cpu 4.10
+round 3 memcached  P1-50   ops    193811 p50 0.247 p99 0.455 cpu 1.85
+round 3 memcached  P16-200 ops   2672838 p50 1.127 p99 2.463 cpu 4.78
+
+# io_uring check, same day, AMD EPYC 9655P host, kernel 6.18.15:
+#   /proc/sys/kernel/io_uring_disabled = 0, but the container runs under a seccomp
+#   filter (Seccomp: 2, 3 filters) that blocks io_uring. Tantalum --io uring reported
+#   "uring mode without io_uring (epoll/kqueue fallback)"; Dragonfly logged
+#   "iouring API is not supported. Switching to epoll."
+# So --io uring ran on monoio's epoll fallback. A/B against the tokio per-thread loop
+# and memcached on this (slower) host, 3 rounds, 12 s each:
+round 1 tokio-pt   P1-200  ops    239635 p50 0.791 p99 1.655 cpu 3.88
+round 1 tokio-pt   P16-200 ops   2373451 p50 1.295 p99 2.447 cpu 3.87
+round 1 monoio-ep  P1-200  ops    186888 p50 1.023 p99 1.887 cpu 3.90
+round 1 monoio-ep  P16-200 ops   1906806 p50 1.639 p99 3.087 cpu 3.58
+round 1 memcached  P1-200  ops    237441 p50 0.751 p99 1.847 cpu 3.67
+round 1 memcached  P16-200 ops   2034289 p50 1.423 p99 3.519 cpu 4.60
+round 2 tokio-pt   P1-200  ops    241886 p50 0.791 p99 1.511 cpu 3.90
+round 2 tokio-pt   P16-200 ops   2327354 p50 1.327 p99 2.447 cpu 3.88
+round 2 monoio-ep  P1-200  ops    187550 p50 1.007 p99 1.959 cpu 3.90
+round 2 monoio-ep  P16-200 ops   2011884 p50 1.535 p99 3.263 cpu 3.58
+round 2 memcached  P1-200  ops    238607 p50 0.743 p99 1.903 cpu 3.98
+round 2 memcached  P16-200 ops   2028925 p50 1.431 p99 3.503 cpu 4.25
+round 3 tokio-pt   P1-200  ops    243005 p50 0.791 p99 1.399 cpu 3.90
+round 3 tokio-pt   P16-200 ops   2334708 p50 1.319 p99 2.415 cpu 3.89
+round 3 monoio-ep  P1-200  ops    192966 p50 1.015 p99 1.743 cpu 3.92
+round 3 monoio-ep  P16-200 ops   1971398 p50 1.535 p99 3.119 cpu 3.58
+round 3 memcached  P1-200  ops    248180 p50 0.719 p99 1.775 cpu 3.68
+round 3 memcached  P16-200 ops   2057789 p50 1.407 p99 3.743 cpu 4.55

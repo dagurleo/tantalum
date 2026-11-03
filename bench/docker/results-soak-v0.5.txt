@@ -1,0 +1,100 @@
+# Soak test, Tantalum 0.5.0, Docker Desktop on an Apple M1 Pro (Linux 6.12 VM, 8 vCPUs), 2026-11-03.
+# bench/docker/soak.sh with MINUTES=5, seccomp=unconfined (io_uring allowed). In this run the load ended
+# with the sampling window, so its SIGTERM lines had no clients; the script now keeps the load
+# running past it. A separate SIGTERM-under-load check follows the log.
+
+== per-thread: 5 min, --maxmemory 64mb allkeys-lru, 4 threads
+tantalum 0.5.0 listening on 127.0.0.1:7990 (4 threads, per-thread I/O, maxmemory 67108864 bytes, allkeys-lru)
+  time  used_mb  rss_mb  clients_kb  conns  keys     evicted   expired
+    10s       64      74        2560     73  66486    2460185   0
+    20s       63      75        2560     73  66960    4605024   0
+    30s       64      76        2560     73  66468    6551313   0
+    40s       63      76        2560     73  66453    8555443   0
+    50s       64      76        2560     73  66335    11047826  0
+    60s       64      75        2560     73  66603    13477275  0
+    70s       64      75        2560     73  67266    15999744  0
+    80s       64      74        2560     73  66236    17003034  0
+    90s       64      77        2560     73  66307    18573264  0
+   100s       63      78        2560     73  67746    20354118  0
+   110s       63      77        2560     73  65720    22473408  0
+   120s       64      78        2560     73  66127    24345959  0
+   130s       64      77        2560     73  66262    25411722  0
+   140s       64      77        2528     73  66147    26966901  0
+   150s       64      78        2560     73  66613    28498821  0
+   160s       64      78        2560     73  66124    30197954  0
+   170s       64      77        2560     73  66063    31913524  0
+   180s       64      77        2560     73  66439    33580880  0
+   190s       64      77        2560     73  66645    35204804  0
+   200s       64      77        2560     73  66034    36716331  0
+   210s       64      77        2560     73  66756    38337095  0
+   220s       63      77        2560     73  66795    39857520  0
+   230s       64      77        2560     73  66077    41294782  0
+   240s       64      77        2560     73  66855    43074462  0
+   250s       64      75        2560     73  64992    44699736  0
+   260s       64      75        2560     73  64272    45100821  0
+   270s       64      75        2560     73  65574    45474513  0
+   280s       64      75        2560     73  65129    45889266  0
+   290s       64      75        2560     73  65174    46305710  0
+   300s       61      75          32      1  66674    46617793  0
+  peak used_memory 64 MB, peak RSS 78 MB, limit 64 MB
+  ok: used_memory stayed within 3% of the limit
+  ok: RSS stayed within 1.5x the limit
+  SIGTERM with clients connected: exit 0 after 4 ms; all connections closed: exiting
+  ok: exit code 0
+  ok: shut down within the 10 s grace period
+  memtier cache: 696300.75 ops/s
+  memtier counters: 32990.57 ops/s
+  memtier big: 98.22 ops/s
+  ok: connected_clients back to 1 (this check)
+  ok: mem_clients_normal back to baseline
+  ok: total_connections_received counted the churn
+== uring: 5 min, --maxmemory 64mb allkeys-lru, 4 threads
+tantalum 0.5.0 listening on 127.0.0.1:7990 (4 threads, io_uring I/O, maxmemory 67108864 bytes, allkeys-lru)
+  time  used_mb  rss_mb  clients_kb  conns  keys     evicted   expired
+    10s       64      78        2641     73  66346    377936    0
+    20s       64      78        2723     73  66834    2162987   0
+    30s       64      79        2723     73  67633    3949470   0
+    40s       64      78        2723     73  67345    5729203   0
+    50s       64      79        2723     73  66879    7623944   0
+    60s       64      78        2723     73  66258    9350380   0
+    70s       63      79        2723     73  67440    11160836  0
+    80s       63      79        2723     73  67836    13398226  0
+    90s       64      79        2723     73  66944    15605166  0
+   100s       64      79        2723     73  67706    18139157  0
+   110s       64      79        2723     73  66961    20291591  0
+   120s       64      78        2723     73  67842    22861401  0
+   130s       64      78        2723     73  67036    25020858  0
+   140s       64      78        2723     73  68495    26672792  0
+   150s       64      79        2723     73  68373    28640475  0
+   160s       64      79        2723     73  67641    30930215  0
+   170s       64      78        2723     73  67152    32708873  0
+   180s       64      77        2723     73  65931    34185266  0
+   190s       64      78        2723     73  67820    35728471  0
+   200s       64      78        2723     73  67730    37731080  0
+   210s       64      79        2723     73  68400    39119828  0
+   220s       64      79        2723     73  68418    40537677  0
+   230s       64      79        2723     73  68201    42409226  0
+   240s       64      79        2691     73  67588    44726165  0
+   250s       64      78        2723     73  68342    47117766  0
+   260s       63      79        2723     73  69826    49677135  0
+   270s       63      78        2723     73  68048    52363152  0
+   280s       64      78        2723     73  68687    54931143  0
+   290s       63      78        2723     73  67751    57379062  0
+   300s       62      79          32      1  67685    59263692  0
+  peak used_memory 64 MB, peak RSS 79 MB, limit 64 MB
+  ok: used_memory stayed within 3% of the limit
+  ok: RSS stayed within 1.5x the limit
+  SIGTERM with clients connected: exit 0 after 50 ms; all connections closed: exiting
+  ok: exit code 0
+  ok: shut down within the 10 s grace period
+  memtier cache: 873753.30 ops/s
+  memtier counters: 46580.78 ops/s
+  memtier big: 98.36 ops/s
+  ok: connected_clients back to 1 (this check)
+  ok: mem_clients_normal back to baseline
+  ok: total_connections_received counted the churn
+SOAK PASSED
+
+# SIGTERM under load: 4 server threads, memtier 4 x 25 clients, pipeline 16, SIGTERM 5 s in.
+per-thread: connected_clients:101 before SIGTERM; exit 0 after 11 ms ("all connections closed: exiting")
+uring: connected_clients:101 before SIGTERM; exit 0 after 4 ms ("all connections closed: exiting")
