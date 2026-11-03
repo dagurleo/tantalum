@@ -1094,7 +1094,20 @@ async fn read_subscribed(
             tokio::select! {
                 ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx)) => {
                     ready?;
-                    break;
+                    // Readiness can be stale (on the shared runtime, another
+                    // thread's I/O event can keep it set after a read drained
+                    // the socket), and a client that only listens sends
+                    // nothing more: try the read once, and if there's nothing
+                    // after all, go back to waiting for both.
+                    if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
+                        rbuf.reserve(READ_RESERVE);
+                    }
+                    let mut read = std::pin::pin!(socket.read_buf(rbuf));
+                    let attempt = std::future::poll_fn(|cx| Poll::Ready(read.as_mut().poll(cx)));
+                    match attempt.await {
+                        Poll::Ready(n) => return Ok(Some(n?)),
+                        Poll::Pending => continue,
+                    }
                 }
                 () = subscriber.ready(None) => {}
             }
@@ -1115,10 +1128,6 @@ async fn read_subscribed(
         }
         messages.clear();
     }
-    if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
-        rbuf.reserve(READ_RESERVE);
-    }
-    Ok(Some(socket.read_buf(rbuf).await?))
 }
 
 async fn write_all_vectored(
