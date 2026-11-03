@@ -418,24 +418,28 @@ fn memory_returns_to_baseline() {
 #[test]
 fn matches_a_model() {
     let s = Store::new(4);
-    let mut model: HashMap<Vec<u8>, (Vec<u8>, Millis)> = HashMap::new();
+    // Key to kind, value and deadline (0 for none).
+    let mut model: HashMap<Vec<u8>, (Kind, Vec<u8>, Millis)> = HashMap::new();
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let mut now: Millis = 1;
-    for step in 0..60_000u64 {
+    let random_value = |rng: &mut Rng, step: u64| -> Vec<u8> {
+        let len = match rng.below(10) {
+            0 => 0,
+            1..7 => rng.below(64),
+            7..9 => 100 + rng.below(400),
+            _ => 3_000 + rng.below(6_000), // some are big enough to be external
+        };
+        (0..len).map(|i| (i ^ step) as u8).collect()
+    };
+    for step in 0..80_000u64 {
         let key = format!("k{}", rng.below(300)).into_bytes();
         let live = model
             .get(&key)
-            .filter(|(_, d)| *d == 0 || *d > now)
+            .filter(|(_, _, d)| *d == 0 || *d > now)
             .cloned();
         match rng.below(100) {
             0..30 => {
-                let len = match rng.below(10) {
-                    0 => 0,
-                    1..7 => rng.below(64),
-                    7..9 => 100 + rng.below(400),
-                    _ => 3_000 + rng.below(6_000), // some are big enough to be external
-                };
-                let value: Vec<u8> = (0..len).map(|i| (i ^ step) as u8).collect();
+                let value = random_value(&mut rng, step);
                 let expiry = match rng.below(4) {
                     0 => Expiry::At(now + 1 + rng.below(50)),
                     1 => Expiry::Keep,
@@ -446,57 +450,84 @@ fn matches_a_model() {
                     1 => Condition::IfPresent,
                     _ => Condition::Always,
                 };
-                let out = s.set(&key, &value, cond, expiry, now, true).unwrap();
-                let applies = match cond {
-                    Condition::Always => true,
-                    Condition::IfAbsent => live.is_none(),
-                    Condition::IfPresent => live.is_some(),
-                };
+                let want_previous = rng.below(2) == 0;
+                let out = s
+                    .set(&key, &value, cond, expiry, now, want_previous)
+                    .unwrap();
+                // Asking for the previous value of another kind sets nothing.
+                let wrong_type =
+                    want_previous && live.as_ref().is_some_and(|(k, _, _)| *k != Kind::String);
+                let applies = !wrong_type
+                    && match cond {
+                        Condition::Always => true,
+                        Condition::IfAbsent => live.is_none(),
+                        Condition::IfPresent => live.is_some(),
+                    };
                 assert_eq!(out.applied, applies, "step {step}");
+                assert_eq!(out.wrong_type, wrong_type, "step {step}");
+                let previous = live.as_ref().filter(|_| want_previous && !wrong_type);
                 assert_eq!(
                     out.previous.map(|p| p.as_bytes().to_vec()),
-                    live.as_ref().map(|(v, _)| v.clone()),
+                    previous.map(|(_, v, _)| v.clone()),
                     "step {step}"
                 );
                 if applies {
                     let deadline = match expiry {
                         Expiry::Never => 0,
                         Expiry::At(t) => t,
-                        Expiry::Keep => live.map_or(0, |(_, d)| d),
+                        Expiry::Keep => live.map_or(0, |(_, _, d)| d),
                     };
-                    model.insert(key, (value, deadline));
+                    model.insert(key, (Kind::String, value, deadline));
                 }
             }
-            30..60 => assert_eq!(get(&s, &key, now), live.map(|(v, _)| v), "step {step}"),
-            60..85 => {
+            30..55 => {
+                let got = s.get_with(&key, now, |v| v.map(|v| (v.kind(), v.as_bytes().to_vec())));
+                assert_eq!(got, live.map(|(k, v, _)| (k, v)), "step {step}");
+            }
+            55..85 => {
                 // An update, after checking update_key shows the key as the model has it.
-                let update = match rng.below(6) {
+                let kind = if rng.below(2) == 0 {
+                    Kind::String
+                } else {
+                    Kind::Hash
+                };
+                let update = match rng.below(9) {
                     0 => Update::Delete,
                     1 => Update::Expire(Expiry::At(now + 1 + rng.below(50))),
                     2 => Update::Expire(Expiry::At(now.saturating_sub(rng.below(3)).max(1))),
                     3 => Update::Expire(Expiry::Never),
                     4 => Update::SetInt(rng.below(2_000) as i64 - 1_000),
+                    // As long as what's there, to be written in place when the kinds match.
+                    5 | 6 if live.is_some() => {
+                        let len = live.as_ref().unwrap().1.len();
+                        Update::Replace(kind, (0..len).map(|i| (i as u64 ^ step) as u8).collect())
+                    }
+                    5..8 => Update::Replace(kind, random_value(&mut rng, step)),
                     _ => Update::Touch,
                 };
                 let shown = s
                     .update_key(s.key(&key), now, |current| {
-                        let shown = current.map(|c| (c.value.as_bytes().to_vec(), c.expiry));
-                        (update, shown)
+                        let shown = current
+                            .map(|c| (c.value.kind(), c.value.as_bytes().to_vec(), c.expiry));
+                        (update.clone(), shown)
                     })
                     .unwrap();
-                let expected = live.as_ref().map(|(v, d)| {
+                let expected = live.as_ref().map(|(k, v, d)| {
                     let expiry = if *d == 0 {
                         Expiry::Never
                     } else {
                         Expiry::At(*d)
                     };
-                    (v.clone(), expiry)
+                    (*k, v.clone(), expiry)
                 });
                 assert_eq!(shown, expected, "step {step}");
+                let deadline = live.as_ref().map_or(0, |(_, _, d)| *d);
                 match (update, live) {
-                    (Update::SetInt(n), live) => {
-                        let deadline = live.map_or(0, |(_, d)| d);
-                        model.insert(key, (n.to_string().into_bytes(), deadline));
+                    (Update::SetInt(n), _) => {
+                        model.insert(key, (Kind::String, n.to_string().into_bytes(), deadline));
+                    }
+                    (Update::Replace(kind, value), _) => {
+                        model.insert(key, (kind, value, deadline));
                     }
                     (_, None) | (Update::Touch, _) => {}
                     (Update::Delete, _) => {
@@ -505,17 +536,35 @@ fn matches_a_model() {
                     (Update::Expire(Expiry::At(d)), _) if d <= now => {
                         model.remove(&key);
                     }
-                    (Update::Expire(expiry), Some((value, _))) => {
+                    (Update::Expire(expiry), Some((kind, value, _))) => {
                         let deadline = match expiry {
                             Expiry::At(d) => d,
                             _ => 0,
                         };
-                        model.insert(key, (value, deadline));
+                        model.insert(key, (kind, value, deadline));
                     }
                     (Update::Peek, _) => unreachable!(),
                 }
             }
-            85..95 => now += rng.below(20),
+            85..88 => {
+                // As snapshots load keys.
+                let kind = if rng.below(2) == 0 {
+                    Kind::String
+                } else {
+                    Kind::Hash
+                };
+                let value = random_value(&mut rng, step);
+                let (expiry, deadline) = match rng.below(2) {
+                    0 => (Expiry::Never, 0),
+                    _ => {
+                        let d = now + 1 + rng.below(50);
+                        (Expiry::At(d), d)
+                    }
+                };
+                s.restore(&key, kind, &value, expiry, now).unwrap();
+                model.insert(key, (kind, value, deadline));
+            }
+            88..96 => now += rng.below(20),
             _ => {
                 s.expire_cycle(now);
             }
@@ -525,6 +574,19 @@ fn matches_a_model() {
         }
     }
     s.check();
+    // Every kind and value as the model has it, as a snapshot would see them.
+    let mut seen = HashMap::new();
+    for shard in 0..s.shard_count() {
+        s.for_each_live(shard, now, |key, kind, value, _| {
+            seen.insert(key.to_vec(), (kind, value.to_vec()));
+        });
+    }
+    let expected: HashMap<_, _> = model
+        .into_iter()
+        .filter(|(_, (_, _, d))| *d == 0 || *d > now)
+        .map(|(key, (kind, value, _))| (key, (kind, value)))
+        .collect();
+    assert_eq!(seen, expected);
 }
 
 /// Under eviction, keys may vanish but must never come back with stale values.

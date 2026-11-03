@@ -1,11 +1,15 @@
 //! Command dispatch. Replies match Redis 7 byte for byte where practical.
 
+mod hash;
+
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use crate::context::{Context, Session};
+use crate::glob;
 use crate::resp;
 use crate::store::{
-    COPY_UNDER_LOCK_MAX, Condition, Current, Expiry, Key, KeyHash, MAX_DEADLINE, Millis,
+    COPY_UNDER_LOCK_MAX, Condition, Current, Expiry, Key, KeyHash, Kind, MAX_DEADLINE, Millis,
     OutOfMemory, SharedValue, Store, Update,
 };
 
@@ -103,8 +107,8 @@ const NO_KEYS: (i32, i32, i32) = (0, 0, 0);
 const ONE_KEY: (i32, i32, i32) = (1, 1, 1);
 const ALL_KEYS: (i32, i32, i32) = (1, -1, 1);
 
-/// Every command, the most used first since lookup is a linear search.
-/// Arity and flags as in Redis 7.
+/// Every command, in the order `COMMAND` lists them. Arity and flags as in
+/// Redis 7.
 #[rustfmt::skip]
 static COMMANDS: &[Command] = &[
     Command { name: "get", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: get },
@@ -148,6 +152,21 @@ static COMMANDS: &[Command] = &[
     Command { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: lastsave },
     Command { name: "flushdb", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
     Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: quit },
+    Command { name: "type", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: type_of },
+    Command { name: "hget", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hget },
+    Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hset },
+    Command { name: "hgetall", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hgetall },
+    Command { name: "hdel", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: hash::hdel },
+    Command { name: "hmget", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hmget },
+    Command { name: "hincrby", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hincrby },
+    Command { name: "hexists", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hexists },
+    Command { name: "hlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hlen },
+    Command { name: "hmset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hmset },
+    Command { name: "hsetnx", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hsetnx },
+    Command { name: "hkeys", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hkeys },
+    Command { name: "hvals", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hvals },
+    Command { name: "hstrlen", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hstrlen },
+    Command { name: "hscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: hash::hscan },
 ];
 
 /// Runs one command and writes its reply to `out`. `args` must be non-empty.
@@ -170,10 +189,7 @@ pub fn execute(
         }
     }
     // Checked in Redis' order: unknown command, arity, then authentication.
-    let Some(command) = COMMANDS
-        .iter()
-        .find(|c| name.eq_ignore_ascii_case(c.name.as_bytes()))
-    else {
+    let Some(command) = find_command(name) else {
         if ctx
             .settings
             .panic_command
@@ -195,6 +211,28 @@ pub fn execute(
     (command.run)(ctx, session, now, args, out)
 }
 
+/// The command called `name`, in any case. [`COMMANDS`] is split by name
+/// length and first letter, so this takes a comparison or two however many
+/// commands there are.
+fn find_command(name: &[u8]) -> Option<&'static Command> {
+    const BUCKETS: usize = 32 * 32;
+    // ASCII letters land in the same bucket in either case.
+    let bucket =
+        |name: &[u8]| name.len().min(31) * 32 + usize::from(name.first().map_or(0, |c| c & 31));
+    static INDEX: OnceLock<Vec<Vec<u16>>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut index = vec![Vec::new(); BUCKETS];
+        for (i, c) in COMMANDS.iter().enumerate() {
+            index[bucket(c.name.as_bytes())].push(i as u16);
+        }
+        index
+    });
+    index[bucket(name)]
+        .iter()
+        .map(|&i| &COMMANDS[usize::from(i)])
+        .find(|c| name.eq_ignore_ascii_case(c.name.as_bytes()))
+}
+
 /// [`Store::update_key`] for updates that need no memory, so can't fail.
 fn update<R>(
     store: &Store,
@@ -204,7 +242,7 @@ fn update<R>(
 ) -> R {
     store
         .update_key(key, now, f)
-        .unwrap_or_else(|OutOfMemory| unreachable!("only Update::SetInt needs memory"))
+        .unwrap_or_else(|OutOfMemory| unreachable!("only writing a value needs memory"))
 }
 
 fn get(
@@ -220,6 +258,10 @@ fn get(
         None => {
             out.extend_from_slice(null);
             (Reply::Written, false)
+        }
+        Some(v) if v.kind() != Kind::String => {
+            resp::write_error(out, WRONGTYPE);
+            (Reply::Written, true)
         }
         Some(v) if v.as_bytes().len() <= COPY_UNDER_LOCK_MAX => {
             resp::write_bulk(out, v.as_bytes());
@@ -251,6 +293,11 @@ fn mget(
             None => {
                 out.extend_from_slice(null);
                 (None, false)
+            }
+            // Other kinds read as nil, as in Redis.
+            Some(v) if v.kind() != Kind::String => {
+                out.extend_from_slice(null);
+                (None, true)
             }
             Some(v) if v.as_bytes().len() <= COPY_UNDER_LOCK_MAX => {
                 resp::write_bulk(out, v.as_bytes());
@@ -353,7 +400,9 @@ fn set(
             return Reply::Written;
         }
     };
-    if want_previous {
+    if outcome.wrong_type {
+        resp::write_error(out, WRONGTYPE);
+    } else if want_previous {
         match outcome.previous {
             Some(previous) => return bulk(out, previous),
             None => out.extend_from_slice(session.null()),
@@ -499,11 +548,11 @@ fn getdel(
 ) -> Reply {
     let store = &*ctx.store;
     let value = update(store, args.key(store), now, |current| match current {
-        Some(current) => (Update::Delete, Some(current.value.share())),
-        None => (Update::Peek, None),
+        Some(current) if current.value.kind() != Kind::String => (Update::Touch, Err(())),
+        Some(current) => (Update::Delete, Ok(Some(current.value.share()))),
+        None => (Update::Peek, Ok(None)),
     });
-    session.count_lookup(value.is_some());
-    bulk_or_null(out, session, value)
+    string_or_null(out, session, value)
 }
 
 /// `GETEX key [EX s | PX ms | EXAT ts | PXAT ts-ms | PERSIST]`
@@ -544,11 +593,11 @@ fn getex(
         },
     };
     let value = update(store, args.key(store), now, |current| match current {
-        Some(current) => (change, Some(current.value.share())),
-        None => (Update::Peek, None),
+        Some(current) if current.value.kind() != Kind::String => (Update::Touch, Err(())),
+        Some(current) => (change.clone(), Ok(Some(current.value.share()))),
+        None => (Update::Peek, Ok(None)),
     });
-    session.count_lookup(value.is_some());
-    bulk_or_null(out, session, value)
+    string_or_null(out, session, value)
 }
 
 fn expire(
@@ -802,6 +851,9 @@ fn incr_by(store: &Store, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, delta
     let result = store.update_key(args.key(store), now, |current| {
         let old = match current {
             None => 0,
+            Some(current) if current.value.kind() != Kind::String => {
+                return (Update::Peek, Err(WRONGTYPE));
+            }
             Some(current) => match resp::parse_int(current.value.as_bytes()) {
                 Some(n) => n,
                 None => return (Update::Peek, Err(NOT_AN_INTEGER)),
@@ -1153,10 +1205,7 @@ fn command(
         resp::write_array_header(out, args.len() - 2);
         for i in 2..args.len() {
             let name = args.get(i);
-            match COMMANDS
-                .iter()
-                .find(|c| name.eq_ignore_ascii_case(c.name.as_bytes()))
-            {
+            match find_command(name) {
                 Some(c) => write_command_info(out, c, resp3),
                 None => out.extend_from_slice(session.null()),
             }
@@ -1228,7 +1277,9 @@ fn config(
         ];
         let matching: Vec<_> = settings
             .iter()
-            .filter(|(name, _)| (2..args.len()).any(|i| glob_match(args.get(i), name.as_bytes())))
+            .filter(|(name, _)| {
+                (2..args.len()).any(|i| glob::matches(args.get(i), name.as_bytes(), true))
+            })
             .collect();
         resp::write_map_header(out, matching.len(), session.resp3);
         for (name, value) in matching {
@@ -1246,34 +1297,36 @@ fn config(
     Reply::Written
 }
 
-/// Glob matching as `CONFIG GET` does it, ignoring case: `*` matches any
-/// run of bytes and `?` any one byte.
-fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    let (mut p, mut t) = (0, 0);
-    // Where the last `*` was, and where in `text` it's currently matched up to.
-    let mut star: Option<(usize, usize)> = None;
-    while t < text.len() {
-        match pattern.get(p) {
-            Some(b'*') => {
-                star = Some((p, t));
-                p += 1;
-            }
-            Some(&c) if c == b'?' || c.eq_ignore_ascii_case(&text[t]) => {
-                p += 1;
-                t += 1;
-            }
-            _ => match star {
-                // Let the `*` take one more byte and try again from there.
-                Some((sp, st)) => {
-                    star = Some((sp, st + 1));
-                    p = sp + 1;
-                    t = st + 1;
-                }
-                None => return false,
-            },
+/// A string read by `GETDEL` or `GETEX`: `Err` when the key held another kind.
+fn string_or_null(
+    out: &mut Vec<u8>,
+    session: &mut Session,
+    value: Result<Option<SharedValue>, ()>,
+) -> Reply {
+    session.count_lookup(!matches!(value, Ok(None)));
+    match value {
+        Ok(value) => bulk_or_null(out, session, value),
+        Err(()) => {
+            resp::write_error(out, WRONGTYPE);
+            Reply::Written
         }
     }
-    pattern[p..].iter().all(|&c| c == b'*')
+}
+
+/// `TYPE key`
+fn type_of(
+    ctx: &Context,
+    _: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let store = &*ctx.store;
+    let kind = update(store, args.key(store), now, |current| {
+        (Update::Peek, current.map(|c| c.value.kind()))
+    });
+    resp::write_simple(out, kind.map_or("none", Kind::name).as_bytes());
+    Reply::Written
 }
 
 fn bulk_or_null(out: &mut Vec<u8>, session: &Session, value: Option<SharedValue>) -> Reply {
@@ -1443,6 +1496,7 @@ fn rss_bytes() -> Option<usize> {
 const OOM: &[u8] = b"OOM command not allowed when used memory > 'maxmemory'.";
 const NOT_AN_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
 const SYNTAX_ERROR: &[u8] = b"ERR syntax error";
+const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding the wrong kind of value";
 const WRONGPASS: &[u8] = b"WRONGPASS invalid username-password pair or user is disabled.";
 
 fn wrong_arity(out: &mut Vec<u8>, name: &str) {
@@ -1485,26 +1539,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glob() {
-        for (pattern, text, matches) in [
-            ("maxmemory", "maxmemory", true),
-            ("MAXMEMORY", "maxmemory", true),
-            ("max*", "maxmemory-policy", true),
-            ("*policy", "maxmemory-policy", true),
-            ("*", "save", true),
-            ("*mem*", "maxmemory", true),
-            ("m?xmemory", "maxmemory", true),
-            ("maxmemory", "maxmemory-policy", false),
-            ("*x", "maxmemory", false),
-            ("", "save", false),
-            ("a*b*c", "aXbYbZc", true),
-            ("a*b*c", "aXbYbZ", false),
-        ] {
-            assert_eq!(
-                glob_match(pattern.as_bytes(), text.as_bytes()),
-                matches,
-                "{pattern} vs {text}"
-            );
+    fn finds_every_command_in_any_case() {
+        for c in COMMANDS {
+            let upper = c.name.to_ascii_uppercase();
+            for name in [c.name.as_bytes(), upper.as_bytes()] {
+                assert!(std::ptr::eq(find_command(name).unwrap(), c), "{}", c.name);
+            }
+        }
+        for name in [&b""[..], b"g", b"gett", b"nope", b"\xff", &[b'h'; 40]] {
+            assert!(find_command(name).is_none());
         }
     }
 

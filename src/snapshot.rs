@@ -3,14 +3,19 @@
 //! Redis' RDB files, though in a format of our own:
 //!
 //! ```text
-//! "TANTALUM SNAPSHOT 1\n"
-//! per key:  0x01, key length, key, value length, value, expiry
+//! "TANTALUM SNAPSHOT 2\n"
+//! per key:  kind, key length, key, value length, value, expiry
 //! trailer:  0x00, key count (u64 LE), CRC32 of everything before it (u32 LE)
 //! ```
 //!
-//! Lengths and expiries are LEB128 varints; an expiry is a Unix time in
-//! milliseconds, 0 for none, so TTLs carry over a restart and keys that
-//! expired meanwhile are dropped on load.
+//! The kind is 0x01 for a string and 0x02 for a hash, whose value is its
+//! encoding in memory (see `hash.rs`). Lengths and expiries are LEB128
+//! varints; an expiry is a Unix time in milliseconds, 0 for none, so TTLs
+//! carry over a restart and keys that expired meanwhile are dropped on load.
+//!
+//! Version 1 is the same without hashes. A save writes it when it holds no
+//! hashes, so a build from before hashes can still read it (after a
+//! rollback, say), and loading reads both.
 //!
 //! A save copies one shard at a time under its lock, so it's consistent per
 //! shard rather than across the whole store: a write made during a save may
@@ -18,7 +23,7 @@
 //! it over the old snapshot, so a crash mid-save leaves the previous one.
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -26,10 +31,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
-use crate::store::{Condition, Expiry, NO_EXPIRY, Store};
+use crate::hash;
+use crate::store::{Expiry, Kind, NO_EXPIRY, Store};
 
-const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 1\n";
-const RECORD: u8 = 1;
+/// The header, with the version in its next-to-last byte.
+const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 2\n";
+const VERSION_AT: usize = MAGIC.len() - 2;
+const MAGIC_V1: &[u8] = b"TANTALUM SNAPSHOT 1\n";
+const STRING: u8 = 1;
+const HASH: u8 = 2;
 const END: u8 = 0;
 
 fn unix_ms() -> i64 {
@@ -97,7 +107,10 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
         inner: BufWriter::with_capacity(1 << 20, file),
         crc: crc32fast::Hasher::new(),
     };
-    out.write_all(MAGIC)?;
+    // Version 1 until a hash turns up; the CRC is of what follows, combined
+    // with the header's at the end.
+    let mut magic = MAGIC_V1.to_vec();
+    out.inner.write_all(&magic)?;
     let now = store.now();
     // Store-clock deadlines become Unix times by this offset.
     let offset = unix_ms() - now as i64;
@@ -105,8 +118,14 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
     let mut buf = Vec::new();
     for shard in 0..store.shard_count() {
         buf.clear();
-        store.for_each_live(shard, now, |key, value, deadline| {
-            buf.push(RECORD);
+        store.for_each_live(shard, now, |key, kind, value, deadline| {
+            buf.push(match kind {
+                Kind::String => STRING,
+                Kind::Hash => {
+                    magic[VERSION_AT] = MAGIC[VERSION_AT];
+                    HASH
+                }
+            });
             put_varint(&mut buf, key.len() as u64);
             buf.extend_from_slice(key);
             put_varint(&mut buf, value.len() as u64);
@@ -122,9 +141,16 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
     }
     out.write_all(&[END])?;
     out.write_all(&keys.to_le_bytes())?;
-    let crc = out.crc.clone().finalize();
     let mut file = out.inner.into_inner().map_err(|e| e.into_error())?;
-    file.write_all(&crc.to_le_bytes())?;
+    if magic != MAGIC_V1 {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&magic)?;
+        file.seek(SeekFrom::End(0))?;
+    }
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&magic);
+    crc.combine(&out.crc);
+    file.write_all(&crc.finalize().to_le_bytes())?;
     file.sync_all()?;
     Ok(keys)
 }
@@ -155,9 +181,16 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
     let mut magic = [0; MAGIC.len()];
     reader.read_exact(&mut magic)?;
-    if magic != MAGIC {
-        return Err(invalid("not a Tantalum snapshot"));
-    }
+    let version = match &magic[..] {
+        MAGIC_V1 => 1,
+        MAGIC => 2,
+        _ if magic.starts_with(&MAGIC[..VERSION_AT]) => {
+            return Err(invalid(
+                "a snapshot from a newer Tantalum: upgrade to load it",
+            ));
+        }
+        _ => return Err(invalid("not a Tantalum snapshot")),
+    };
     let now = store.now();
     let unix_now = unix_ms();
     let mut loaded = Loaded::default();
@@ -166,15 +199,19 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
     loop {
         let mut tag = [0];
         reader.read_exact(&mut tag)?;
-        match tag[0] {
-            RECORD => {}
+        let kind = match tag[0] {
+            STRING => Kind::String,
+            HASH if version >= 2 => Kind::Hash,
             END => break,
             other => return Err(invalid(format!("unknown record type {other}"))),
-        }
+        };
         records += 1;
         read_bytes(&mut reader, &mut key)?;
         read_bytes(&mut reader, &mut value)?;
         let expires = read_varint(&mut reader)?;
+        if kind == Kind::Hash && !hash::is_valid(&value) {
+            return Err(invalid("a damaged hash"));
+        }
         if loaded.dropped > 0 {
             // Full: count the rest without trying.
             loaded.dropped += 1;
@@ -188,8 +225,8 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
             }
             t => Expiry::At(store.deadline_from_unix_ms(now, t as i64)),
         };
-        match store.set(&key, &value, Condition::Always, expiry, now, false) {
-            Ok(_) => loaded.keys += 1,
+        match store.restore(&key, kind, &value, expiry, now) {
+            Ok(()) => loaded.keys += 1,
             Err(_) => loaded.dropped += 1,
         }
     }
@@ -364,7 +401,7 @@ impl Snapshots {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Config;
+    use crate::store::{Condition, Config};
 
     fn temp_path(name: &str) -> PathBuf {
         let dir =
@@ -463,6 +500,134 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(!tmp_path(&path).exists(), "temp file left behind");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn hash(pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut edit = hash::Edit::new(None, pairs.len());
+        for &(field, value) in pairs {
+            edit.set(field, value);
+        }
+        edit.encode()
+    }
+
+    fn kind_and_value(store: &Store, key: &[u8]) -> Option<(Kind, Vec<u8>)> {
+        store.get_with(key, store.now(), |v| {
+            v.map(|v| (v.kind(), v.as_bytes().to_vec()))
+        })
+    }
+
+    #[test]
+    fn hashes_roundtrip_in_version_2() {
+        let path = temp_path("hashes");
+        let s = filled();
+        let now = s.now();
+        let small = hash(&[(b"name", b"tantalum"), (b"", b"")]);
+        let fields: Vec<_> = (0..200)
+            .map(|i| (format!("f{i}"), "v".repeat(100)))
+            .collect();
+        let pairs: Vec<_> = fields
+            .iter()
+            .map(|(f, v)| (f.as_bytes(), v.as_bytes()))
+            .collect();
+        let big = hash(&pairs);
+        assert!(big.len() > 16_384, "big enough to be external");
+        s.restore(b"h", Kind::Hash, &small, Expiry::Never, now)
+            .unwrap();
+        s.restore(b"big", Kind::Hash, &big, Expiry::At(now + 3_600_000), now)
+            .unwrap();
+        assert_eq!(save(&s, &path).unwrap(), 5_005);
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        let t = Store::new(4);
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 5_005);
+        assert_eq!(kind_and_value(&t, b"h"), Some((Kind::Hash, small)));
+        assert_eq!(kind_and_value(&t, b"big"), Some((Kind::Hash, big)));
+        assert_eq!(
+            kind_and_value(&t, b"ttl"),
+            Some((Kind::String, b"t".to_vec()))
+        );
+        // Without hashes, it's version 1 again.
+        let u = filled();
+        save(&u, &path).unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V1));
+        assert_eq!(load(&Store::new(1), &path).unwrap().unwrap().keys, 5_004);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// `tests/data/v1.snapshot` was saved by Tantalum 0.7.0, before hashes:
+    /// `SET name tantalum`, `SET counter 73`, an empty key and value, a
+    /// binary key, a 20,000-byte value and a key expiring in 2100.
+    #[test]
+    fn loads_version_1_from_before_hashes() {
+        let path = temp_path("v1");
+        fs::write(&path, include_bytes!("../tests/data/v1.snapshot")).unwrap();
+        let t = Store::new(4);
+        let loaded = load(&t, &path).unwrap().unwrap();
+        assert_eq!(
+            loaded,
+            Loaded {
+                keys: 6,
+                expired: 0,
+                dropped: 0
+            }
+        );
+        let string = |v: &[u8]| Some((Kind::String, v.to_vec()));
+        assert_eq!(kind_and_value(&t, b"name"), string(b"tantalum"));
+        assert_eq!(kind_and_value(&t, b"counter"), string(b"73"));
+        assert_eq!(kind_and_value(&t, b""), string(b""));
+        assert_eq!(kind_and_value(&t, b"\0\r\n\xff"), string(b"binary"));
+        assert_eq!(kind_and_value(&t, b"big"), string(&[b'x'; 20_000]));
+        assert_eq!(kind_and_value(&t, b"forever"), string(b"until 2100"));
+        let expiry = t.update_key(t.key(b"forever"), t.now(), |c| {
+            (crate::store::Update::Peek, c.map(|c| c.expiry))
+        });
+        let Some(Expiry::At(deadline)) = expiry.unwrap() else {
+            panic!("lost its TTL");
+        };
+        assert_eq!(t.deadline_to_unix_ms(t.now(), deadline), 4_102_444_800_000);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A file with a good checksum around these records.
+    fn file_of(magic: &[u8], records: &[u8], count: u64) -> Vec<u8> {
+        let mut file = [magic, records, &[END], &count.to_le_bytes()].concat();
+        let crc = crc32fast::hash(&file);
+        file.extend(crc.to_le_bytes());
+        file
+    }
+
+    #[test]
+    fn rejects_hashes_that_should_not_be_there() {
+        let path = temp_path("bad-hashes");
+        let good = hash(&[(b"a", b"1")]);
+        let record = |kind: u8, value: &[u8]| {
+            let mut r = vec![kind, 1, b'h', value.len() as u8];
+            r.extend_from_slice(value);
+            r.push(0);
+            r
+        };
+        // The good one loads...
+        fs::write(&path, file_of(MAGIC, &record(HASH, &good), 1)).unwrap();
+        let t = Store::new(1);
+        load(&t, &path).unwrap();
+        assert_eq!(kind_and_value(&t, b"h"), Some((Kind::Hash, good.clone())));
+        for (what, file) in [
+            (
+                "a hash in version 1",
+                file_of(MAGIC_V1, &record(HASH, &good), 1),
+            ),
+            (
+                "a damaged hash",
+                file_of(MAGIC, &record(HASH, b"\x02\x01a"), 1),
+            ),
+            ("an empty hash", file_of(MAGIC, &record(HASH, b"\x00"), 1)),
+            ("an unknown kind", file_of(MAGIC, &record(9, b"x"), 1)),
+            ("a newer version", file_of(b"TANTALUM SNAPSHOT 3\n", &[], 0)),
+        ] {
+            fs::write(&path, file).unwrap();
+            let err = load(&Store::new(1), &path).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}: {err}");
+        }
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

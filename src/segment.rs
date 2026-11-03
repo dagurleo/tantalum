@@ -31,6 +31,35 @@ const USAGE_SHIFT: u32 = 3;
 const USAGE_MASK: u8 = 0b11 << USAGE_SHIFT;
 /// Usage counters saturate here (2 bits).
 pub const MAX_USAGE: u8 = 3;
+/// The value's data type, in the top three bits. Strings are 0, so their
+/// entries are what they were before there were other types.
+const KIND_SHIFT: u32 = 5;
+const KIND_MASK: u8 = 0b111 << KIND_SHIFT;
+
+/// What an entry's value holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    String = 0,
+    /// Fields and values, encoded by `hash.rs`.
+    Hash = 1,
+}
+
+impl Kind {
+    pub fn of(flags: u8) -> Kind {
+        match (flags & KIND_MASK) >> KIND_SHIFT {
+            1 => Kind::Hash,
+            _ => Kind::String,
+        }
+    }
+
+    /// The name `TYPE` replies with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::String => "string",
+            Kind::Hash => "hash",
+        }
+    }
+}
 
 pub fn usage(flags: u8) -> u8 {
     (flags & USAGE_MASK) >> USAGE_SHIFT
@@ -125,8 +154,8 @@ pub fn encoded_len(payload: &Payload<'_>, deadline: Millis) -> usize {
 }
 
 /// Appends an encoded entry to `out`.
-pub fn encode(out: &mut impl Sink, usage: u8, payload: &Payload<'_>, deadline: Millis) {
-    let mut flags = with_usage(0, usage);
+pub fn encode(out: &mut impl Sink, kind: Kind, usage: u8, payload: &Payload<'_>, deadline: Millis) {
+    let mut flags = with_usage((kind as u8) << KIND_SHIFT, usage);
     if deadline != 0 {
         flags |= HAS_TTL;
     }
@@ -188,6 +217,10 @@ impl Header {
 
     pub fn usage(&self) -> u8 {
         usage(self.flags)
+    }
+
+    pub fn kind(&self) -> Kind {
+        Kind::of(self.flags)
     }
 }
 
@@ -352,7 +385,7 @@ mod tests {
         for (payload, deadline, usage) in &cases {
             expected_offsets.push(seg.buf.len());
             let before = seg.buf.len();
-            encode(&mut seg.buf, *usage, payload, *deadline);
+            encode(&mut seg.buf, Kind::String, *usage, payload, *deadline);
             assert_eq!(seg.buf.len() - before, encoded_len(payload, *deadline));
         }
         let parsed: Vec<_> = seg.entries().collect();
@@ -403,7 +436,7 @@ mod tests {
                 Payload::External(300),
             ] {
                 let mut buf = Vec::new();
-                encode(&mut buf, 2, &payload, old);
+                encode(&mut buf, Kind::String, 2, &payload, old);
                 let before = parse(&buf, 0);
                 let field = deadline_field(&buf, 0).unwrap();
                 assert_eq!(field.len(), varint_len(old));
@@ -423,8 +456,40 @@ mod tests {
             }
         }
         let mut buf = Vec::new();
-        encode(&mut buf, 0, &Payload::External(1), 0);
+        encode(&mut buf, Kind::String, 0, &Payload::External(1), 0);
         assert_eq!(deadline_field(&buf, 0), None);
+    }
+
+    #[test]
+    fn kinds_survive_usage_updates() {
+        let mut buf = Vec::new();
+        encode(
+            &mut buf,
+            Kind::Hash,
+            1,
+            &Payload::Inline {
+                key: b"k",
+                value: b"v",
+            },
+            0,
+        );
+        assert_eq!(parse(&buf, 0).kind(), Kind::Hash);
+        buf[0] = with_usage(buf[0], 3);
+        assert_eq!(parse(&buf, 0).kind(), Kind::Hash);
+        assert_eq!(parse(&buf, 0).usage(), 3);
+        // A string's flags byte is unchanged by kinds existing.
+        let mut plain = Vec::new();
+        encode(
+            &mut plain,
+            Kind::String,
+            2,
+            &Payload::Inline {
+                key: b"k",
+                value: b"v",
+            },
+            0,
+        );
+        assert_eq!(plain[0], with_usage(0, 2));
     }
 
     #[test]

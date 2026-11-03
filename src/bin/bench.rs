@@ -5,7 +5,11 @@
 //!
 //! - `memory_per_key`: accounted bytes per key after the fill (exact, so any
 //!   change shows);
-//! - `<workload>`: nanoseconds per command, one number per run.
+//! - `<workload>`: nanoseconds per command, one number per run;
+//! - `hash_memory_per_field`: the same for a fill of hashes, per field.
+//!
+//! The string workloads run first and alone, as they did before hashes
+//! existed; the hashes come after them.
 //!
 //!   bench [--keys N] [--ops N] [--runs N]
 
@@ -58,21 +62,38 @@ fn requests(keys: usize, ops: usize, pipeline: usize, seed: u64) -> Vec<Vec<u8>>
         .collect()
 }
 
-fn main() {
-    let mut keys = 1_000_000;
-    let mut ops = 2_000_000;
-    let mut runs = 3;
-    let mut args = std::env::args().skip(1);
-    while let Some(flag) = args.next() {
-        let value: usize = args.next().and_then(|v| v.parse().ok()).expect("a number");
-        match flag.as_str() {
-            "--keys" => keys = value,
-            "--ops" => ops = value,
-            "--runs" => runs = value,
-            _ => panic!("unknown option {flag}"),
-        }
-    }
+/// The hash fill: `--keys / 10` hashes of [`FIELDS`] fields of 16 bytes,
+/// like small objects (a user, a session) kept as hashes.
+const FIELDS: usize = 10;
 
+/// Requests of `pipeline` commands each: 1 HSET of one field for every 10
+/// HGETs, over random fields of random hashes of the fill.
+fn hash_requests(hashes: usize, ops: usize, pipeline: usize, seed: u64) -> Vec<Vec<u8>> {
+    let mut rng = Rng(seed);
+    let value = [b'h'; 16];
+    (0..ops / pipeline)
+        .map(|_| {
+            let mut buf = Vec::new();
+            for _ in 0..pipeline {
+                let key = format!("user:{}", rng.below(hashes));
+                let field = format!("field{}", rng.below(FIELDS));
+                if rng.below(11) == 0 {
+                    push_command(
+                        &mut buf,
+                        &[b"HSET", key.as_bytes(), field.as_bytes(), &value],
+                    );
+                } else {
+                    push_command(&mut buf, &[b"HGET", key.as_bytes(), field.as_bytes()]);
+                }
+            }
+            buf
+        })
+        .collect()
+}
+
+/// Runs `f` with a fresh store and a function that runs every command in a
+/// buffer as a connection does with one read, writing replies to `out`.
+fn with_server<R>(f: impl FnOnce(&Store, &mut dyn FnMut(&[u8], &mut Vec<u8>)) -> R) -> R {
     // A fixed hash seed lays the keys out the same way every run, so memory
     // per key compares exactly between builds.
     let store = Arc::new(Store::with_config(Config {
@@ -84,9 +105,6 @@ fn main() {
     let client = ctx.connect(-1).expect("a client");
     let mut session = client.session();
     let mut batch = Batch::default();
-    let mut out = Vec::new();
-
-    // Runs every command in `buf` as a connection does with one read.
     let mut serve = |buf: &[u8], out: &mut Vec<u8>| {
         let now = store.now();
         let mut pos = 0;
@@ -105,34 +123,101 @@ fn main() {
             out.clear();
         }
     };
+    f(&store, &mut serve)
+}
 
-    let value = [b'v'; 32];
-    let mut fill = Vec::new();
-    for i in 0..keys {
-        push_command(&mut fill, &[b"SET", format!("key:{i}").as_bytes(), &value]);
-        if (i + 1) % 64 == 0 || i + 1 == keys {
-            serve(&fill, &mut out);
-            fill.clear();
+/// Nanoseconds per command of each run, as a JSON field.
+fn time(
+    name: &str,
+    runs: usize,
+    serve: &mut dyn FnMut(&[u8], &mut Vec<u8>),
+    requests: impl Fn(u64) -> Vec<Vec<u8>>,
+    per_request: usize,
+) -> String {
+    let mut out = Vec::new();
+    let mut times = Vec::new();
+    for run in 0..runs {
+        let reqs = requests(0x9E37_79B9_7F4A_7C15 ^ run as u64);
+        let started = Instant::now();
+        for req in &reqs {
+            serve(req, &mut out);
+        }
+        let ns = started.elapsed().as_nanos() as f64 / (reqs.len() * per_request) as f64;
+        times.push(format!("{ns:.1}"));
+    }
+    format!("\"{name}\":[{}]", times.join(","))
+}
+
+/// Sends `commands` in batches of 64, as a client filling the store would.
+fn fill(serve: &mut dyn FnMut(&[u8], &mut Vec<u8>), commands: impl Iterator<Item = Vec<u8>>) {
+    let (mut buf, mut out) = (Vec::new(), Vec::new());
+    for (i, command) in commands.enumerate() {
+        buf.extend_from_slice(&command);
+        if (i + 1) % 64 == 0 {
+            serve(&buf, &mut out);
+            buf.clear();
         }
     }
-    let memory_per_key = store.stats().used_memory as f64 / keys as f64;
+    serve(&buf, &mut out);
+}
 
+fn command(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_command(&mut out, args);
+    out
+}
+
+fn main() {
+    let mut keys = 1_000_000;
+    let mut ops = 2_000_000;
+    let mut runs = 3;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value: usize = args.next().and_then(|v| v.parse().ok()).expect("a number");
+        match flag.as_str() {
+            "--keys" => keys = value,
+            "--ops" => ops = value,
+            "--runs" => runs = value,
+            _ => panic!("unknown option {flag}"),
+        }
+    }
     let mut results = Vec::new();
-    for (name, pipeline) in [("p1_ns", 1), ("p16_ns", 16)] {
-        let mut times = Vec::new();
-        for run in 0..runs {
-            let reqs = requests(keys, ops, pipeline, 0x9E37_79B9_7F4A_7C15 ^ run as u64);
-            let started = Instant::now();
-            for req in &reqs {
-                serve(req, &mut out);
-            }
-            let ns = started.elapsed().as_nanos() as f64 / (reqs.len() * pipeline) as f64;
-            times.push(format!("{ns:.1}"));
+
+    with_server(|store, serve| {
+        let value = [b'v'; 32];
+        fill(
+            serve,
+            (0..keys).map(|i| command(&[b"SET", format!("key:{i}").as_bytes(), &value])),
+        );
+        let memory_per_key = store.stats().used_memory as f64 / keys as f64;
+        results.push(format!("\"memory_per_key\":{memory_per_key:.3}"));
+        for (name, pipeline) in [("p1_ns", 1), ("p16_ns", 16)] {
+            let reqs = |seed| requests(keys, ops, pipeline, seed);
+            results.push(time(name, runs, serve, reqs, pipeline));
         }
-        results.push(format!("\"{name}\":[{}]", times.join(",")));
-    }
-    println!(
-        "{{\"memory_per_key\":{memory_per_key:.3},{}}}",
-        results.join(",")
-    );
+    });
+
+    // Hashes in a store of their own, so the string workloads run as they
+    // did before hashes existed.
+    with_server(|store, serve| {
+        let hashes = (keys / 10).max(1);
+        let value = [b'h'; 16];
+        let names: Vec<String> = (0..FIELDS).map(|j| format!("field{j}")).collect();
+        fill(
+            serve,
+            (0..hashes).map(|i| {
+                let key = format!("user:{i}");
+                let mut args: Vec<&[u8]> = vec![b"HSET", key.as_bytes()];
+                for name in &names {
+                    args.extend([name.as_bytes(), &value]);
+                }
+                command(&args)
+            }),
+        );
+        let per_field = store.stats().used_memory as f64 / (hashes * FIELDS) as f64;
+        results.push(format!("\"hash_memory_per_field\":{per_field:.3}"));
+        let reqs = |seed| hash_requests(hashes, ops, 16, seed);
+        results.push(time("hash_p16_ns", runs, serve, reqs, 16));
+    });
+    println!("{{{}}}", results.join(","));
 }

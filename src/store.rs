@@ -50,6 +50,7 @@ use parking_lot::Mutex;
 
 use crate::entry::KeyValue;
 use crate::pages;
+pub use crate::segment::Kind;
 use crate::segment::{self, Body, Header, MAX_USAGE, Payload, Segment};
 use crate::table::{self, Table};
 
@@ -192,7 +193,7 @@ impl SharedValue {
 }
 
 /// Borrowed view of a live value, valid while the shard lock is held.
-pub struct ValueRef<'a>(Borrowed<'a>);
+pub struct ValueRef<'a>(Borrowed<'a>, Kind);
 
 enum Borrowed<'a> {
     Inline(&'a [u8]),
@@ -200,6 +201,11 @@ enum Borrowed<'a> {
 }
 
 impl ValueRef<'_> {
+    /// What the value holds: commands for one kind reply `WRONGTYPE` to others.
+    pub fn kind(&self) -> Kind {
+        self.1
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         match self.0 {
             Borrowed::Inline(bytes) => bytes,
@@ -221,6 +227,9 @@ pub struct SetOutcome {
     pub applied: bool,
     /// The previous live value, if requested and there was one.
     pub previous: Option<SharedValue>,
+    /// With `want_previous`, the key held another kind than a string, so
+    /// nothing was written (Redis' `WRONGTYPE`).
+    pub wrong_type: bool,
     /// Big values this write displaced, freed when the outcome is dropped
     /// (after the shard lock is released).
     _garbage: Vec<KeyValue>,
@@ -234,7 +243,7 @@ pub struct Current<'a> {
 }
 
 /// What [`Store::update_key`] does to the key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Update {
     /// Leaves it as it is, and doesn't count as using it.
     Peek,
@@ -248,6 +257,9 @@ pub enum Update {
     /// Sets its value to this integer in decimal, keeping its TTL, or
     /// creates it without one.
     SetInt(i64),
+    /// Sets its value to this, of this kind, keeping its TTL, or creates it
+    /// without one.
+    Replace(Kind, Vec<u8>),
 }
 
 fn join(id: usize, offset: usize) -> u32 {
@@ -404,14 +416,15 @@ impl ShardInner {
     }
 
     fn value_ref(&self, loc: u32, header: &Header) -> ValueRef<'_> {
-        ValueRef(match &header.body {
+        let value = match &header.body {
             Body::Inline { value, .. } => {
                 Borrowed::Inline(&self.segment(split(loc).0).buf[value.clone()])
             }
             Body::External(i) => {
                 Borrowed::External(self.externals[*i as usize].as_ref().expect("live external"))
             }
-        })
+        };
+        ValueRef(value, header.kind())
     }
 
     /// Bumps an entry's usage counter.
@@ -505,12 +518,18 @@ impl ShardInner {
         self.mem.segment_resident += resident_growth;
     }
 
-    fn append(&mut self, usage: u8, payload: &Payload<'_>, deadline: Millis) -> Option<u32> {
+    fn append(
+        &mut self,
+        kind: Kind,
+        usage: u8,
+        payload: &Payload<'_>,
+        deadline: Millis,
+    ) -> Option<u32> {
         let len = segment::encoded_len(payload, deadline);
         let id = self.active_with_room(len)?;
         let buf = &mut self.segment_mut(id).buf;
         let offset = buf.len();
-        segment::encode(buf, usage, payload, deadline);
+        segment::encode(buf, kind, usage, payload, deadline);
         debug_assert_eq!(buf.len() - offset, len);
         self.count_appended(id, len, deadline);
         Some(join(id, offset))
@@ -655,7 +674,7 @@ impl ShardInner {
             Body::External(index) => Payload::External(*index),
         };
         // Out of segment ids (practically unreachable): keep the old deadline.
-        if let Some(new) = self.append(header.usage(), &payload, deadline) {
+        if let Some(new) = self.append(header.kind(), header.usage(), &payload, deadline) {
             let linked = self.relink(hash, loc, new);
             debug_assert!(linked, "live entry without a slot");
             self.mark_dead(loc);
@@ -1172,9 +1191,46 @@ impl Store {
     }
 
     /// [`Store::set`] for a key hashed already.
+    #[inline]
     pub fn set_key(
         &self,
         key: Key<'_>,
+        value: &[u8],
+        cond: Condition,
+        expiry: Expiry,
+        now: Millis,
+        want_previous: bool,
+    ) -> Result<SetOutcome, OutOfMemory> {
+        self.set_kind(key, Kind::String, value, cond, expiry, now, want_previous)
+    }
+
+    /// Writes a value of any kind as it is, replacing whatever the key held:
+    /// for loading snapshots.
+    pub fn restore(
+        &self,
+        key: &[u8],
+        kind: Kind,
+        value: &[u8],
+        expiry: Expiry,
+        now: Millis,
+    ) -> Result<(), OutOfMemory> {
+        self.set_kind(
+            self.key(key),
+            kind,
+            value,
+            Condition::Always,
+            expiry,
+            now,
+            false,
+        )
+        .map(drop)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_kind(
+        &self,
+        key: Key<'_>,
+        kind: Kind,
         value: &[u8],
         cond: Condition,
         expiry: Expiry,
@@ -1202,6 +1258,15 @@ impl Store {
                 .as_ref()
                 .filter(|(_, header)| !header.is_expired(now))
                 .cloned();
+            // `SET ... GET` on another kind fails, as in Redis, and sets nothing.
+            if want_previous && live.as_ref().is_some_and(|(_, h)| h.kind() != Kind::String) {
+                return Ok(SetOutcome {
+                    applied: false,
+                    previous: None,
+                    wrong_type: true,
+                    _garbage: Vec::new(),
+                });
+            }
             if (cond == Condition::IfAbsent && live.is_some())
                 || (cond == Condition::IfPresent && live.is_none())
             {
@@ -1212,6 +1277,7 @@ impl Store {
                 return Ok(SetOutcome {
                     applied: false,
                     previous,
+                    wrong_type: false,
                     _garbage: Vec::new(),
                 });
             }
@@ -1265,7 +1331,7 @@ impl Store {
                 Some(kv) => Payload::External(inner.store_external(kv)),
                 None => Payload::Inline { key, value },
             };
-            let Some(new) = inner.append(usage, &payload, deadline) else {
+            let Some(new) = inner.append(kind, usage, &payload, deadline) else {
                 // Out of segment ids: practically unreachable (4 GB per shard).
                 if let Payload::External(index) = payload {
                     garbage.push(inner.take_external(index));
@@ -1291,6 +1357,7 @@ impl Store {
             return Ok(SetOutcome {
                 applied: true,
                 previous,
+                wrong_type: false,
                 _garbage: garbage,
             });
         }
@@ -1336,14 +1403,22 @@ impl Store {
                     deadline => Expiry::At(deadline),
                 },
             }));
-            match (update, &existing) {
-                (Update::SetInt(n), _) => {
-                    let mut digits = itoa::Buffer::new();
-                    let value = digits.format(n).as_bytes();
+            let mut digits = itoa::Buffer::new();
+            let write = match &update {
+                Update::SetInt(n) => Some((Kind::String, digits.format(*n).as_bytes())),
+                Update::Replace(kind, value) => Some((*kind, value.as_slice())),
+                _ => None,
+            };
+            match (&update, &existing) {
+                (Update::SetInt(_) | Update::Replace(..), _) => {
+                    let (kind, value) = write.expect("a write");
+                    // Same length and kind: overwrite the bytes where they are.
                     let in_place = existing
                         .as_ref()
                         .and_then(|(loc, header)| match &header.body {
-                            Body::Inline { value: range, .. } if range.len() == value.len() => {
+                            Body::Inline { value: range, .. }
+                                if range.len() == value.len() && header.kind() == kind =>
+                            {
                                 Some((*loc, header, range.clone()))
                             }
                             _ => None,
@@ -1393,7 +1468,7 @@ impl Store {
                             Some(kv) => Payload::External(inner.store_external(kv)),
                             None => Payload::Inline { key, value },
                         };
-                        let Some(new) = inner.append(usage, &payload, deadline) else {
+                        let Some(new) = inner.append(kind, usage, &payload, deadline) else {
                             // Out of segment ids: practically unreachable.
                             if let Payload::External(index) = payload {
                                 garbage.push(inner.take_external(index));
@@ -1417,7 +1492,7 @@ impl Store {
                     changed = true;
                 }
                 (Update::Expire(expiry), Some((loc, header))) => {
-                    let deadline = match expiry {
+                    let deadline = match *expiry {
                         Expiry::Keep => header.deadline,
                         Expiry::Never => NO_EXPIRY,
                         Expiry::At(deadline) => deadline,
@@ -1468,14 +1543,14 @@ impl Store {
         self.shards.len()
     }
 
-    /// Calls `f` with the key, value and deadline (`NO_EXPIRY` for none) of
-    /// every live entry in shard `index`, holding its lock throughout: keep
-    /// `f` quick, such as copying into a buffer.
+    /// Calls `f` with the key, kind, value and deadline (`NO_EXPIRY` for
+    /// none) of every live entry in shard `index`, holding its lock
+    /// throughout: keep `f` quick, such as copying into a buffer.
     pub fn for_each_live(
         &self,
         index: usize,
         now: Millis,
-        mut f: impl FnMut(&[u8], &[u8], Millis),
+        mut f: impl FnMut(&[u8], Kind, &[u8], Millis),
     ) {
         let inner = self.shards[index].inner.lock();
         for seg in inner.segments.iter().flatten() {
@@ -1491,7 +1566,7 @@ impl Store {
                         .expect("live external")
                         .value(),
                 };
-                f(key, value, header.deadline);
+                f(key, header.kind(), value, header.deadline);
             }
         }
     }

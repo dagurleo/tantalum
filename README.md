@@ -2,10 +2,10 @@
 
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
-`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends) with TTLs, eviction,
-a password, TLS and optional snapshots to disk, and that's the point: be a faster
-drop-in for the "Redis as a cache" use case, using as little memory as
-possible.
+`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends) and hashes (`HSET`,
+`HGET`, `HGETALL` and the rest), with TTLs, eviction, a password, TLS and
+optional snapshots to disk. The point: be a faster drop-in for the "Redis as
+a cache" use case, using as little memory as possible.
 
 Named after the metal of tantalum capacitors, known for packing the most into
 the least space. (It was called ferrokv until v0.2; the raw logs in
@@ -47,7 +47,8 @@ names include the proxy's hostname works, and no CA has to renew it).
 ## Commands
 
 Replies match Redis 7 byte for byte, errors included, as far as the tests
-check (`tests/server.rs`).
+check (`tests/server.rs`, and `tests/hashes.rs`, whose expected replies were
+recorded from Redis 7.0 with `tools/redis-diff.py`).
 
 | Command | Notes |
 |---|---|
@@ -59,13 +60,18 @@ check (`tests/server.rs`).
 | `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` `key time [NX\|XX\|GT\|LT]` | A time already passed deletes the key |
 | `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST` | |
 | `INCR`, `DECR`, `INCRBY`, `DECRBY` | 64-bit, keep the key's TTL |
+| `HSET key field value [field value ...]`, `HSETNX`, `HMSET` | Hashes keep their fields in the order they were added (as Redis does for small hashes) and keep the key's TTL |
+| `HGET key field`, `HMGET key field [field ...]`, `HGETALL`, `HKEYS`, `HVALS` | `HGETALL` is a map in RESP3 |
+| `HDEL key field [field ...]`, `HEXISTS`, `HLEN`, `HSTRLEN`, `HINCRBY key field n` | `HDEL` of the last field deletes the key |
+| `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0 (as Redis does for small hashes). Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
+| `TYPE key` | `string`, `hash` or `none`. Commands for one type reply `-WRONGTYPE` to the other, and `MGET` gives nil for hashes, as in Redis |
 | `FLUSHALL [ASYNC\|SYNC]`, `FLUSHDB [ASYNC\|SYNC]` | Not atomic across shards: writes running at the same time may survive |
 | `AUTH [username] password` | With `--requirepass` (or `TANTALUM_REQUIREPASS`). One user, `default`, as in Redis without ACLs |
-| `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | RESP3 too: redis-py 8 won't connect without it. For these commands it only changes nulls, maps (`HELLO`, `CONFIG GET`), sets (`COMMAND` flags) and `INFO` (verbatim text) |
+| `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | RESP3 too: redis-py 8 won't connect without it. For these commands it only changes nulls, maps (`HELLO`, `CONFIG GET`, `HGETALL`), sets (`COMMAND` flags) and `INFO` (verbatim text) |
 | `CLIENT SETNAME\|GETNAME\|ID\|SETINFO` | What client libraries send on connect |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
-| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX` and `GETDEL`), `evicted_keys`, `expired_keys`, a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
+| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `evicted_keys`, `expired_keys`, a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
 | `PING [msg]`, `ECHO msg`, `SELECT 0`, `QUIT` | |
 
 Anything else gets `-ERR unknown command ...` and the connection stays open.
@@ -121,9 +127,21 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   append-only segments of 4–256 KB, sized to the shard (about 1/16 of its data).
   No heap allocation per key means no allocator header, no size-class rounding
   and no fragmentation between keys. An entry is a flags byte (dead bit,
-  has-TTL, external, 2-bit usage counter), varint key and value lengths, an
-  optional varint deadline, then key and value. A 15-byte key with a 32-byte
-  value takes 50 bytes.
+  has-TTL, external, 2-bit usage counter, and 3 bits for its type), varint key
+  and value lengths, an optional varint deadline, then key and value. A 15-byte
+  key with a 32-byte value takes 50 bytes.
+- **Hashes** (`src/hash.rs`) are one entry like a string, with the type bits
+  set and the fields in its value: a field count, then each field and value
+  with a varint length (one byte below 128), in the order they were added.
+  So a hash costs what its bytes do: 100k hashes of ten 6-byte fields with
+  16-byte values take 27.5 bytes per field in all (Redis 7.0: 34.7, measured
+  with `used_memory` on macOS). Reads scan the fields; writes build the new
+  value and replace the entry, or overwrite it where it is when the length
+  is unchanged (a field set to a value of the same length). Strings pay
+  nothing for this: the type was already in the flags byte, so `GET` and
+  `SET` read the same bytes, and the speed guard measured no difference.
+- **Commands** (`src/cmd.rs`) are found by name length and first letter, a
+  comparison or two however many there are; `GET` and `SET` skip even that.
 - **Table** (`src/table.rs`): bucketized cuckoo hashing over 8-byte slots,
   each holding 32 bits of hash plus a 32-bit location (segment id and offset).
   - Each key can live in one of two 8-slot buckets (a cache line each), so a
@@ -191,9 +209,12 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   pin (`tls: { ca }` in ioredis) works without a public CA.
 - **Snapshots** (`src/snapshot.rs`, `--snapshot FILE`): like Redis' RDB
   files. Every `--snapshot-interval` (60 s) with changes, on `SAVE`/`BGSAVE`
-  and after a graceful shutdown, the live keys go to the file: key, value,
-  and the expiry as a Unix time, so TTLs carry over and keys that expired
-  while the server was down are dropped at startup. Each shard is copied out
+  and after a graceful shutdown, the live keys go to the file: type, key,
+  value, and the expiry as a Unix time, so TTLs carry over and keys that
+  expired while the server was down are dropped at startup. The format has a
+  version in its header: 2 has hashes; a save without hashes still writes 1,
+  which builds from before hashes (0.7) can read, and every build reads all
+  versions up to its own (`tests/data/v1.snapshot` was written by 0.7.0). Each shard is copied out
   under its lock (a few MB: about a millisecond) and written after, so a save
   is consistent per shard, not across the store. It writes `FILE.tmp`, syncs
   it and renames it over the old one, and a CRC32 over the whole file is
@@ -535,8 +556,14 @@ hit rates share the seeding flaw described above.
 - The server binds to `127.0.0.1` by default. If you expose it, set a password,
   and use TLS outside a private network. No client certificates, no
   certificate reloading without a restart.
-- An append-only log (snapshots only), replication, other data types, ACL
-  users, Lua, pub/sub, `SCAN`/`KEYS`.
+- **Big hashes are slow to change**: a hash is one entry, so every write
+  copies all of it (fine at the tens of fields caches keep, O(n) per write
+  at thousands; Redis switches to a hash table past 128 fields), and reads
+  scan it. `HGET` costs about 1.7× a `GET` at pipeline 16 (235 against 145 ns
+  in the in-process benchmark, 10 fields), mostly in the cache lines the
+  scan touches. No `HRANDFIELD`, `HINCRBYFLOAT` or field TTLs (`HEXPIRE`).
+- An append-only log (snapshots only), replication, lists, sets, sorted sets,
+  ACL users, Lua, pub/sub, `SCAN`/`KEYS`, `RENAME`.
 - LFU and random eviction policies, `CONFIG SET` at runtime.
 
 ## Development
@@ -548,10 +575,13 @@ cargo clippy --all-targets
 RUSTFLAGS=-Zsanitizer=address cargo +nightly test --lib --tests --target aarch64-apple-darwin --target-dir target/asan
 # Coverage-guided fuzzing of the parser and every command (cargo install cargo-fuzz):
 cd fuzz && cargo +nightly fuzz run commands corpus/commands seeds/commands -- -max_total_time=600
+# Speed and memory against the last commit (see CLAUDE.md), and replies against a real Redis:
+tools/speed-guard.sh
+tools/redis-diff.py commands.txt   # with redis-server on 6390 and tantalum on 6391
 ```
 
 `tests/fuzz.rs` runs 300,000 random commands (valid and not) on every
-`cargo test`; `fuzz/` drives raw bytes through the parser and command
+`cargo test`; `tests/hashes.rs` checks hash commands against a model; `fuzz/` drives raw bytes through the parser and command
 execution under AddressSanitizer. `bench/docker/soak.sh` runs Tantalum for
 minutes under eviction, TTL, counter, big-value and connection churn, then
 checks memory and a SIGTERM shutdown with clients still connected.

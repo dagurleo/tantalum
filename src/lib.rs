@@ -3,6 +3,8 @@
 pub mod cmd;
 pub mod context;
 mod entry;
+mod glob;
+mod hash;
 mod pages;
 pub mod resp;
 mod segment;
