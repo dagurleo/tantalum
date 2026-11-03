@@ -84,7 +84,10 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `ZUNION`, `ZINTER`, `ZDIFF numkeys key ... [WEIGHTS ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]`, their `STORE` forms, `ZINTERCARD` | Sets count as sorted sets with scores of 1, as in Redis. Each key is read on its own |
 | `ZSCAN key cursor [MATCH pattern] [COUNT n]` | As `SSCAN` |
 | `SSCAN key cursor [MATCH pattern] [COUNT n]` | Small sets come whole with cursor 0, as in Redis; big ones `COUNT` at a time, each member there throughout returned at least once |
-| `TYPE key` | `string`, `hash`, `list`, `set`, `zset` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
+| `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] threshold [LIMIT n]] *\|id field value ...` | IDs as Redis makes and reads them (`ms-*` included). Trimming with `~` removes whole nodes where Redis' end, so it removes what Redis does |
+| `XLEN`, `XRANGE key start end [COUNT n]`, `XREVRANGE`, `XDEL key id ...`, `XTRIM key MAXLEN\|MINID [=\|~] threshold [LIMIT n]` | `(` for exclusive ends. An emptied stream stays, keeping its last ID, as in Redis |
+| `XREAD [COUNT n] [BLOCK ms] STREAMS key ... id ...` | `$` for new entries only. Blocked readers are all served by an entry that's new to them (reading takes nothing), and `$` means the last ID when the command came |
+| `TYPE key` | `string`, `hash`, `list`, `set`, `zset`, `stream` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
 | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | A whole scan returns every key that existed throughout exactly once (Redis may repeat keys), and any cursor is safe. `COUNT` is about how many keys a call looks at, as in Redis; for big shards a call looks at a 1024th of the shard at least. Cursors are Tantalum's own and stay under 2^53, so clients that read them as JavaScript numbers work |
 | `KEYS pattern` | Every match at once, like Redis: it holds each shard's lock in turn while reading it, so prefer `SCAN` on big stores |
 | `RENAME key newkey`, `RENAMENX key newkey` | Atomic across shards; keeps the type and TTL. As in Redis, it overwrites `newkey` of any type and ignores `maxmemory` |
@@ -191,6 +194,19 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   lists of ten 8-byte elements take 13.4 bytes per element (Redis 17.8),
   one of 1M take 9.0 (Redis 9.0). In-process on 200k elements, `LPUSH`
   ~500 ns, `RPOP` ~290 ns, `LINDEX` ~760 ns, `LRANGE -10 -1` ~530 ns.
+- **Streams** (`src/stream.rs`) are kept in chunks that end exactly where
+  Redis would start a new listpack node: after 100 entries (counting ones
+  removed from it), or when its listpack would pass 4 KB. Each chunk counts
+  the bytes Redis' listpack would take, by its encoding rules (integers,
+  string lengths, the master entry, `SAMEFIELDS`), because trimming with `~`
+  removes whole nodes: 118,000 random XADD/XDEL/XTRIM/XRANGE/XREAD commands,
+  values from empty to 4 KB, gave the same replies from Redis 7.2.4. The
+  entries themselves are stored more compactly than a listpack: varint IDs
+  relative to the chunk's first, varint lengths, field names left out when
+  they're the chunk's first entry's. Against Redis 7.2.4 (`used_memory`),
+  100,000 BullMQ-like events take 32.2 bytes each (Redis 41.8), entries of
+  one 8-byte field 13.0 (Redis 20.9). A stream is always an object
+  (`collection.rs`); string entries pay nothing for it.
 - **Sorted sets** (`src/zset.rs`) are packed while small (up to 128
   members of up to 64 bytes, Redis' listpack limits), in order, each entry
   a score and a member; a whole score below 2^52 is a varint of a byte or
@@ -340,9 +356,11 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   and after a graceful shutdown, the live keys go to the file: type, key,
   value, and the expiry as a Unix time, so TTLs carry over and keys that
   expired while the server was down are dropped at startup. The format has a
-  version in its header: 2 has hashes; a save without hashes still writes 1,
-  which builds from before hashes (0.7) can read, and every build reads all
-  versions up to its own (`tests/data/v1.snapshot` was written by 0.7.0). Each shard is copied out
+  version in its header: 2 has hashes, 3 the other collections, 4 streams
+  (with their chunks as they are, so `~` trims the same after a restart). A
+  save writes the lowest version that holds its data (without hashes still
+  1, which builds from before hashes, 0.7, can read), and every build reads
+  all versions up to its own (`tests/data/v1.snapshot` was written by 0.7.0). Each shard is copied out
   under its lock (a few MB: about a millisecond) and written after, so a save
   is consistent per shard, not across the store. It writes `FILE.tmp`, syncs
   it and renames it over the old one, and a CRC32 over the whole file is
@@ -704,8 +722,10 @@ hit rates share the seeding flaw described above.
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
 - An append-only log (snapshots only), replication,
-  ACL users, Lua, streams, `COPY`, `RANDOMKEY`, `OBJECT`,
+  ACL users, Lua, `COPY`, `RANDOMKEY`, `OBJECT`,
   `DUMP`/`RESTORE`.
+- **Stream gaps**: no consumer groups (`XGROUP`, `XREADGROUP`, `XACK`,
+  `XPENDING`, `XCLAIM`, `XAUTOCLAIM`), `XINFO` or `XSETID`.
 - **Transaction gaps**: Redis refuses a write command with `-OOM` while
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client

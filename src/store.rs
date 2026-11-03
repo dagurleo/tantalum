@@ -2198,6 +2198,17 @@ impl Store {
         }
     }
 
+    /// After a write to `key` that may serve clients blocked on it without
+    /// creating it (`XADD`): queues it if some are.
+    pub(crate) fn wake_waiters(&self, key: Key<'_>) {
+        if self.blocked_clients() == 0 {
+            return;
+        }
+        let (_, index) = self.locate(key.hash);
+        let inner = self.shards[index].inner.lock();
+        self.created(&inner, key.bytes);
+    }
+
     /// Registers `waiter` as blocked on `key`, after those already there.
     pub(crate) fn wait_on(&self, key: Key<'_>, waiter: &Arc<Waiter>) {
         let (_, index) = self.locate(key.hash);
@@ -2245,7 +2256,13 @@ impl Store {
 
     /// The first client blocked on `key` that it now has data for,
     /// claimed (see [`Waiter::claim`]) for the caller to serve.
-    pub(crate) fn claim_waiter(&self, key: Key<'_>, now: Millis) -> Option<Arc<Waiter>> {
+    /// (Skipping those in `tried`.)
+    pub(crate) fn claim_waiter(
+        &self,
+        key: Key<'_>,
+        now: Millis,
+        tried: &[Arc<Waiter>],
+    ) -> Option<Arc<Waiter>> {
         self.update_with(key, now, false, |inner, existing| {
             let claimed = existing.and_then(|(_, header)| {
                 let kind = header.kind();
@@ -2253,7 +2270,9 @@ impl Store {
                     .waiting
                     .get(key.bytes)?
                     .iter()
-                    .find(|w| w.kind() == kind && w.claim())
+                    .find(|w| {
+                        w.kind() == kind && !tried.iter().any(|t| Arc::ptr_eq(t, w)) && w.claim()
+                    })
                     .cloned()
             });
             (Update::Peek, claimed)

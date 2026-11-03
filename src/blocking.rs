@@ -45,11 +45,14 @@ pub(crate) enum Attempt {
     /// `keys` for data of `kind`, for `timeout` (`None`: forever). In a
     /// transaction it replies nil at once instead: a null array, or with
     /// `nil_bulk`, a null bulk string (as Redis' BLMOVE does).
+    /// With `args`, the command waits with these arguments instead (XREAD's
+    /// `$` made the ID it stood for).
     Wait {
         keys: Range<usize>,
         timeout: Option<Duration>,
         kind: Kind,
         nil_bulk: bool,
+        args: Option<Vec<Vec<u8>>>,
     },
 }
 
@@ -237,6 +240,7 @@ pub(crate) fn block(
         timeout,
         kind,
         nil_bulk,
+        args: rewritten,
     } = attempt(ctx, session, now, args, out)
     else {
         return Reply::Written;
@@ -252,10 +256,13 @@ pub(crate) fn block(
     }
     let mut buf = Vec::new();
     let mut ranges = Vec::with_capacity(args.len());
-    for i in 0..args.len() {
-        let arg = args.get(i);
+    let mut push = |arg: &[u8]| {
         ranges.push(buf.len()..buf.len() + arg.len());
         buf.extend_from_slice(arg);
+    };
+    match &rewritten {
+        Some(rewritten) => rewritten.iter().for_each(|arg| push(arg)),
+        None => (0..args.len()).for_each(|i| push(args.get(i))),
     }
     let waiter = Arc::new(Waiter {
         state: AtomicU8::new(ARMING),
@@ -279,9 +286,12 @@ pub(crate) fn block(
         store.wait_on(store.key(key), &blocked.waiter);
     }
     store.count_blocked(1);
-    // Again, now that a write creating a key would see it.
+    // Again, now that a write creating a key would see it (with what it
+    // waits with).
+    let waiter = blocked.waiter.clone();
+    let args = Args::new(&waiter.buf, &waiter.ranges);
     loop {
-        if let Attempt::Done = attempt(ctx, session, now, args, out) {
+        if let Attempt::Done = attempt(ctx, session, now, &args, out) {
             return Reply::Written; // `blocked` deregisters as it drops
         }
         if blocked.waiter.arm() {
@@ -296,7 +306,10 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
     let store = &*ctx.store;
     while let Some(key) = store.take_ready() {
         let key = store.key(&key);
-        while let Some(waiter) = store.claim_waiter(key, now) {
+        // Stream readers all read what came: one that found nothing new
+        // doesn't mean the next won't.
+        let mut tried = Vec::new();
+        while let Some(waiter) = store.claim_waiter(key, now, &tried) {
             let claimed = Claimed(waiter);
             let served = loop {
                 let mut out = Vec::new();
@@ -314,6 +327,10 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
                 }
             };
             if !served {
+                if claimed.0.kind() == Kind::Stream {
+                    tried.push(claimed.0.clone());
+                    continue;
+                }
                 break; // the key is empty again
             }
         }

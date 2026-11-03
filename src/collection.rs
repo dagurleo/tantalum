@@ -1,10 +1,11 @@
 //! Big collections: lists, sets and sorted sets too big to stay packed in
-//! their entry. Their shard keeps them as objects and commands change them
-//! in place; the store sees them only through this module.
+//! their entry, and streams. Their shard keeps them as objects and commands
+//! change them in place; the store sees them only through this module.
 
 use crate::list::{self, BigList};
 use crate::segment::Kind;
 use crate::set::{self, BigSet};
+use crate::stream::{self, BigStream};
 use crate::zset::{self, BigZSet};
 
 #[derive(Clone)]
@@ -12,6 +13,7 @@ pub enum Collection {
     List(BigList),
     Set(BigSet),
     ZSet(BigZSet),
+    Stream(BigStream),
 }
 
 impl std::fmt::Debug for Collection {
@@ -31,6 +33,7 @@ impl Collection {
             Collection::List(_) => Kind::List,
             Collection::Set(_) => Kind::Set,
             Collection::ZSet(_) => Kind::ZSet,
+            Collection::Stream(_) => Kind::Stream,
         }
     }
 
@@ -40,6 +43,7 @@ impl Collection {
             Collection::List(list) => list.allocation_size(),
             Collection::Set(set) => set.allocation_size(),
             Collection::ZSet(set) => set.allocation_size(),
+            Collection::Stream(stream) => stream.allocation_size(),
         }
     }
 
@@ -50,6 +54,7 @@ impl Collection {
             Collection::List(list) => list.to_packed(),
             Collection::Set(set) => set.to_compact(),
             Collection::ZSet(set) => set.to_packed(),
+            Collection::Stream(stream) => stream.to_compact(),
         }
     }
 
@@ -59,6 +64,9 @@ impl Collection {
             Kind::List => Collection::List(BigList::from_packed(bytes)),
             Kind::Set => Collection::Set(BigSet::from_compact(bytes)),
             Kind::ZSet => Collection::ZSet(BigZSet::from_packed(bytes)),
+            Kind::Stream => {
+                Collection::Stream(BigStream::from_compact(bytes).expect("a valid stream"))
+            }
             other => unreachable!("{} isn't a collection", other.name()),
         }
     }
@@ -71,6 +79,7 @@ pub fn fits_compact(kind: Kind, bytes: &[u8]) -> bool {
         Kind::List => list::fits_packed(bytes),
         Kind::Set => set::fits_compact(bytes),
         Kind::ZSet => zset::fits_packed(bytes),
+        Kind::Stream => false,
         _ => true,
     }
 }
@@ -81,6 +90,7 @@ pub fn is_valid(kind: Kind, bytes: &[u8]) -> bool {
         Kind::List => list::is_valid(bytes),
         Kind::Set => set::is_valid(bytes),
         Kind::ZSet => zset::is_valid(bytes),
+        Kind::Stream => stream::is_valid(bytes),
         _ => false,
     }
 }

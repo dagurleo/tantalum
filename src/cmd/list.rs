@@ -725,6 +725,7 @@ fn blocking_move(
                 timeout,
                 kind: Kind::List,
                 nil_bulk: true,
+                args: None,
             };
         }
         Err(msg) => resp::write_error(out, msg),
@@ -773,6 +774,7 @@ fn blocking_pop(
         timeout,
         kind: Kind::List,
         nil_bulk: false,
+        args: None,
     }
 }
 
@@ -896,5 +898,6 @@ fn mpop(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, at: usiz
         timeout,
         kind: Kind::List,
         nil_bulk: false,
+        args: None,
     }
 }
