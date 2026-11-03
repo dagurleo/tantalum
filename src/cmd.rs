@@ -2,6 +2,7 @@
 
 mod hash;
 mod keys;
+mod list;
 mod set;
 
 use std::ops::Range;
@@ -190,6 +191,23 @@ static COMMANDS: &[Command] = &[
     Command { name: "sdiff", arity: -2, flags: &["readonly"], keys: ALL_KEYS, run: set::sdiff },
     Command { name: "sdiffstore", arity: -3, flags: &["write", "denyoom"], keys: ALL_KEYS, run: set::sdiffstore },
     Command { name: "sscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: set::sscan },
+    Command { name: "lpush", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::lpush },
+    Command { name: "rpush", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::rpush },
+    Command { name: "lpop", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: list::lpop },
+    Command { name: "rpop", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: list::rpop },
+    Command { name: "lrange", arity: 4, flags: &["readonly"], keys: ONE_KEY, run: list::lrange },
+    Command { name: "llen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: list::llen },
+    Command { name: "lindex", arity: 3, flags: &["readonly"], keys: ONE_KEY, run: list::lindex },
+    Command { name: "lset", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: list::lset },
+    Command { name: "linsert", arity: 5, flags: &["write", "denyoom"], keys: ONE_KEY, run: list::linsert },
+    Command { name: "lrem", arity: 4, flags: &["write"], keys: ONE_KEY, run: list::lrem },
+    Command { name: "ltrim", arity: 4, flags: &["write"], keys: ONE_KEY, run: list::ltrim },
+    Command { name: "lpos", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: list::lpos },
+    Command { name: "lpushx", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::lpushx },
+    Command { name: "rpushx", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::rpushx },
+    Command { name: "lmove", arity: 5, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::lmove },
+    Command { name: "rpoplpush", arity: 3, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::rpoplpush },
+    Command { name: "lmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: list::lmpop },
 ];
 
 /// Runs one command and writes its reply to `out`. `args` must be non-empty.

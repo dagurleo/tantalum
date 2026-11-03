@@ -636,6 +636,52 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    #[test]
+    fn lists_roundtrip() {
+        use crate::collection::Collection;
+        use crate::list::BigList;
+        use crate::store::Update;
+        let path = temp_path("lists");
+        let s = Store::new(2);
+        let now = s.now();
+        let mut small = BigList::default();
+        for e in [&b"a"[..], b"", b"\0\r\n"] {
+            small.push_back(e);
+        }
+        s.restore(b"small", Kind::List, &small.to_packed(), Expiry::Never, now)
+            .unwrap();
+        let mut big = BigList::default();
+        for i in 0..5_000 {
+            big.push_back(format!("element {i}").as_bytes());
+        }
+        big.push_back(&[9; 20_000]);
+        let packed = big.to_packed();
+        let mut made = Some(Collection::List(big));
+        s.update_collection(s.key(b"big"), now, false, |_| {
+            (Update::Object(made.take().unwrap()), ())
+        })
+        .unwrap();
+        save(&s, &path).unwrap();
+        let t = Store::new(4);
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
+        assert_eq!(
+            kind_and_value(&t, b"small"),
+            Some((Kind::List, small.to_packed()))
+        );
+        let reloaded = t
+            .update_collection(t.key(b"big"), t.now(), false, |entry| {
+                match entry.unwrap().value {
+                    crate::store::EntryValue::Object(Collection::List(list)) => {
+                        (Update::Peek, list.to_packed())
+                    }
+                    _ => panic!("not big"),
+                }
+            })
+            .unwrap();
+        assert_eq!(reloaded, packed);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// `tests/data/v1.snapshot` was saved by Tantalum 0.7.0, before hashes:
     /// `SET name tantalum`, `SET counter 73`, an empty key and value, a
     /// binary key, a 20,000-byte value and a key expiring in 2100.

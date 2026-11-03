@@ -6,6 +6,7 @@ pub mod context;
 mod entry;
 mod glob;
 mod hash;
+mod list;
 mod pages;
 pub mod resp;
 mod segment;

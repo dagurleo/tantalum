@@ -3,7 +3,7 @@
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
-and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
+lists, and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
 optional snapshots to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
@@ -68,8 +68,13 @@ recorded from Redis 7.0 with `tools/redis-diff.py`).
 | `SPOP key [count]`, `SRANDMEMBER key [count]` | Random members; a negative `SRANDMEMBER` count may repeat them. A count covering the whole set gives it in Redis' order |
 | `SMOVE source destination member` | Atomic: holds both keys' shards |
 | `SINTER`, `SUNION`, `SDIFF key [key ...]`, their `STORE` forms, `SINTERCARD numkeys key ... [LIMIT n]` | Each key is read on its own, so unlike Redis, a write to another key meanwhile may or may not be seen |
+| `LPUSH`, `RPUSH key element [element ...]`, `LPUSHX`, `RPUSHX` | |
+| `LPOP`, `RPOP key [count]`, `LMPOP numkeys key [key ...] LEFT\|RIGHT [COUNT n]` | No blocking forms yet (`BLPOP` and the rest) |
+| `LRANGE key start stop`, `LINDEX`, `LLEN`, `LPOS key element [RANK r] [COUNT n] [MAXLEN m]` | |
+| `LSET`, `LINSERT key BEFORE\|AFTER pivot element`, `LREM key count element`, `LTRIM` | |
+| `LMOVE source destination LEFT\|RIGHT LEFT\|RIGHT`, `RPOPLPUSH` | Atomic: holds both keys' shards |
 | `SSCAN key cursor [MATCH pattern] [COUNT n]` | Small sets come whole with cursor 0, as in Redis; big ones `COUNT` at a time, each member there throughout returned at least once |
-| `TYPE key` | `string`, `hash`, `set` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
+| `TYPE key` | `string`, `hash`, `list`, `set` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
 | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | A whole scan returns every key that existed throughout exactly once (Redis may repeat keys), and any cursor is safe. `COUNT` is about how many keys a call looks at, as in Redis; for big shards a call looks at a 1024th of the shard at least. Cursors are Tantalum's own and stay under 2^53, so clients that read them as JavaScript numbers work |
 | `KEYS pattern` | Every match at once, like Redis: it holds each shard's lock in turn while reading it, so prefer `SCAN` on big stores |
 | `RENAME key newkey`, `RENAMENX key newkey` | Atomic across shards; keeps the type and TTL. As in Redis, it overwrites `newkey` of any type and ignores `maxmemory` |
@@ -161,6 +166,15 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   and one set of 1M take 23.0 (Redis 29.3). Entries of object kinds use the
   external bit to point into the shard's object table, so strings and
   hashes read the same bytes as before.
+- **Lists** (`src/list.rs`) are packed while small (up to 128 elements in
+  4 KB): a count, then each element's length, bytes, and length again
+  written backwards, so the list reads from either end, as Redis'
+  listpacks do. A bigger list is chunks of up to 8 KB in that format (like
+  Redis' quicklist): pushes and pops at either end touch one chunk, and an
+  index walks chunk counts from the nearer end. Against Redis 7.2.4: 100k
+  lists of ten 8-byte elements take 13.4 bytes per element (Redis 17.8),
+  one of 1M take 9.0 (Redis 9.0). In-process on 200k elements, `LPUSH`
+  ~500 ns, `RPOP` ~290 ns, `LINDEX` ~760 ns, `LRANGE -10 -1` ~530 ns.
 - **`SCAN` goes in hash order** (`Store::scan`): a cursor is a shard and a
   32-bit slot hash, and each call takes the keys with the next smallest
   hashes in that shard, every key with the same hash at once, under its
@@ -603,7 +617,9 @@ hit rates share the seeding flaw described above.
 - **Multi-key set commands read one key at a time** (`SINTER`, `SUNION`,
   `SDIFF` and their stores), as `MSET` writes one at a time; `SMOVE` and
   `RENAME` are atomic.
-- An append-only log (snapshots only), replication, lists, sorted sets,
+- **No blocking list commands** (`BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`,
+  `BRPOPLPUSH`): they need connections to wait inside the I/O loops.
+- An append-only log (snapshots only), replication, sorted sets,
   ACL users, Lua, pub/sub, `COPY`, `RANDOMKEY`, `OBJECT`, `DUMP`/`RESTORE`.
 - LFU and random eviction policies, `CONFIG SET` at runtime.
 

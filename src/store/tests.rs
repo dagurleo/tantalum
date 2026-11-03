@@ -1431,11 +1431,19 @@ fn big_collections_keep_the_books() {
         let mut rng = Rng(0x2545_F491_4F6C_DD1D);
         let mut now: Millis = 1;
         let big = |n: u64, tag: u64| {
-            let mut set = BigSet::with_capacity(n as usize);
-            for i in 0..n {
-                set.insert(format!("{tag}-{i}").as_bytes());
+            if tag.is_multiple_of(2) {
+                let mut set = BigSet::with_capacity(n as usize);
+                for i in 0..n {
+                    set.insert(format!("{tag}-{i}").as_bytes());
+                }
+                Collection::Set(set)
+            } else {
+                let mut list = crate::list::BigList::default();
+                for i in 0..n {
+                    list.push_back(format!("{tag}-{i}").as_bytes());
+                }
+                Collection::List(list)
             }
-            Collection::Set(set)
         };
         for step in 0..4_000u64 {
             let key = format!("c{}", rng.below(40)).into_bytes();
@@ -1458,6 +1466,16 @@ fn big_collections_keep_the_books() {
                                 set.insert(format!("x{step}-{i}").as_bytes());
                             }
                             set.remove(b"0-0");
+                            (Update::Changed, ())
+                        }
+                        Some(Entry {
+                            value: EntryValue::Object(Collection::List(list)),
+                            ..
+                        }) => {
+                            for i in 0..extra {
+                                list.push_front(format!("x{step}-{i}").as_bytes());
+                            }
+                            list.pop_back();
                             (Update::Changed, ())
                         }
                         _ => (Update::Peek, ()),
@@ -1523,15 +1541,325 @@ fn big_collections_keep_the_books() {
         }
         s.check();
         // A big set reads back as one, and snapshots see it packed.
-        let mut sets = 0;
+        let (mut sets, mut lists) = (0, 0);
         for shard in 0..s.shard_count() {
-            s.for_each_live(shard, now, |_, kind, value, _| {
-                if kind == Kind::Set {
+            s.for_each_live(shard, now, |_, kind, value, _| match kind {
+                Kind::Set => {
                     assert!(crate::set::is_valid(value));
                     sets += 1;
                 }
+                Kind::List => {
+                    assert!(crate::list::is_valid(value));
+                    lists += 1;
+                }
+                _ => {}
             });
         }
-        assert!(sets > 0, "{policy:?}: no sets survived");
+        assert!(
+            sets > 0 && lists > 0,
+            "{policy:?}: {sets} sets, {lists} lists survived"
+        );
     }
+}
+
+/// Random commands, valid and not (the vocabulary of `tests/fuzz.rs`),
+/// through `cmd::execute`, with the store's books checked after every one,
+/// so a command that leaves them wrong fails at once rather than later.
+mod random_commands {
+    use crate::cmd::{self, Args};
+    use crate::context::{Context, Settings};
+    use crate::store::{Config, EvictionPolicy, Store};
+    use std::sync::Arc;
+    /// Deterministic xorshift, so a failure reproduces.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a [u8]]) -> &'a [u8] {
+            items[self.below(items.len())]
+        }
+    }
+
+    const COMMANDS: &[&[u8]] = &[
+        b"GET",
+        b"SET",
+        b"MGET",
+        b"MSET",
+        b"DEL",
+        b"UNLINK",
+        b"EXISTS",
+        b"EXPIRE",
+        b"PEXPIRE",
+        b"EXPIREAT",
+        b"PEXPIREAT",
+        b"TTL",
+        b"PTTL",
+        b"EXPIRETIME",
+        b"PEXPIRETIME",
+        b"PERSIST",
+        b"INCR",
+        b"DECR",
+        b"INCRBY",
+        b"DECRBY",
+        b"SETEX",
+        b"PSETEX",
+        b"SETNX",
+        b"GETDEL",
+        b"GETEX",
+        b"PING",
+        b"ECHO",
+        b"SELECT",
+        b"DBSIZE",
+        b"INFO",
+        b"AUTH",
+        b"HELLO",
+        b"CLIENT",
+        b"COMMAND",
+        b"CONFIG",
+        b"FLUSHALL",
+        b"FLUSHDB",
+        b"TYPE",
+        b"HSET",
+        b"HSETNX",
+        b"HMSET",
+        b"HGET",
+        b"HMGET",
+        b"HGETALL",
+        b"HDEL",
+        b"HEXISTS",
+        b"HLEN",
+        b"HKEYS",
+        b"HVALS",
+        b"HSTRLEN",
+        b"HINCRBY",
+        b"HSCAN",
+        b"SCAN",
+        b"KEYS",
+        b"RENAME",
+        b"RENAMENX",
+        b"SADD",
+        b"SREM",
+        b"SISMEMBER",
+        b"SMISMEMBER",
+        b"SMEMBERS",
+        b"SCARD",
+        b"SPOP",
+        b"SRANDMEMBER",
+        b"SMOVE",
+        b"SINTER",
+        b"SINTERSTORE",
+        b"SINTERCARD",
+        b"SUNION",
+        b"SUNIONSTORE",
+        b"SDIFF",
+        b"SDIFFSTORE",
+        b"SSCAN",
+        b"LPUSH",
+        b"RPUSH",
+        b"LPUSHX",
+        b"RPUSHX",
+        b"LPOP",
+        b"RPOP",
+        b"LLEN",
+        b"LRANGE",
+        b"LINDEX",
+        b"LSET",
+        b"LINSERT",
+        b"LREM",
+        b"LTRIM",
+        b"LPOS",
+        b"LMOVE",
+        b"RPOPLPUSH",
+        b"LMPOP",
+        b"hget",
+        b"get",
+        b"sEt",
+        b"NOPE",
+    ];
+
+    const WORDS: &[&[u8]] = &[
+        b"k",
+        b"k1",
+        b"k2",
+        b"counter",
+        b"",
+        b"0",
+        b"1",
+        b"-1",
+        b"2",
+        b"3",
+        b"10",
+        b"100",
+        b"99999999999",
+        b"9223372036854775807",
+        b"-9223372036854775808",
+        b"9223372036854775808",
+        b"1.5",
+        b"abc",
+        b" 1",
+        b"EX",
+        b"PX",
+        b"EXAT",
+        b"PXAT",
+        b"NX",
+        b"XX",
+        b"GT",
+        b"LT",
+        b"GET",
+        b"KEEPTTL",
+        b"PERSIST",
+        b"ASYNC",
+        b"SYNC",
+        b"AUTH",
+        b"SETNAME",
+        b"default",
+        b"GETNAME",
+        b"ID",
+        b"SETINFO",
+        b"LIB-NAME",
+        b"LIB-VER",
+        b"COUNT",
+        b"INFO",
+        b"LIST",
+        b"DOCS",
+        b"MATCH",
+        b"LIMIT",
+        b"LEFT",
+        b"RIGHT",
+        b"BEFORE",
+        b"AFTER",
+        b"RANK",
+        b"MAXLEN",
+        b"-5",
+        b"TYPE",
+        b"string",
+        b"hash",
+        b"4294967296",
+        b"NOVALUES",
+        b"f",
+        b"k*",
+        b"[a-z]",
+        b"\\",
+        b"maxmemory*",
+        b"*",
+        b"?",
+        b"name with space",
+        b"\r\n",
+        b"\0\xff",
+        b"pw",
+    ];
+
+    fn random_arg(rng: &mut Rng) -> Vec<u8> {
+        match rng.below(10) {
+            0 => (0..rng.below(40)).map(|_| rng.next() as u8).collect(),
+            1 => vec![b'v'; rng.below(3) * 10_000], // some values big enough to be external
+            2 => rng.next().to_string().into_bytes(),
+            _ => rng.pick(WORDS).to_vec(),
+        }
+    }
+
+    #[test]
+    fn keep_the_books() {
+        for seed in [1u64, 2, 3] {
+            let settings = if seed == 2 {
+                Settings {
+                    password: Some(b"pw".to_vec()),
+                    ..Settings::default()
+                }
+            } else {
+                Settings::default()
+            };
+            let store = Store::with_config(Config {
+                shards: 4,
+                maxmemory: 2 << 20,
+                policy: if seed == 3 {
+                    EvictionPolicy::NoEviction
+                } else {
+                    EvictionPolicy::AllKeysLru
+                },
+                ..Config::default()
+            });
+            let ctx = Context::new(Arc::new(store), settings);
+            let client = ctx.connect(-1).unwrap();
+            let mut session = client.session();
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut now = 1;
+            let mut out = Vec::new();
+            let mut history: Vec<String> = Vec::new();
+            for step in 0..15_000 {
+                let mut args = vec![rng.pick(COMMANDS).to_vec()];
+                for _ in 0..rng.below(7) {
+                    args.push(random_arg(&mut rng));
+                }
+                let mut buf = Vec::new();
+                let mut ranges = Vec::new();
+                for arg in &args {
+                    ranges.push(buf.len()..buf.len() + arg.len());
+                    buf.extend_from_slice(arg);
+                }
+                out.clear();
+                let shown: Vec<String> = args
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(&a[..a.len().min(20)]).into_owned())
+                    .collect();
+                history.push(format!("step {step}: {shown:?}"));
+                if history.len() > 6 {
+                    history.remove(0);
+                }
+                let _ = cmd::execute(&ctx, &mut session, now, &Args::new(&buf, &ranges), &mut out);
+                let ok =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.store.check()));
+                assert!(
+                    ok.is_ok(),
+                    "seed {seed}: the books are wrong after {history:#?}"
+                );
+                now += rng.below(50) as u64;
+            }
+        }
+    }
+}
+
+/// A packed set or list renamed to a key too long to pack it with becomes
+/// a big one (an `EXTERNAL` collection entry is an object, not bytes).
+#[test]
+fn renaming_a_packed_collection_to_a_long_key() {
+    let s = Store::new(2);
+    let long = vec![b'k'; 20_000];
+    s.restore(b"set", Kind::Set, b"\x00\x01\x01a", Expiry::Never, 1)
+        .unwrap();
+    s.restore(b"list", Kind::List, b"\x01\x01a\x01", Expiry::Never, 1)
+        .unwrap();
+    assert_eq!(
+        s.rename(s.key(b"set"), s.key(&long), false, 1).unwrap(),
+        Renamed::Done
+    );
+    s.check();
+    let mut longer = long.clone();
+    longer.push(b'!');
+    assert_eq!(
+        s.rename(s.key(b"list"), s.key(&longer), false, 1).unwrap(),
+        Renamed::Done
+    );
+    s.check();
+    let kinds: Vec<Kind> = [&long, &longer]
+        .iter()
+        .map(|k| s.get_with(k, 1, |v| v.unwrap().kind()))
+        .collect();
+    assert_eq!(kinds, [Kind::Set, Kind::List]);
+    // And back to short keys, still big.
+    assert_eq!(
+        s.rename(s.key(&long), s.key(b"set2"), false, 1).unwrap(),
+        Renamed::Done
+    );
+    s.check();
 }

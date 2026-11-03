@@ -2236,7 +2236,13 @@ impl Store {
                 // The value, out from under the source's segment, which the
                 // destination's appends may share.
                 let value = src.value_ref(loc, &header).share();
-                let payload = if to.bytes.len() + value.as_bytes().len() + 20 > INLINE_MAX {
+                let too_big = to.bytes.len() + value.as_bytes().len() + 20 > INLINE_MAX;
+                let payload = if too_big && header.kind().is_collection() {
+                    // A packed collection whose new key is too long to pack
+                    // it with becomes a big one (it's at most a few KB).
+                    let big = Collection::from_compact(header.kind(), value.as_bytes());
+                    Payload::External(target!().store_object(to.bytes, big))
+                } else if too_big {
                     let kv = match prepared.take() {
                         Some((copied, kv)) if same_bytes(copied.as_bytes(), value.as_bytes()) => kv,
                         _ if attempts < 2 => {
@@ -2261,7 +2267,7 @@ impl Store {
                 let Some(new) = appended else {
                     // Out of segment ids: practically unreachable (4 GB per shard).
                     if let Payload::External(index) = payload {
-                        garbage.push(Freed::Value(target!().take_external(index)));
+                        garbage.push(target!().take_outside(header.kind(), index));
                     }
                     return Err(OutOfMemory);
                 };

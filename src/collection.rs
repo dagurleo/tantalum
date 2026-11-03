@@ -2,11 +2,13 @@
 //! their entry. Their shard keeps them as objects and commands change them
 //! in place; the store sees them only through this module.
 
+use crate::list::{self, BigList};
 use crate::segment::Kind;
 use crate::set::{self, BigSet};
 
 #[derive(Clone)]
 pub enum Collection {
+    List(BigList),
     Set(BigSet),
 }
 
@@ -24,6 +26,7 @@ impl std::fmt::Debug for Collection {
 impl Collection {
     pub fn kind(&self) -> Kind {
         match self {
+            Collection::List(_) => Kind::List,
             Collection::Set(_) => Kind::Set,
         }
     }
@@ -31,6 +34,7 @@ impl Collection {
     /// Roughly what it takes in memory, for `used_memory` and eviction.
     pub fn allocation_size(&self) -> usize {
         match self {
+            Collection::List(list) => list.allocation_size(),
             Collection::Set(set) => set.allocation_size(),
         }
     }
@@ -39,6 +43,7 @@ impl Collection {
     /// snapshots.
     pub fn to_compact(&self) -> Vec<u8> {
         match self {
+            Collection::List(list) => list.to_packed(),
             Collection::Set(set) => set.to_compact(),
         }
     }
@@ -46,6 +51,7 @@ impl Collection {
     /// The big form of packed bytes (`is_valid` ones).
     pub fn from_compact(kind: Kind, bytes: &[u8]) -> Self {
         match kind {
+            Kind::List => Collection::List(BigList::from_packed(bytes)),
             Kind::Set => Collection::Set(BigSet::from_compact(bytes)),
             other => unreachable!("{} isn't a collection", other.name()),
         }
@@ -56,6 +62,7 @@ impl Collection {
 /// staying packed; past them it becomes a [`Collection`].
 pub fn fits_compact(kind: Kind, bytes: &[u8]) -> bool {
     match kind {
+        Kind::List => list::fits_packed(bytes),
         Kind::Set => set::fits_compact(bytes),
         _ => true,
     }
@@ -64,6 +71,7 @@ pub fn fits_compact(kind: Kind, bytes: &[u8]) -> bool {
 /// Whether `bytes` are packed contents of `kind`, for values read from files.
 pub fn is_valid(kind: Kind, bytes: &[u8]) -> bool {
     match kind {
+        Kind::List => list::is_valid(bytes),
         Kind::Set => set::is_valid(bytes),
         _ => false,
     }
