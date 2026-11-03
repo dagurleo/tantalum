@@ -1,6 +1,6 @@
 [package]
 name = "tantalum"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,9 @@ mimalloc = "0.1.52"
 parking_lot = "0.13.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 socket2 = "0.6"
+# TLS on its own port (--tls-port). The ring backend builds without cmake.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 monoio = "0.2.4"
 
 [target.'cfg(unix)'.dependencies]
@@ -21,6 +24,11 @@ libc = "0.2"
 # The version monoio uses, to pass it ring setup flags.
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.6.4"
+
+[dev-dependencies]
+# Self-signed certificates for the TLS tests.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 
 [profile.release]
 lto = "fat"

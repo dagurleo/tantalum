@@ -17,7 +17,8 @@ Usage: tantalum [OPTIONS]
 
 Options:
   --bind <ADDR>     Address to listen on [default: 127.0.0.1]
-  --port <PORT>     Port to listen on [default: 6379]
+  --port <PORT>     Port to listen on; 0 for none, with --tls-port
+                    [default: 6379]
   --threads <N>     Worker threads [default: number of CPUs]
   --io <MODE>       uring: an event loop per thread on io_uring, each
                     connection pinned to one; per-thread: the same on
@@ -40,6 +41,10 @@ Options:
   --tcp-keepalive <SECS>
                     Probe idle connections after this long to detect dead
                     clients; 0 turns it off [default: 300]
+  --tls-port <PORT> Also listen on this port for TLS connections, with the
+                    certificate chain and key from these PEM files:
+  --tls-cert-file <FILE>
+  --tls-key-file <FILE>
   --snapshot <FILE> Keep the data across restarts: load FILE at startup if it
                     exists, save to it periodically and at shutdown
                     [default: none, nothing is saved]
@@ -65,6 +70,9 @@ struct Config {
     settings: Settings,
     snapshot: Option<PathBuf>,
     snapshot_interval: Option<Duration>,
+    tls_port: Option<u16>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,6 +153,9 @@ fn parse_args() -> Result<Config, String> {
         },
         snapshot: None,
         snapshot_interval: Some(Duration::from_secs(60)),
+        tls_port: None,
+        tls_cert: None,
+        tls_key: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -182,6 +193,9 @@ fn parse_args() -> Result<Config, String> {
                 config.settings.tcp_keepalive = parse_secs(&value).ok_or_else(|| bad(()))?;
             }
             "--snapshot" => config.snapshot = Some(PathBuf::from(value)),
+            "--tls-port" => config.tls_port = Some(value.parse().map_err(|_| bad(()))?),
+            "--tls-cert-file" => config.tls_cert = Some(PathBuf::from(value)),
+            "--tls-key-file" => config.tls_key = Some(PathBuf::from(value)),
             "--snapshot-interval" => {
                 config.snapshot_interval = parse_secs(&value).ok_or_else(|| bad(()))?;
             }
@@ -236,7 +250,31 @@ fn main() -> std::io::Result<()> {
     let _expirer = store::spawn_expirer(&store, Duration::from_millis(100));
     let ctx = Arc::new(ctx);
     server::handle_signals(ctx.clone())?;
-    let banner = |addr: std::net::SocketAddr| {
+    // TLS listens on its own port, on tokio loops even with io_uring (monoio
+    // has no TLS here).
+    let tls = match config.tls_port {
+        None => None,
+        Some(port) => {
+            let (Some(cert), Some(key)) = (&config.tls_cert, &config.tls_key) else {
+                eprintln!("error: --tls-port needs --tls-cert-file and --tls-key-file");
+                std::process::exit(2);
+            };
+            let acceptor = server::tls_acceptor(cert, key).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            });
+            Some((
+                std::net::TcpListener::bind((config.bind.as_str(), port))?,
+                acceptor,
+            ))
+        }
+    };
+    if config.port == 0 && tls.is_none() {
+        eprintln!("error: nothing to listen on: --port 0 needs --tls-port");
+        std::process::exit(2);
+    }
+    let tls_addr = tls.as_ref().map(|(l, _)| l.local_addr()).transpose()?;
+    let banner = |plain: Option<std::net::SocketAddr>| {
         let limit = match config.store.maxmemory {
             0 => "no memory limit".to_string(),
             n => format!("maxmemory {n} bytes, {}", config.store.policy.name()),
@@ -246,14 +284,21 @@ fn main() -> std::io::Result<()> {
             Io::PerThread => "per-thread",
             Io::Uring => "io_uring",
         };
+        let addrs = match (plain, tls_addr) {
+            (Some(plain), Some(tls)) => format!("{plain} and {tls} (TLS)"),
+            (Some(plain), None) => plain.to_string(),
+            (None, Some(tls)) => format!("{tls} (TLS)"),
+            (None, None) => unreachable!("checked above"),
+        };
         eprintln!(
-            "tantalum {} listening on {addr} ({} threads, {io} I/O, {limit})",
+            "tantalum {} listening on {addrs} ({} threads, {io} I/O, {limit})",
             env!("CARGO_PKG_VERSION"),
             config.threads,
         );
-        if config.settings.password.is_none() && !addr.ip().is_loopback() {
+        let exposed = plain.iter().chain(&tls_addr).any(|a| !a.ip().is_loopback());
+        if config.settings.password.is_none() && exposed {
             eprintln!(
-                "warning: no password set (--requirepass): anyone who can reach {addr} can read and write"
+                "warning: no password set (--requirepass): anyone who can reach {addrs} can read and write"
             );
         }
     };
@@ -261,17 +306,45 @@ fn main() -> std::io::Result<()> {
     let mut _shared_runtime = None;
     match io {
         Io::PerThread => {
-            let listener = std::net::TcpListener::bind((config.bind.as_str(), config.port))?;
-            banner(listener.local_addr()?);
-            server::serve_per_thread(listener, ctx.clone(), config.threads)?;
+            let mut listeners = Vec::new();
+            let mut plain = None;
+            if config.port != 0 {
+                let listener = std::net::TcpListener::bind((config.bind.as_str(), config.port))?;
+                plain = Some(listener.local_addr()?);
+                listeners.push((listener, None));
+            }
+            banner(plain);
+            listeners.extend(tls.map(|(listener, acceptor)| (listener, Some(acceptor))));
+            server::serve_per_thread_with(listeners, ctx.clone(), config.threads)?;
         }
         Io::Uring => {
-            let addr = (config.bind.as_str(), config.port)
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| std::io::Error::other("no address to bind"))?;
-            banner(addr);
-            server::serve_uring(addr, ctx.clone(), config.threads)?;
+            let tls_loops = tls
+                .map(|(listener, acceptor)| {
+                    let (ctx, threads) = (ctx.clone(), config.threads);
+                    std::thread::Builder::new()
+                        .name("tantalum-tls".into())
+                        .spawn(move || {
+                            server::serve_per_thread_with(
+                                vec![(listener, Some(acceptor))],
+                                ctx,
+                                threads,
+                            )
+                        })
+                })
+                .transpose()?;
+            if config.port != 0 {
+                let addr = (config.bind.as_str(), config.port)
+                    .to_socket_addrs()?
+                    .next()
+                    .ok_or_else(|| std::io::Error::other("no address to bind"))?;
+                banner(Some(addr));
+                server::serve_uring(addr, ctx.clone(), config.threads)?;
+            } else if let Some(tls_loops) = tls_loops {
+                banner(None);
+                tls_loops
+                    .join()
+                    .map_err(|_| std::io::Error::other("the TLS thread panicked"))??;
+            }
         }
         Io::Shared => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -279,9 +352,31 @@ fn main() -> std::io::Result<()> {
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                let listener = TcpListener::bind((config.bind.as_str(), config.port)).await?;
-                banner(listener.local_addr()?);
-                server::serve(listener, ctx.clone()).await
+                let mut accept_loops = Vec::new();
+                let mut plain = None;
+                if config.port != 0 {
+                    let listener = TcpListener::bind((config.bind.as_str(), config.port)).await?;
+                    plain = Some(listener.local_addr()?);
+                    accept_loops.push(tokio::spawn(server::serve_with(
+                        listener,
+                        ctx.clone(),
+                        None,
+                    )));
+                }
+                banner(plain);
+                if let Some((listener, acceptor)) = tls {
+                    listener.set_nonblocking(true)?;
+                    let listener = TcpListener::from_std(listener)?;
+                    accept_loops.push(tokio::spawn(server::serve_with(
+                        listener,
+                        ctx.clone(),
+                        Some(acceptor),
+                    )));
+                }
+                for accept_loop in accept_loops {
+                    accept_loop.await.map_err(std::io::Error::other)??;
+                }
+                Ok::<_, std::io::Error>(())
             })?;
             // Its workers run the connections still open.
             _shared_runtime = Some(runtime);

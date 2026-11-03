@@ -31,11 +31,14 @@ use std::io::{self, IoSlice};
 use std::ops::Range;
 use std::os::fd::AsRawFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+pub use tokio_rustls::TlsAcceptor;
 
 use crate::cmd::{self, Args, Reply};
 use crate::context::{Context, Session};
@@ -63,6 +66,8 @@ const MAX_BATCH: usize = 256;
 const MAX_CLIENTS_ERROR: &[u8] = b"-ERR max number of clients reached\r\n";
 /// What a connection gets if a command panics (a bug), before it's closed.
 const PANIC_ERROR: &[u8] = b"-ERR internal error, closing the connection\r\n";
+/// How long a TLS client may take to finish its handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Commands parsed ahead of running them. Run one at a time, each command of a
 /// pipelined batch waits on its own cache misses in turn (its buckets, then
@@ -148,6 +153,15 @@ impl Batch {
 }
 
 pub async fn serve(listener: TcpListener, ctx: Arc<Context>) -> io::Result<()> {
+    serve_with(listener, ctx, None).await
+}
+
+/// [`serve`], speaking TLS on this listener if `tls` is given.
+pub async fn serve_with(
+    listener: TcpListener,
+    ctx: Arc<Context>,
+    tls: Option<TlsAcceptor>,
+) -> io::Result<()> {
     loop {
         let socket = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -159,10 +173,10 @@ pub async fn serve(listener: TcpListener, ctx: Arc<Context>) -> io::Result<()> {
             },
             () = ctx.until_shutdown() => return Ok(()),
         };
-        let ctx = ctx.clone();
+        let (ctx, tls) = (ctx.clone(), tls.clone());
         tokio::spawn(async move {
             // Errors here are almost always the client going away.
-            let _ = handle_connection(socket, &ctx).await;
+            let _ = handle_connection(socket, &ctx, tls.as_ref()).await;
         });
     }
 }
@@ -187,9 +201,20 @@ pub fn serve_per_thread(
     ctx: Arc<Context>,
     threads: usize,
 ) -> io::Result<()> {
+    serve_per_thread_with(vec![(listener, None)], ctx, threads)
+}
+
+/// [`serve_per_thread`] for several listeners, each speaking TLS if it
+/// comes with an acceptor.
+pub fn serve_per_thread_with(
+    listeners: Vec<(std::net::TcpListener, Option<TlsAcceptor>)>,
+    ctx: Arc<Context>,
+    threads: usize,
+) -> io::Result<()> {
+    type Incoming = (std::net::TcpStream, Option<TlsAcceptor>);
     let mut workers = Vec::with_capacity(threads);
     for i in 0..threads.max(1) {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Incoming>();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -198,48 +223,88 @@ pub fn serve_per_thread(
             .name(format!("tantalum-io-{i}"))
             .spawn(move || {
                 runtime.block_on(async move {
-                    while let Some(socket) = rx.recv().await {
+                    while let Some((socket, tls)) = rx.recv().await {
                         // Registers the socket with this thread's reactor.
                         let Ok(socket) = TcpStream::from_std(socket) else {
                             continue;
                         };
                         let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            let _ = handle_connection(socket, &ctx).await;
+                            let _ = handle_connection(socket, &ctx, tls.as_ref()).await;
                         });
                     }
                 })
             })?;
         workers.push(tx);
     }
-    listener.set_nonblocking(true)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let listener = TcpListener::from_std(listener)?;
-        let mut next = 0;
-        loop {
-            let socket = tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((socket, _)) => socket,
-                    Err(e) => {
-                        accept_failed(e).await;
+        let mut loops = Vec::new();
+        for (listener, tls) in listeners {
+            listener.set_nonblocking(true)?;
+            let listener = TcpListener::from_std(listener)?;
+            let (ctx, workers) = (ctx.clone(), workers.clone());
+            loops.push(tokio::spawn(async move {
+                let mut next = 0;
+                loop {
+                    let socket = tokio::select! {
+                        accepted = listener.accept() => match accepted {
+                            Ok((socket, _)) => socket,
+                            Err(e) => {
+                                accept_failed(e).await;
+                                continue;
+                            }
+                        },
+                        () = ctx.until_shutdown() => return Ok(()),
+                    };
+                    // Deregistered from this thread's reactor, for the worker's.
+                    let Ok(socket) = socket.into_std() else {
                         continue;
+                    };
+                    if workers[next].send((socket, tls.clone())).is_err() {
+                        return Err(io::Error::other("an I/O thread exited"));
                     }
-                },
-                () = ctx.until_shutdown() => return Ok(()),
-            };
-            // Deregistered from this thread's reactor, for the worker's.
-            let Ok(socket) = socket.into_std() else {
-                continue;
-            };
-            if workers[next].send(socket).is_err() {
-                return Err(io::Error::other("an I/O thread exited"));
-            }
-            next = (next + 1) % workers.len();
+                    next = (next + 1) % workers.len();
+                }
+            }));
         }
+        for accept_loop in loops {
+            accept_loop.await.map_err(io::Error::other)??;
+        }
+        Ok(())
     })
+}
+
+/// The TLS setup for `--tls-port`, from PEM files: a certificate chain and
+/// its private key. Clients aren't asked for certificates.
+pub fn tls_acceptor(cert_file: &Path, key_file: &Path) -> io::Result<TlsAcceptor> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let bad = |what: &str, file: &Path, e: &dyn std::fmt::Display| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} {}: {e}", file.display()),
+        )
+    };
+    let certs = CertificateDer::pem_file_iter(cert_file)
+        .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+        .map_err(|e| bad("can't read the certificate", cert_file, &e))?;
+    if certs.is_empty() {
+        return Err(bad("no certificate in", cert_file, &"empty"));
+    }
+    let key = PrivateKeyDer::from_pem_file(key_file)
+        .map_err(|e| bad("can't read the private key", key_file, &e))?;
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(io::Error::other)?
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .map_err(|e| bad("the certificate doesn't go with the key", key_file, &e))?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 /// Runs `threads` monoio event loops, each with its own listening socket on
@@ -536,9 +601,41 @@ async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::
     }
 }
 
-pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Result<()> {
-    let Some(mut client) = ctx.connect(socket.as_raw_fd()) else {
-        if !ctx.is_shutting_down() {
+/// A connection's byte stream: plain TCP, or TLS over it.
+trait Stream: AsyncRead + AsyncWrite + Unpin {
+    /// Whether to wait for data before taking a buffer to read it into, so
+    /// an idle connection holds none. Not for TLS: rustls may already hold
+    /// decrypted bytes from an earlier read, so it reads right away.
+    const WAIT_FOR_DATA: bool;
+
+    fn poll_read_ready(&self, _: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Stream for TcpStream {
+    const WAIT_FOR_DATA: bool = true;
+
+    // Not `readable()`, which queues each wait on a locked list: through
+    // `poll_read_ready` it takes the reader's own waker slot, as reads do.
+    fn poll_read_ready(&self, cx: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
+        TcpStream::poll_read_ready(self, cx)
+    }
+}
+
+impl Stream for tokio_rustls::server::TlsStream<TcpStream> {
+    const WAIT_FOR_DATA: bool = false;
+}
+
+/// Serves one connection, after a TLS handshake if `tls` is given.
+pub async fn handle_connection(
+    mut socket: TcpStream,
+    ctx: &Context,
+    tls: Option<&TlsAcceptor>,
+) -> io::Result<()> {
+    let Some(client) = ctx.connect(socket.as_raw_fd()) else {
+        // (A TLS client couldn't read a plain-text error.)
+        if tls.is_none() && !ctx.is_shutting_down() {
             let _ = socket.write_all(MAX_CLIENTS_ERROR).await;
         }
         return Ok(());
@@ -546,37 +643,73 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
     // Without this, Nagle + delayed ACK can stall small replies by ~40ms.
     socket.set_nodelay(true)?;
     set_keepalive(socket2::SockRef::from(&socket), ctx.settings.tcp_keepalive);
+    match tls {
+        None => serve_stream(socket, ctx, client).await,
+        Some(acceptor) => {
+            match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await {
+                Ok(Ok(stream)) => serve_stream(stream, ctx, client).await,
+                // Not TLS, or too slow about it.
+                Ok(Err(_)) | Err(_) => Ok(()),
+            }
+        }
+    }
+}
+
+/// Writes `buf` and flushes: rustls may hold encrypted bytes until then (for
+/// plain TCP, flushing does nothing).
+async fn send(socket: &mut impl Stream, buf: &[u8]) -> io::Result<()> {
+    socket.write_all(buf).await?;
+    socket.flush().await
+}
+
+async fn serve_stream(
+    mut socket: impl Stream,
+    ctx: &Context,
+    mut client: crate::context::Client<'_>,
+) -> io::Result<()> {
     let store = &*ctx.store;
     let mut session = client.session();
     // Vecs rather than a BytesMut: after a big request, a BytesMut keeps the
     // whole allocation but reports only its unused tail as capacity, so the
     // shrinking below (and the memory accounting) would miss it. Both are
-    // empty, holding no memory, while the connection waits for a request.
+    // empty, holding no memory, while a plain connection waits for a request.
     let mut rbuf: Vec<u8> = Vec::new();
     let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
 
     loop {
-        // Wait for data before taking a buffer to read it into. (Not
-        // `readable()`, which queues each wait on a locked list: through
-        // `poll_read_ready` it takes the reader's own waker slot, as reads do.)
-        let ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx));
-        match ctx.settings.timeout {
-            None => ready.await?,
-            Some(timeout) => match tokio::time::timeout(timeout, ready).await {
-                Ok(ready) => ready?,
-                Err(_) => return Ok(()),
-            },
+        fn wait_for_data<S: Stream>(_: &S) -> bool {
+            S::WAIT_FOR_DATA
+        }
+        let plain = wait_for_data(&socket);
+        if plain {
+            // Wait for data before taking a buffer to read it into.
+            let ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx));
+            match ctx.settings.timeout {
+                None => ready.await?,
+                Some(timeout) => match tokio::time::timeout(timeout, ready).await {
+                    Ok(ready) => ready?,
+                    Err(_) => return Ok(()),
+                },
+            }
         }
         if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
             rbuf.reserve(READ_RESERVE);
         }
         client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
-        // Data is ready, so this reads at once. Through `read_buf` (unlike
-        // `try_read_buf`), a short read tells tokio the socket is drained, so
-        // the next wait doesn't first try a read that finds nothing: that
-        // cost an extra syscall per request.
-        if socket.read_buf(&mut rbuf).await? == 0 {
+        // For plain TCP, data is ready, so this reads at once. Through
+        // `read_buf` (unlike `try_read_buf`), a short read tells tokio the
+        // socket is drained, so the next wait doesn't first try a read that
+        // finds nothing: that cost an extra syscall per request.
+        let read = socket.read_buf(&mut rbuf);
+        let n = match ctx.settings.timeout {
+            Some(timeout) if !plain => match tokio::time::timeout(timeout, read).await {
+                Ok(n) => n?,
+                Err(_) => return Ok(()),
+            },
+            _ => read.await?,
+        };
+        if n == 0 {
             return Ok(());
         }
         if wbuf.capacity() == 0 {
@@ -611,7 +744,7 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
                 }
                 pos = batch.end(i);
                 if wbuf.len() >= FLUSH_THRESHOLD {
-                    socket.write_all(&wbuf).await?;
+                    send(&mut socket, &wbuf).await?;
                     wbuf.clear();
                 }
                 if close {
@@ -622,7 +755,7 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
                 && !close
             {
                 resp::write_error(&mut wbuf, format!("ERR {}", e.message()).as_bytes());
-                socket.write_all(&wbuf).await?;
+                send(&mut socket, &wbuf).await?;
                 return Ok(());
             }
             if close || batch.len() < MAX_BATCH {
@@ -632,7 +765,7 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
         ctx.publish(&mut session);
         rbuf.drain(..pos);
         if !wbuf.is_empty() {
-            socket.write_all(&wbuf).await?;
+            send(&mut socket, &wbuf).await?;
             wbuf.clear();
         }
         if close {
@@ -640,7 +773,7 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
         }
         if rbuf.len() > MAX_QUERY_BUFFER {
             resp::write_error(&mut wbuf, b"ERR query buffer limit exceeded");
-            socket.write_all(&wbuf).await?;
+            send(&mut socket, &wbuf).await?;
             return Ok(());
         }
         if rbuf.is_empty() {
@@ -655,7 +788,7 @@ pub async fn handle_connection(mut socket: TcpStream, ctx: &Context) -> io::Resu
 }
 
 async fn write_all_vectored(
-    socket: &mut TcpStream,
+    socket: &mut impl Stream,
     mut parts: &mut [IoSlice<'_>],
 ) -> io::Result<()> {
     while !parts.is_empty() {
@@ -665,5 +798,5 @@ async fn write_all_vectored(
         }
         IoSlice::advance_slices(&mut parts, n);
     }
-    Ok(())
+    socket.flush().await
 }

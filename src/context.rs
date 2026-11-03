@@ -78,7 +78,9 @@ pub struct Context {
     pub snapshots: Option<Arc<Snapshots>>,
     started: Instant,
     next_client_id: AtomicU64,
-    /// Open connections, by client id, so shutdown can reach them.
+    /// Open connections, by client id, so shutdown can reach them: a
+    /// duplicate of each socket's fd, open until the client is dropped, so
+    /// it never refers to another socket however the connection ends.
     clients: Mutex<HashMap<u64, RawFd>>,
     connected: AtomicUsize,
     total_connections: AtomicU64,
@@ -123,6 +125,8 @@ impl Context {
             return None;
         }
         let id = self.next_client_id.fetch_add(1, Relaxed);
+        // SAFETY: duplicating an fd has no memory effects; failure is -1.
+        let dup = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
         {
             // Checked under the lock `shutdown` holds while closing
             // connections, so a connection either gets closed by it or sees
@@ -130,10 +134,11 @@ impl Context {
             let mut clients = self.clients.lock();
             if self.shutting_down.load(Relaxed) {
                 drop(clients);
+                close(dup);
                 self.connected.fetch_sub(1, Relaxed);
                 return None;
             }
-            clients.insert(id, fd);
+            clients.insert(id, dup);
         }
         self.total_connections.fetch_add(1, Relaxed);
         Some(Client {
@@ -152,8 +157,8 @@ impl Context {
         self.shutting_down.store(true, Relaxed);
         self.shutdown.send_replace(true);
         for &fd in clients.values() {
-            // SAFETY: the fd is open: a connection deregisters (under this
-            // lock) before closing its socket.
+            // SAFETY: the fd is our own duplicate, open until its client is
+            // deregistered under this lock. (-1, if dup failed, is ignored.)
             unsafe { libc::shutdown(fd, libc::SHUT_RD) };
         }
     }
@@ -237,8 +242,14 @@ pub struct ServerStats {
     pub keyspace_misses: u64,
 }
 
-/// A connection, counted as connected until dropped. Drop it before
-/// closing the socket (see [`Context::shutdown`]).
+fn close(fd: RawFd) {
+    if fd >= 0 {
+        // SAFETY: `fd` is a duplicate only we hold.
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// A connection, counted as connected until dropped.
 pub struct Client<'a> {
     ctx: &'a Context,
     id: u64,
@@ -279,7 +290,9 @@ impl Client<'_> {
 impl Drop for Client<'_> {
     fn drop(&mut self) {
         self.report(0);
-        self.ctx.clients.lock().remove(&self.id);
+        if let Some(fd) = self.ctx.clients.lock().remove(&self.id) {
+            close(fd);
+        }
         self.ctx.connected.fetch_sub(1, Relaxed);
     }
 }

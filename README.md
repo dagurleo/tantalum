@@ -3,7 +3,7 @@
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends) with TTLs, eviction,
-a password and optional snapshots to disk, and that's the point: be a faster
+a password, TLS and optional snapshots to disk, and that's the point: be a faster
 drop-in for the "Redis as a cache" use case, using as little memory as
 possible.
 
@@ -17,6 +17,7 @@ cargo run --release -- --maxmemory 2gb --maxmemory-policy allkeys-lru
 TANTALUM_REQUIREPASS=s3cret cargo run --release -- --bind 0.0.0.0   # or --requirepass
 cargo run --release -- --maxclients 2000 --timeout 300 --tcp-keepalive 60
 cargo run --release -- --snapshot data/tantalum.snapshot   # keep data across restarts
+cargo run --release -- --tls-port 6380 --tls-cert-file cert.pem --tls-key-file key.pem
 redis-cli SET greeting hello EX 60
 redis-cli GET greeting
 ```
@@ -26,8 +27,8 @@ Any Redis client, `redis-cli`, `redis-cli --pipe`, and `redis-benchmark` work as
 To deploy, `deploy/Dockerfile` builds a small image with just the binary
 (`docker build -f deploy/Dockerfile .`); on Railway, set
 `RAILWAY_DOCKERFILE_PATH=deploy/Dockerfile` and put options in the start
-command. It listens on `::` (IPv4 and IPv6) with no TLS, so keep it on a
-private network and set a password.
+command. It listens on `::` (IPv4 and IPv6); set a password, and outside a
+private network add `--tls-port` with a certificate.
 
 ## Commands
 
@@ -165,6 +166,15 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
     without this a panic on `--io uring` would take down a whole I/O thread.
   - Server counters are per thread (one cache line each) and published once
     per read, so `INFO`'s totals cost the request path no shared writes.
+- **TLS** (`--tls-port`, with `--tls-cert-file` and `--tls-key-file` as in
+  Redis): a second listener next to the plain port (`--port 0` leaves only
+  TLS), using rustls with its `ring` backend. Plain and TLS connections share
+  the same connection loop, generic over the stream; a TLS connection reads
+  without first waiting for data, since rustls may already hold decrypted
+  bytes, and flushes after each write. With io_uring, TLS runs on its own
+  epoll loops (monoio has no TLS here). There's no client-certificate
+  authentication: use the password. A self-signed certificate that clients
+  pin (`tls: { ca }` in ioredis) works without a public CA.
 - **Snapshots** (`src/snapshot.rs`, `--snapshot FILE`): like Redis' RDB
   files. Every `--snapshot-interval` (60 s) with changes, on `SAVE`/`BGSAVE`
   and after a graceful shutdown, the live keys go to the file: key, value,
@@ -508,8 +518,9 @@ hit rates share the seeding flaw described above.
 - **Table resizes still rebuild a whole shard's table** (25% at a time, without reading
   keys): sub-millisecond at today's sizes, but a few ms per shard at 100M keys.
 - No `instantaneous_ops_per_sec`, latency histograms or a slow log.
-- The server binds to `127.0.0.1` by default. If you expose it, set a password:
-  traffic isn't encrypted (no TLS), so keep it on a private network.
+- The server binds to `127.0.0.1` by default. If you expose it, set a password,
+  and use TLS outside a private network. No client certificates, no
+  certificate reloading without a restart.
 - An append-only log (snapshots only), replication, other data types, ACL
   users, Lua, pub/sub, `SCAN`/`KEYS`.
 - LFU and random eviction policies, `CONFIG SET` at runtime.
