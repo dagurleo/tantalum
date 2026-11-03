@@ -584,7 +584,10 @@ mod tests {
         let Some(Expiry::At(deadline)) = expiry.unwrap() else {
             panic!("lost its TTL");
         };
-        assert_eq!(t.deadline_to_unix_ms(t.now(), deadline), 4_102_444_800_000);
+        // Each conversion between the store's clock and Unix time reads the
+        // wall clock, so a millisecond can tick between them.
+        let unix = t.deadline_to_unix_ms(t.now(), deadline);
+        assert!((unix - 4_102_444_800_000).abs() <= 2, "{unix}");
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
