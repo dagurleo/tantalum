@@ -528,6 +528,11 @@ pub fn fits_packed(bytes: &[u8]) -> bool {
     set.len() <= MAX_PACKED && set.iter().all(|(_, m)| m.len() <= MAX_MEMBER_LEN)
 }
 
+/// `i`'s lowest set bit (`i > 0`): a Fenwick tree's step.
+fn lowest_bit(i: usize) -> usize {
+    1 << i.trailing_zeros()
+}
+
 /// Sums of chunk sizes, for ranks in O(log n): a Fenwick tree.
 #[derive(Clone, Default)]
 struct Sizes(Vec<usize>);
@@ -536,7 +541,7 @@ impl Sizes {
     fn build(sizes: impl Iterator<Item = usize>) -> Self {
         let mut tree: Vec<usize> = std::iter::once(0).chain(sizes).collect();
         for i in 1..tree.len() {
-            let parent = i + (i & i.wrapping_neg());
+            let parent = i + lowest_bit(i);
             if parent < tree.len() {
                 tree[parent] += tree[i];
             }
@@ -548,7 +553,7 @@ impl Sizes {
         let mut i = chunk + 1;
         while i < self.0.len() {
             self.0[i] = self.0[i].wrapping_add_signed(delta);
-            i += i & i.wrapping_neg();
+            i += lowest_bit(i);
         }
     }
 
@@ -557,7 +562,7 @@ impl Sizes {
         let (mut i, mut sum) = (chunk, 0);
         while i > 0 {
             sum += self.0[i];
-            i -= i & i.wrapping_neg();
+            i -= lowest_bit(i);
         }
         sum
     }
