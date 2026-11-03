@@ -8,7 +8,9 @@
 //!
 //! Each connection reads whatever is available, runs every complete command
 //! in that buffer (pipelining), and answers them all with a single write. That
-//! keeps syscalls per command low. The buffer's commands are parsed before any
+//! keeps syscalls per command low. A blocking command (`BLPOP` ...) that has
+//! to wait sends the replies before it and waits; the commands after it run
+//! once it's done. The buffer's commands are parsed before any
 //! runs (`Batch`), so the store can prefetch the memory each one will read
 //! while earlier ones run: at 1M keys, waiting on those cache misses one at a
 //! time cost pipelined throughput almost half.
@@ -40,7 +42,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 pub use tokio_rustls::TlsAcceptor;
 
-use crate::cmd::{self, Args, Reply};
+use crate::blocking::Mailbox;
+use crate::cmd::{self, Args, Blocked, Reply};
 use crate::context::{Context, Session};
 use crate::resp;
 use crate::store::{KeyHash, Millis, Store};
@@ -348,7 +351,12 @@ pub fn serve_uring(
                         .enable_timer()
                         .build();
                     let mut runtime = runtime?;
+                    let (mailbox, bell) = Mailbox::new()?;
                     runtime.block_on(async move {
+                        monoio::spawn(deliver_mail(
+                            mailbox.clone(),
+                            monoio::net::UnixStream::from_std(bell)?,
+                        ));
                         let opts = monoio::net::ListenerOpts::new()
                             .reuse_port(true)
                             .backlog(1024);
@@ -357,9 +365,9 @@ pub fn serve_uring(
                             monoio::select! {
                                 accepted = listener.accept() => match accepted {
                                     Ok((socket, _)) => {
-                                        let ctx = ctx.clone();
+                                        let (ctx, mailbox) = (ctx.clone(), mailbox.clone());
                                         monoio::spawn(async move {
-                                            let _ = handle_uring(socket, &ctx).await;
+                                            let _ = handle_uring(socket, &ctx, &mailbox).await;
                                         });
                                     }
                                     Err(e) => {
@@ -497,10 +505,71 @@ fn uring_setups() -> Vec<(&'static str, io_uring::Builder)> {
     setups
 }
 
+/// Wakes this monoio thread's blocked connections that other threads served
+/// (see [`Mailbox`]), each time its bell rings.
+async fn deliver_mail(mailbox: Arc<Mailbox>, mut bell: monoio::net::UnixStream) {
+    use monoio::io::AsyncReadRent;
+    let mut buf = vec![0u8; 64];
+    loop {
+        let (read, b) = bell.read(buf).await;
+        buf = b;
+        if !matches!(read, Ok(n) if n > 0) {
+            return;
+        }
+        mailbox.deliver();
+    }
+}
+
+/// [`wait_blocked`] for monoio, waking through this thread's `mailbox`.
+async fn wait_blocked_uring(
+    socket: &mut monoio::net::TcpStream,
+    blocked: &Blocked,
+    mut rbuf: Vec<u8>,
+    mailbox: &Arc<Mailbox>,
+) -> (io::Result<bool>, Vec<u8>) {
+    use monoio::buf::IoBufMut;
+    use monoio::io::AsyncReadRent;
+    let mut served = std::pin::pin!(blocked.served(Some(mailbox)));
+    let mut timeout = std::pin::pin!(async {
+        match blocked.timeout() {
+            Some(timeout) => monoio::time::sleep(timeout).await,
+            None => std::future::pending().await,
+        }
+    });
+    loop {
+        // Readiness, not a read: a read cancelled in flight could lose data.
+        monoio::select! {
+            () = &mut served => return (Ok(true), rbuf),
+            () = &mut timeout => return (Ok(true), rbuf),
+            ready = socket.readable(false) => {
+                if let Err(e) = ready {
+                    return (Err(e), rbuf);
+                }
+            }
+        }
+        if rbuf.capacity() - rbuf.len() < URING_READ_BUFFER / 2 {
+            rbuf.reserve(rbuf.capacity().max(URING_READ_BUFFER));
+        }
+        let filled = rbuf.len();
+        let (result, slice) = socket.read(rbuf.slice_mut(filled..)).await;
+        rbuf = slice.into_inner();
+        match result {
+            Ok(0) => return (Ok(false), rbuf),
+            Ok(_) if rbuf.len() > MAX_QUERY_BUFFER => return (Ok(false), rbuf),
+            Ok(_) => {}
+            Err(e) => return (Err(e), rbuf),
+        }
+    }
+}
+
 /// The connection loop of `handle_connection`, on monoio's owned-buffer I/O.
 /// Large values are copied into the reply buffer rather than written with a
-/// separate `writev`.
-async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::Result<()> {
+/// separate `writev`. `mailbox` is its thread's, for blocking commands.
+async fn handle_uring(
+    mut socket: monoio::net::TcpStream,
+    ctx: &Context,
+    mailbox: &Arc<Mailbox>,
+) -> io::Result<()> {
     use monoio::buf::IoBufMut;
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
@@ -548,9 +617,11 @@ async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::
         if wbuf.capacity() == 0 {
             wbuf.reserve(WRITE_RESERVE);
         }
-        let now = store.now();
+        let mut now = store.now();
         let mut pos = 0;
         let mut close = false;
+        // Whether a command blocked, during which more may have been read.
+        let mut blocked_meanwhile = false;
         loop {
             let parsed = batch.parse(&rbuf, pos, store);
             for i in 0..batch.len() {
@@ -561,6 +632,20 @@ async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::
                         Some(Reply::Written) => {}
                         Some(Reply::Close) | None => close = true,
                         Some(Reply::Bulk(value)) => resp::write_bulk(&mut wbuf, value.as_bytes()),
+                        Some(Reply::Block(blocked)) => {
+                            if !wbuf.is_empty() {
+                                wbuf = flush(&mut socket, wbuf).await?;
+                            }
+                            let (result, buf) =
+                                wait_blocked_uring(&mut socket, &blocked, rbuf, mailbox).await;
+                            rbuf = buf;
+                            if !result? {
+                                return Ok(());
+                            }
+                            blocked.finish(&mut wbuf);
+                            now = store.now();
+                            blocked_meanwhile = true;
+                        }
                     }
                 }
                 pos = batch.end(i);
@@ -578,7 +663,7 @@ async fn handle_uring(mut socket: monoio::net::TcpStream, ctx: &Context) -> io::
                 flush(&mut socket, wbuf).await?;
                 return Ok(());
             }
-            if close || batch.len() < MAX_BATCH {
+            if close || (batch.len() < MAX_BATCH && !std::mem::take(&mut blocked_meanwhile)) {
                 break;
             }
         }
@@ -722,9 +807,11 @@ async fn serve_stream(
             wbuf.reserve(WRITE_RESERVE);
         }
         // One clock read per batch, like Redis' cached time per event loop tick.
-        let now = store.now();
+        let mut now = store.now();
         let mut pos = 0;
         let mut close = false;
+        // Whether a command blocked, during which more may have been read.
+        let mut blocked_meanwhile = false;
         loop {
             let parsed = batch.parse(&rbuf, pos, store);
             for i in 0..batch.len() {
@@ -746,6 +833,18 @@ async fn serve_stream(
                             write_all_vectored(&mut socket, &mut parts).await?;
                             wbuf.clear();
                         }
+                        Some(Reply::Block(blocked)) => {
+                            if !wbuf.is_empty() {
+                                send(&mut socket, &wbuf).await?;
+                                wbuf.clear();
+                            }
+                            if !wait_blocked(&mut socket, &blocked, &mut rbuf).await? {
+                                return Ok(());
+                            }
+                            blocked.finish(&mut wbuf);
+                            now = store.now();
+                            blocked_meanwhile = true;
+                        }
                     }
                 }
                 pos = batch.end(i);
@@ -764,7 +863,7 @@ async fn serve_stream(
                 send(&mut socket, &wbuf).await?;
                 return Ok(());
             }
-            if close || batch.len() < MAX_BATCH {
+            if close || (batch.len() < MAX_BATCH && !std::mem::take(&mut blocked_meanwhile)) {
                 break;
             }
         }
@@ -789,6 +888,38 @@ async fn serve_stream(
             client.set_buffer_bytes(0);
         } else if wbuf.capacity() > SHRINK_ABOVE {
             wbuf = Vec::new();
+        }
+    }
+}
+
+/// Waits while a command is blocked, until it's served or times out
+/// (`true`), or the client goes away (`false`). What the client sends
+/// meanwhile is read into `rbuf`, to run after. Blocked clients aren't
+/// subject to the idle `timeout`, as in Redis.
+async fn wait_blocked(
+    socket: &mut impl Stream,
+    blocked: &Blocked,
+    rbuf: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let mut served = std::pin::pin!(blocked.served(None));
+    let mut timeout = std::pin::pin!(async {
+        match blocked.timeout() {
+            Some(timeout) => tokio::time::sleep(timeout).await,
+            None => std::future::pending().await,
+        }
+    });
+    loop {
+        if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
+            rbuf.reserve(READ_RESERVE);
+        }
+        tokio::select! {
+            () = &mut served => return Ok(true),
+            () = &mut timeout => return Ok(true),
+            read = socket.read_buf(rbuf) => {
+                if read? == 0 || rbuf.len() > MAX_QUERY_BUFFER {
+                    return Ok(false);
+                }
+            }
         }
     }
 }

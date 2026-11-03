@@ -336,6 +336,18 @@ pub fn parse_score(s: &[u8]) -> Option<f64> {
     (used == s.len() && used > 0 && !value.is_nan() && !out_of_range).then_some(value)
 }
 
+/// A blocking command's timeout in seconds, as Redis reads one (with
+/// `strtold`): all of it a number, no space before it, not NaN. Also
+/// whether it underflowed to zero, though a long double wouldn't have.
+pub(crate) fn parse_timeout_seconds(s: &[u8]) -> Option<(f64, bool)> {
+    if s.first().is_some_and(|&b| is_space(b)) {
+        return None;
+    }
+    let (value, used, out_of_range) = strtod(s);
+    (used == s.len() && used > 0 && !value.is_nan())
+        .then_some((value, out_of_range && value == 0.0))
+}
+
 /// One end of a score range: `(` for exclusive. Read as Redis'
 /// `zslParseRange` does: leading space and out-of-range values are fine
 /// (an empty one is 0), NaN isn't.

@@ -40,14 +40,15 @@
 //!   It holds one shard lock at a time and never while the writer holds its
 //!   own, so it can't deadlock.
 
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
+use crate::blocking::Waiter;
 use crate::collection::{self, Collection};
 use crate::entry::KeyValue;
 use crate::pages;
@@ -418,6 +419,7 @@ impl Pair<'_> {
         let (existing, removed) = inner.lookup_live(hash, key, self.now, &mut self.garbage);
         let (update, result) =
             inner.with_entry(existing.as_ref().map(|(loc, h)| (*loc, h)), &mut f);
+        let absent = existing.is_none();
         match self.store.apply(
             inner,
             hash,
@@ -428,7 +430,12 @@ impl Pair<'_> {
             false,
             &mut self.garbage,
         ) {
-            Ok(applied) => self.changed[side] |= applied || removed,
+            Ok(applied) => {
+                self.changed[side] |= applied || removed;
+                if applied && absent && !inner.waiting.is_empty() {
+                    self.store.created(inner, key);
+                }
+            }
             Err(_) => self.out_of_ids = true,
         }
         result
@@ -554,6 +561,8 @@ struct ShardInner {
     unflushed: isize,
     /// Next segment id the expiry sweep looks at.
     sweep_cursor: usize,
+    /// Clients blocked on keys of this shard, by key, first come first.
+    waiting: HashMap<Box<[u8]>, VecDeque<Arc<Waiter>>, foldhash::fast::RandomState>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1328,6 +1337,19 @@ pub struct Store {
     /// [`Store::add_client_memory`]).
     client_memory: AtomicI64,
     flush_bytes: usize,
+    ready: Ready,
+}
+
+/// Keys created while clients were blocked on them, to serve those
+/// clients (see `blocking.rs`). On its own cache line: commands read
+/// `pending` after running.
+#[derive(Default)]
+#[repr(align(128))]
+struct Ready {
+    pending: AtomicBool,
+    keys: Mutex<Vec<Box<[u8]>>>,
+    /// Clients blocked right now.
+    blocked: AtomicI64,
 }
 
 impl Store {
@@ -1380,6 +1402,7 @@ impl Store {
             used: AtomicI64::new(0),
             client_memory: AtomicI64::new(0),
             flush_bytes,
+            ready: Ready::default(),
         }
     }
 
@@ -1887,6 +1910,7 @@ impl Store {
             let inner = &mut *guard;
             let (existing, mut changed) = inner.lookup_live(hash, key, now, &mut garbage);
             let (update, result) = view(inner, existing.as_ref().map(|(loc, h)| (*loc, h)));
+            let absent = existing.is_none();
             match self.apply(
                 inner,
                 hash,
@@ -1897,7 +1921,12 @@ impl Store {
                 attempts < 2,
                 &mut garbage,
             ) {
-                Ok(applied) => changed |= applied,
+                Ok(applied) => {
+                    changed |= applied;
+                    if applied && absent && !inner.waiting.is_empty() {
+                        self.created(inner, key);
+                    }
+                }
                 Err(Retry::NeedRoom(needed)) => {
                     if changed {
                         self.sync_usage(shard, inner, false);
@@ -2098,6 +2127,7 @@ impl Store {
                 empty.mem.expired = inner.mem.expired;
                 empty.mem.evicted = inner.mem.evicted;
                 empty.mem.writes = inner.mem.writes + 1;
+                empty.waiting = std::mem::take(&mut inner.waiting);
                 let old = std::mem::replace(inner, empty);
                 self.used.fetch_sub(flushed, Relaxed);
                 self.sync_usage(shard, inner, true);
@@ -2105,6 +2135,90 @@ impl Store {
             };
             drop(old); // frees its memory outside the lock
         }
+    }
+
+    /// After a write created `key` under its shard's lock: queues it as
+    /// ready if clients are blocked on it.
+    fn created(&self, inner: &ShardInner, key: &[u8]) {
+        if inner.waiting.contains_key(key) {
+            let mut keys = self.ready.keys.lock();
+            keys.push(key.into());
+            self.ready.pending.store(true, Relaxed);
+        }
+    }
+
+    /// Registers `waiter` as blocked on `key`, after those already there.
+    pub(crate) fn wait_on(&self, key: Key<'_>, waiter: &Arc<Waiter>) {
+        let (_, index) = self.locate(key.hash);
+        let mut inner = self.shards[index].inner.lock();
+        inner
+            .waiting
+            .entry(key.bytes.into())
+            .or_default()
+            .push_back(waiter.clone());
+    }
+
+    /// Deregisters `waiter` from `key`.
+    pub(crate) fn stop_waiting(&self, key: Key<'_>, waiter: &Arc<Waiter>) {
+        let (_, index) = self.locate(key.hash);
+        let mut inner = self.shards[index].inner.lock();
+        if let Some(waiters) = inner.waiting.get_mut(key.bytes) {
+            waiters.retain(|w| !Arc::ptr_eq(w, waiter));
+            if waiters.is_empty() {
+                inner.waiting.remove(key.bytes);
+                if inner.waiting.is_empty() {
+                    inner.waiting = HashMap::default();
+                }
+            }
+        }
+    }
+
+    /// Whether keys were created that clients are blocked on: cheap, for
+    /// every command.
+    pub(crate) fn has_ready(&self) -> bool {
+        self.ready.pending.load(Relaxed)
+    }
+
+    /// Takes a key that was created while clients were blocked on it.
+    pub(crate) fn take_ready(&self) -> Option<Box<[u8]>> {
+        if !self.has_ready() {
+            return None;
+        }
+        let mut keys = self.ready.keys.lock();
+        let key = keys.pop();
+        if keys.is_empty() {
+            self.ready.pending.store(false, Relaxed);
+        }
+        key
+    }
+
+    /// The first client blocked on `key` that it now has data for,
+    /// claimed (see [`Waiter::claim`]) for the caller to serve.
+    pub(crate) fn claim_waiter(&self, key: Key<'_>, now: Millis) -> Option<Arc<Waiter>> {
+        self.update_with(key, now, false, |inner, existing| {
+            let claimed = existing.and_then(|(_, header)| {
+                let kind = header.kind();
+                inner
+                    .waiting
+                    .get(key.bytes)?
+                    .iter()
+                    .find(|w| w.kind() == kind && w.claim())
+                    .cloned()
+            });
+            (Update::Peek, claimed)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Counts clients blocking (`delta` 1) or done (-1), for `INFO`.
+    pub(crate) fn count_blocked(&self, delta: i64) {
+        self.ready.blocked.fetch_add(delta, Relaxed);
+    }
+
+    /// Clients blocked right now.
+    pub fn blocked_clients(&self) -> usize {
+        self.ready.blocked.load(Relaxed).max(0) as usize
     }
 
     pub fn shard_count(&self) -> usize {
@@ -2281,6 +2395,11 @@ impl Store {
                 target.mem.expired += 1;
             }
             target.mem.writes += 1;
+            // Like Redis, as if deleted and added again: clients blocked on
+            // the destination may be served.
+            if !target.waiting.is_empty() {
+                self.created(target, to.bytes);
+            }
             src.unlink(from_hash, loc);
             if moved {
                 src.mark_dead(loc); // its object went with it

@@ -2,11 +2,12 @@
 //! which differs from command to command.
 
 use super::{Args, NOT_AN_INTEGER, OOM, Reply, SYNTAX_ERROR, WRONGTYPE};
+use crate::blocking::{self, Attempt};
 use crate::collection::Collection;
 use crate::context::{Context, Session};
 use crate::list::{Finished, ListMut, ListView, Packed};
 use crate::resp;
-use crate::store::{Entry, EntryValue, Key, Kind, Millis, OutOfMemory, Store, Update, View};
+use crate::store::{Entry, EntryValue, Key, Kind, Millis, Store, Update, View};
 
 const NO_SUCH_KEY: &[u8] = b"ERR no such key";
 const MUST_BE_POSITIVE: &[u8] = b"ERR value is out of range, must be positive";
@@ -596,7 +597,12 @@ pub(super) fn lmove(
     let (Some(from), Some(to)) = (end_of(args.get(3)), end_of(args.get(4))) else {
         return reply_error(out, SYNTAX_ERROR);
     };
-    move_element(ctx, session, now, args, out, from, to)
+    match move_element(ctx, now, args, from, to) {
+        Ok(Some(element)) => resp::write_bulk(out, &element),
+        Ok(None) => out.extend_from_slice(session.null()),
+        Err(msg) => resp::write_error(out, msg),
+    }
+    Reply::Written
 }
 
 /// `RPOPLPUSH source destination`: `LMOVE source destination RIGHT LEFT`.
@@ -607,18 +613,23 @@ pub(super) fn rpoplpush(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    move_element(ctx, session, now, args, out, End::Right, End::Left)
+    match move_element(ctx, now, args, End::Right, End::Left) {
+        Ok(Some(element)) => resp::write_bulk(out, &element),
+        Ok(None) => out.extend_from_slice(session.null()),
+        Err(msg) => resp::write_error(out, msg),
+    }
+    Reply::Written
 }
 
+/// Moves an element from the list at argument 1 to the one at argument 2:
+/// the element, `None` if the source is empty, or the error to reply.
 fn move_element(
     ctx: &Context,
-    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
-    out: &mut Vec<u8>,
     from: End,
     to: End,
-) -> Reply {
+) -> Result<Option<Vec<u8>>, &'static [u8]> {
     let store = &*ctx.store;
     let moved = store.update_pair(args.key(store), args.key_at(store, 2), now, true, |pair| {
         // In Redis' order: the source's type, its emptiness, then the
@@ -654,13 +665,135 @@ fn move_element(
         }
         Ok(element)
     });
-    match moved {
-        Ok(Ok(Some(element))) => resp::write_bulk(out, &element),
-        Ok(Ok(None)) => out.extend_from_slice(session.null()),
-        Ok(Err(msg)) => resp::write_error(out, msg),
-        Err(OutOfMemory) => resp::write_error(out, OOM),
+    moved.unwrap_or(Err(OOM))
+}
+
+/// `BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout`
+pub(super) fn blmove(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
+        let (Some(from), Some(to)) = (end_of(args.get(3)), end_of(args.get(4))) else {
+            resp::write_error(out, SYNTAX_ERROR);
+            return Attempt::Done;
+        };
+        blocking_move(ctx, now, args, out, from, to, 5)
+    })
+}
+
+/// `BRPOPLPUSH source destination timeout`
+pub(super) fn brpoplpush(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
+        blocking_move(ctx, now, args, out, End::Right, End::Left, 3)
+    })
+}
+
+/// `LMOVE`, blocking while the source is empty: the timeout comes first.
+fn blocking_move(
+    ctx: &Context,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    from: End,
+    to: End,
+    timeout_at: usize,
+) -> Attempt {
+    let timeout = match blocking::parse_timeout(args.get(timeout_at)) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            resp::write_error(out, msg);
+            return Attempt::Done;
+        }
+    };
+    match move_element(ctx, now, args, from, to) {
+        Ok(Some(element)) => resp::write_bulk(out, &element),
+        Ok(None) => {
+            return Attempt::Wait {
+                keys: 1..2,
+                timeout,
+                kind: Kind::List,
+            };
+        }
+        Err(msg) => resp::write_error(out, msg),
     }
-    Reply::Written
+    Attempt::Done
+}
+
+/// `BLPOP`/`BRPOP key [key ...] timeout`: pops from the first non-empty
+/// list, replying its key and the element.
+fn blocking_pop(
+    ctx: &Context,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    end: End,
+) -> Attempt {
+    let timeout = match blocking::parse_timeout(args.get(args.len() - 1)) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            resp::write_error(out, msg);
+            return Attempt::Done;
+        }
+    };
+    let store = &*ctx.store;
+    let keys = 1..args.len() - 1;
+    for k in keys.clone() {
+        let popped = change(store, args.key_at(store, k), now, false, args, |list, _| {
+            Ok(list.as_mut().and_then(|list| pop(list, end)))
+        });
+        match popped {
+            Err(msg) => {
+                resp::write_error(out, msg);
+                return Attempt::Done;
+            }
+            Ok(None) => continue,
+            Ok(Some(element)) => {
+                resp::write_array_header(out, 2);
+                resp::write_bulk(out, args.get(k));
+                resp::write_bulk(out, &element);
+                return Attempt::Done;
+            }
+        }
+    }
+    Attempt::Wait {
+        keys,
+        timeout,
+        kind: Kind::List,
+    }
+}
+
+pub(super) fn blpop(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
+        blocking_pop(ctx, now, args, out, End::Left)
+    })
+}
+
+pub(super) fn brpop(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
+        blocking_pop(ctx, now, args, out, End::Right)
+    })
 }
 
 /// `LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]`: pops from the
@@ -672,32 +805,67 @@ pub(super) fn lmpop(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let numkeys = match resp::parse_int(args.get(1)) {
+    if let Attempt::Wait { .. } = mpop(ctx, now, args, out, 1) {
+        out.extend_from_slice(null_array(session));
+    }
+    Reply::Written
+}
+
+/// `BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT count]`
+pub(super) fn blmpop(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
+        mpop(ctx, now, args, out, 2)
+    })
+}
+
+/// `LMPOP` with its `numkeys` at argument `at`, or `BLMPOP` (at 2, after
+/// the timeout, which is read after the other arguments).
+fn mpop(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, at: usize) -> Attempt {
+    let error = |out: &mut Vec<u8>, msg: &[u8]| {
+        resp::write_error(out, msg);
+        Attempt::Done
+    };
+    let numkeys = match resp::parse_int(args.get(at)) {
         Some(n) if n > 0 => n as usize,
-        _ => return reply_error(out, b"ERR numkeys should be greater than 0"),
+        _ => return error(out, b"ERR numkeys should be greater than 0"),
     };
     // The direction comes after the keys.
-    if 2 + numkeys >= args.len() {
-        return reply_error(out, SYNTAX_ERROR);
+    let keys = at + 1..(at + 1).saturating_add(numkeys);
+    if keys.end >= args.len() {
+        return error(out, SYNTAX_ERROR);
     }
-    let Some(end) = end_of(args.get(2 + numkeys)) else {
-        return reply_error(out, SYNTAX_ERROR);
+    let Some(end) = end_of(args.get(keys.end)) else {
+        return error(out, SYNTAX_ERROR);
     };
     let mut count = None;
-    let mut i = 3 + numkeys;
+    let mut i = keys.end + 1;
     while i < args.len() {
         if count.is_none() && args.get(i).eq_ignore_ascii_case(b"COUNT") && i + 1 < args.len() {
             match resp::parse_int(args.get(i + 1)) {
                 Some(n) if n > 0 => count = Some(n as usize),
-                _ => return reply_error(out, b"ERR count should be greater than 0"),
+                _ => return error(out, b"ERR count should be greater than 0"),
             }
             i += 2;
         } else {
-            return reply_error(out, SYNTAX_ERROR);
+            return error(out, SYNTAX_ERROR);
         }
     }
+    let timeout = if at == 2 {
+        match blocking::parse_timeout(args.get(1)) {
+            Ok(timeout) => timeout,
+            Err(msg) => return error(out, msg),
+        }
+    } else {
+        None
+    };
     let store = &*ctx.store;
-    for k in 2..2 + numkeys {
+    for k in keys.clone() {
         let popped = change(store, args.key_at(store, k), now, false, args, |list, _| {
             let Some(list) = list else {
                 return Ok(None);
@@ -708,17 +876,20 @@ pub(super) fn lmpop(
             ))
         });
         match popped {
-            Err(msg) => return reply_error(out, msg),
+            Err(msg) => return error(out, msg),
             Ok(None) => continue,
             Ok(Some(popped)) => {
                 resp::write_array_header(out, 2);
                 resp::write_bulk(out, args.get(k));
                 resp::write_array_header(out, popped.len());
                 popped.iter().for_each(|e| resp::write_bulk(out, e));
-                return Reply::Written;
+                return Attempt::Done;
             }
         }
     }
-    out.extend_from_slice(null_array(session));
-    Reply::Written
+    Attempt::Wait {
+        keys,
+        timeout,
+        kind: Kind::List,
+    }
 }

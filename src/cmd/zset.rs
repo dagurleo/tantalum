@@ -8,6 +8,7 @@ use super::{
     Args, INVALID_CURSOR, NOT_AN_INTEGER, OOM, Reply, SYNTAX_ERROR, Scan, ScanOptions, WRONGTYPE,
     parse_cursor,
 };
+use crate::blocking::{self, Attempt};
 use crate::collection::Collection;
 use crate::context::{Context, Session};
 use crate::resp;
@@ -971,58 +972,173 @@ pub(super) fn zmpop(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let numkeys = match resp::parse_int(args.get(1)) {
-        Some(n) if n > 0 => n as usize,
-        _ => return reply_error(out, b"ERR numkeys should be greater than 0"),
-    };
-    if 2 + numkeys >= args.len() {
-        return reply_error(out, SYNTAX_ERROR);
+    if let Attempt::Wait { .. } = mpop(ctx, session, now, args, out, 1) {
+        out.extend_from_slice(if session.resp3 {
+            resp::NULL
+        } else {
+            b"*-1\r\n"
+        });
     }
-    let where_ = args.get(2 + numkeys);
+    Reply::Written
+}
+
+/// `BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT count]`
+pub(super) fn bzmpop(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
+        mpop(ctx, session, now, args, out, 2)
+    })
+}
+
+/// `ZMPOP` with its `numkeys` at argument `at`, or `BZMPOP` (at 2, after
+/// the timeout, which is read after the other arguments).
+fn mpop(
+    ctx: &Context,
+    session: &Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    at: usize,
+) -> Attempt {
+    let error = |out: &mut Vec<u8>, msg: &[u8]| {
+        resp::write_error(out, msg);
+        Attempt::Done
+    };
+    let numkeys = match resp::parse_int(args.get(at)) {
+        Some(n) if n > 0 => n as usize,
+        _ => return error(out, b"ERR numkeys should be greater than 0"),
+    };
+    let keys = at + 1..(at + 1).saturating_add(numkeys);
+    if keys.end >= args.len() {
+        return error(out, SYNTAX_ERROR);
+    }
+    let where_ = args.get(keys.end);
     let max = if where_.eq_ignore_ascii_case(b"MAX") {
         true
     } else if where_.eq_ignore_ascii_case(b"MIN") {
         false
     } else {
-        return reply_error(out, SYNTAX_ERROR);
+        return error(out, SYNTAX_ERROR);
     };
     let mut count = None;
-    let mut i = 3 + numkeys;
+    let mut i = keys.end + 1;
     while i < args.len() {
         if count.is_none() && args.get(i).eq_ignore_ascii_case(b"COUNT") && i + 1 < args.len() {
             match resp::parse_int(args.get(i + 1)) {
                 Some(n) if n > 0 => count = Some(n as usize),
-                _ => return reply_error(out, b"ERR count should be greater than 0"),
+                _ => return error(out, b"ERR count should be greater than 0"),
             }
             i += 2;
         } else {
-            return reply_error(out, SYNTAX_ERROR);
+            return error(out, SYNTAX_ERROR);
         }
     }
+    let timeout = if at == 2 {
+        match blocking::parse_timeout(args.get(1)) {
+            Ok(timeout) => timeout,
+            Err(msg) => return error(out, msg),
+        }
+    } else {
+        None
+    };
     let store = &*ctx.store;
-    for k in 2..2 + numkeys {
+    for k in keys.clone() {
         let popped = change(store, args.key_at(store, k), now, false, args, |set, _| {
             Ok(set
                 .as_mut()
                 .map(|set| pop_entries(set, count.unwrap_or(1), max)))
         });
         match popped {
-            Err(msg) => return reply_error(out, msg),
+            Err(msg) => return error(out, msg),
             Ok(None) => continue,
             Ok(Some(popped)) => {
                 resp::write_array_header(out, 2);
                 resp::write_bulk(out, args.get(k));
                 write_entries(out, &popped, true, session.resp3, true);
-                return Reply::Written;
+                return Attempt::Done;
             }
         }
     }
-    out.extend_from_slice(if session.resp3 {
-        resp::NULL
-    } else {
-        b"*-1\r\n"
-    });
-    Reply::Written
+    Attempt::Wait {
+        keys,
+        timeout,
+        kind: Kind::ZSet,
+    }
+}
+
+/// `BZPOPMIN`/`BZPOPMAX key [key ...] timeout`: pops from the first
+/// non-empty sorted set, replying its key, the member and its score.
+fn blocking_pop(
+    ctx: &Context,
+    session: &Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    max: bool,
+) -> Attempt {
+    let timeout = match blocking::parse_timeout(args.get(args.len() - 1)) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            resp::write_error(out, msg);
+            return Attempt::Done;
+        }
+    };
+    let store = &*ctx.store;
+    let keys = 1..args.len() - 1;
+    for k in keys.clone() {
+        let popped = change(store, args.key_at(store, k), now, false, args, |set, _| {
+            Ok(set.as_mut().map(|set| pop_entries(set, 1, max)))
+        });
+        match popped {
+            Err(msg) => {
+                resp::write_error(out, msg);
+                return Attempt::Done;
+            }
+            Ok(None) => continue,
+            Ok(Some(popped)) => {
+                let (score, member) = &popped[0];
+                resp::write_array_header(out, 3);
+                resp::write_bulk(out, args.get(k));
+                resp::write_bulk(out, member);
+                write_score(out, *score, session.resp3);
+                return Attempt::Done;
+            }
+        }
+    }
+    Attempt::Wait {
+        keys,
+        timeout,
+        kind: Kind::ZSet,
+    }
+}
+
+pub(super) fn bzpopmin(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
+        blocking_pop(ctx, session, now, args, out, false)
+    })
+}
+
+pub(super) fn bzpopmax(
+    c: &Context,
+    s: &mut Session,
+    n: Millis,
+    a: &Args<'_>,
+    o: &mut Vec<u8>,
+) -> Reply {
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
+        blocking_pop(ctx, session, now, args, out, true)
+    })
 }
 
 /// `ZRANDMEMBER key [count [WITHSCORES]]`

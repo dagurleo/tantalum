@@ -119,6 +119,11 @@ const COMMANDS: &[&[u8]] = &[
     b"LMOVE",
     b"RPOPLPUSH",
     b"LMPOP",
+    b"BLPOP",
+    b"BRPOP",
+    b"BLMOVE",
+    b"BRPOPLPUSH",
+    b"BLMPOP",
     b"ZADD",
     b"ZINCRBY",
     b"ZREM",
@@ -142,6 +147,9 @@ const COMMANDS: &[&[u8]] = &[
     b"ZPOPMIN",
     b"ZPOPMAX",
     b"ZMPOP",
+    b"BZPOPMIN",
+    b"BZPOPMAX",
+    b"BZMPOP",
     b"ZRANDMEMBER",
     b"ZSCAN",
     b"ZUNION",
@@ -246,6 +254,57 @@ const WORDS: &[&[u8]] = &[
     b"pw",
 ];
 
+/// A well-formed blocking command, or a write that may serve one, on a
+/// few keys: random arguments rarely line those up.
+fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
+    const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
+    let choice = rng.below(14);
+    let mut key = || rng.pick(KEYS).to_vec();
+    let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
+    let mut args = match choice {
+        0 => vec![b"BLPOP".to_vec(), key(), key()],
+        1 => vec![b"BRPOP".to_vec(), key()],
+        2 => [
+            vec![b"BLMOVE".to_vec(), key(), key()],
+            words(&["LEFT", "RIGHT"]),
+        ]
+        .concat(),
+        3 => vec![b"BRPOPLPUSH".to_vec(), key(), key()],
+        4 => [
+            words(&["BLMPOP", "0", "2"]),
+            vec![key(), key()],
+            words(&["LEFT", "COUNT", "2"]),
+        ]
+        .concat(),
+        5 => vec![b"BZPOPMIN".to_vec(), key(), key()],
+        6 => [words(&["BZMPOP", "0", "1"]), vec![key()], words(&["MAX"])].concat(),
+        7 => [vec![b"RPUSH".to_vec(), key()], words(&["a", "b", "c"])].concat(),
+        8 => [vec![b"LPUSH".to_vec(), key()], words(&["x"])].concat(),
+        9 => [vec![b"ZADD".to_vec(), key()], words(&["1", "m", "2", "n"])].concat(),
+        10 => [
+            vec![b"LMOVE".to_vec(), key(), key()],
+            words(&["LEFT", "LEFT"]),
+        ]
+        .concat(),
+        11 => vec![b"RENAME".to_vec(), key(), key()],
+        12 => vec![b"SET".to_vec(), key(), b"v".to_vec()],
+        _ => vec![b"DEL".to_vec(), key()],
+    };
+    // The blocking ones take a timeout last, except the *MPOPs: first.
+    match args[0].as_slice() {
+        b"BLMPOP" | b"BZMPOP" => {}
+        b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BRPOPLPUSH" | b"BZPOPMIN" => {
+            args.push(if rng.below(4) == 0 {
+                b"0.01".to_vec()
+            } else {
+                b"0".to_vec()
+            })
+        }
+        _ => {}
+    }
+    args
+}
+
 fn random_arg(rng: &mut Rng) -> Vec<u8> {
     match rng.below(10) {
         0 => (0..rng.below(40)).map(|_| rng.next() as u8).collect(),
@@ -275,7 +334,7 @@ fn count_replies(out: &[u8]) -> usize {
                 .unwrap()
         };
         match line[0] {
-            b'+' | b'-' | b':' | b'_' => {}
+            b'+' | b'-' | b':' | b'_' | b',' => {}
             b'$' | b'=' if len() >= 0 => {
                 pos += len() as usize + 2;
                 assert_eq!(&out[pos - 2..pos], b"\r\n", "bulk without CRLF");
@@ -324,11 +383,17 @@ fn random_commands_never_panic() {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut now = 1;
         let mut out = Vec::new();
+        let mut blocked = Vec::new();
         for step in 0..100_000 {
-            let mut args = vec![rng.pick(COMMANDS).to_vec()];
-            for _ in 0..rng.below(7) {
-                args.push(random_arg(&mut rng));
-            }
+            let args = if rng.below(6) == 0 {
+                blocking_or_serving(&mut rng)
+            } else {
+                let mut args = vec![rng.pick(COMMANDS).to_vec()];
+                for _ in 0..rng.below(7) {
+                    args.push(random_arg(&mut rng));
+                }
+                args
+            };
             let mut buf = Vec::new();
             let mut ranges = Vec::new();
             for arg in &args {
@@ -343,6 +408,22 @@ fn random_commands_never_panic() {
                 }
                 Reply::Written | Reply::Close => {
                     assert_eq!(count_replies(&out), 1, "step {step}: {args:?}");
+                }
+                // Blocked: nothing written yet. It waits while later
+                // commands run, which may serve it.
+                Reply::Block(b) => {
+                    assert!(out.is_empty(), "step {step}");
+                    blocked.push(b);
+                }
+            }
+            // Now and then one is done waiting: its one reply (served, or
+            // timed out), or its client leaves.
+            if !blocked.is_empty() && rng.below(32) == 0 {
+                let b: Box<tantalum::cmd::Blocked> = blocked.swap_remove(rng.below(blocked.len()));
+                if rng.below(2) == 0 {
+                    let mut reply = Vec::new();
+                    b.finish(&mut reply);
+                    assert_eq!(count_replies(&reply), 1, "step {step}");
                 }
             }
             now += rng.below(50) as u64;

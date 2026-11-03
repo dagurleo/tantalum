@@ -47,8 +47,9 @@ names include the proxy's hostname works, and no CA has to renew it).
 ## Commands
 
 Replies match Redis 7 byte for byte, errors included, as far as the tests
-check (`tests/server.rs`, and `tests/hashes.rs`, whose expected replies were
-recorded from Redis 7.0 with `tools/redis-diff.py`).
+check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
+`tests/blocking.rs`, whose expected replies were recorded from Redis 7 with
+`tools/redis-diff.py`).
 
 | Command | Notes |
 |---|---|
@@ -69,7 +70,8 @@ recorded from Redis 7.0 with `tools/redis-diff.py`).
 | `SMOVE source destination member` | Atomic: holds both keys' shards |
 | `SINTER`, `SUNION`, `SDIFF key [key ...]`, their `STORE` forms, `SINTERCARD numkeys key ... [LIMIT n]` | Each key is read on its own, so unlike Redis, a write to another key meanwhile may or may not be seen |
 | `LPUSH`, `RPUSH key element [element ...]`, `LPUSHX`, `RPUSHX` | |
-| `LPOP`, `RPOP key [count]`, `LMPOP numkeys key [key ...] LEFT\|RIGHT [COUNT n]` | No blocking forms yet (`BLPOP` and the rest) |
+| `LPOP`, `RPOP key [count]`, `LMPOP numkeys key [key ...] LEFT\|RIGHT [COUNT n]` | |
+| `BLPOP`, `BRPOP key [key ...] timeout`, `BLMPOP timeout numkeys key ... LEFT\|RIGHT [COUNT n]`, `BLMOVE source destination LEFT\|RIGHT LEFT\|RIGHT timeout`, `BRPOPLPUSH` | Block while every key is empty, for `timeout` seconds (fractions allowed, 0 for ever). Served first come first served, right after the command that gave a key data, as in Redis 7.2 (see Design) |
 | `LRANGE key start stop`, `LINDEX`, `LLEN`, `LPOS key element [RANK r] [COUNT n] [MAXLEN m]` | |
 | `LSET`, `LINSERT key BEFORE\|AFTER pivot element`, `LREM key count element`, `LTRIM` | |
 | `LMOVE source destination LEFT\|RIGHT LEFT\|RIGHT`, `RPOPLPUSH` | Atomic: holds both keys' shards |
@@ -77,7 +79,8 @@ recorded from Redis 7.0 with `tools/redis-diff.py`).
 | `ZRANGE key min max [BYSCORE\|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]`, `ZRANGESTORE`, and `ZRANGEBYSCORE`, `ZREVRANGE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX` | RESP3 gives `WITHSCORES` as pairs, as Redis does |
 | `ZRANK`, `ZREVRANK key member [WITHSCORE]`, `ZCOUNT`, `ZLEXCOUNT` | |
 | `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYLEX` | |
-| `ZPOPMIN`, `ZPOPMAX key [count]`, `ZMPOP numkeys key ... MIN\|MAX [COUNT n]`, `ZRANDMEMBER key [count [WITHSCORES]]` | No blocking forms yet (`BZPOPMIN` and the rest) |
+| `ZPOPMIN`, `ZPOPMAX key [count]`, `ZMPOP numkeys key ... MIN\|MAX [COUNT n]`, `ZRANDMEMBER key [count [WITHSCORES]]` | |
+| `BZPOPMIN`, `BZPOPMAX key [key ...] timeout`, `BZMPOP timeout numkeys key ... MIN\|MAX [COUNT n]` | As the blocking list commands |
 | `ZUNION`, `ZINTER`, `ZDIFF numkeys key ... [WEIGHTS ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]`, their `STORE` forms, `ZINTERCARD` | Sets count as sorted sets with scores of 1, as in Redis. Each key is read on its own |
 | `ZSCAN key cursor [MATCH pattern] [COUNT n]` | As `SSCAN` |
 | `SSCAN key cursor [MATCH pattern] [COUNT n]` | Small sets come whole with cursor 0, as in Redis; big ones `COUNT` at a time, each member there throughout returned at least once |
@@ -91,7 +94,7 @@ recorded from Redis 7.0 with `tools/redis-diff.py`).
 | `CLIENT SETNAME\|GETNAME\|ID\|SETINFO` | What client libraries send on connect |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
-| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `evicted_keys`, `expired_keys`, a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
+| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `evicted_keys`, `expired_keys`, a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
 | `PING [msg]`, `ECHO msg`, `SELECT 0`, `QUIT` | |
 
 Anything else gets `-ERR unknown command ...` and the connection stays open.
@@ -196,6 +199,27 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   `ZREVRANGE 0 9 WITHSCORES` ~1 µs, `ZREM` ~1.6 µs. Scores reply exactly
   as Redis 7.2 prints them: shortest digits, laid out as JavaScript's
   `Number.prototype.toString` (plain from 1e-6 up to 1e21).
+- **Blocking commands** (`src/blocking.rs`): a `BLPOP` whose keys are all
+  empty registers its client on each key, in the key's shard under its lock,
+  and checks the keys once more, so a push in between isn't missed. A write
+  that creates a key with clients waiting on it queues the key, and right
+  after that command (before its client's next one, as in Redis 7.2) the
+  waiting commands run again, oldest first, while the key has data of their
+  kind. Run again, a command can also fail: if one of `BLPOP a b`'s keys
+  became a string, it gets `WRONGTYPE`, as in Redis. Its reply goes to the
+  waiting connection, which is woken to send it. The connection meanwhile
+  watches its timeout and the socket: a client that leaves stops waiting at
+  once and takes nothing, and commands it pipelines after the blocking one
+  wait their turn. monoio can't wake a task from another thread without
+  its `sync` feature, which costs every connection, so each io_uring thread
+  has a mailbox: other threads queue its wakers and ring a socket pair it
+  reads. Unused, it costs next to nothing: writes look for waiters only
+  when they create a key in a shard that has some, commands check one flag
+  for queued keys, and the blocked reply is boxed so every other reply stays
+  24 bytes. The speed guard saw no difference, and paired runs on EC2 were
+  within -1.3% to +0.4%, inside one build's spread across rounds. Unlike Redis,
+  commands run in parallel, so another client can take the data between
+  the write and the serving; the waiter then goes on waiting.
 - **`SCAN` goes in hash order** (`Store::scan`): a cursor is a shard and a
   32-bit slot hash, and each call takes the keys with the next smallest
   hashes in that shard, every key with the same hash at once, under its
@@ -638,9 +662,8 @@ hit rates share the seeding flaw described above.
 - **Multi-key set commands read one key at a time** (`SINTER`, `SUNION`,
   `SDIFF`, `ZUNION`, `ZINTER`, `ZDIFF` and their stores), as `MSET` writes
   one at a time; `SMOVE`, `LMOVE` and `RENAME` are atomic.
-- **No blocking commands** (`BLPOP`, `BRPOP`, `BLMOVE`, `BLMPOP`,
-  `BRPOPLPUSH`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`): they need connections
-  to wait inside the I/O loops.
+- **Blocking commands are list and sorted set ones**: no `XREAD BLOCK`
+  (no streams), `WAIT`, `CLIENT UNBLOCK`, or `b` flag in a client list.
 - **Writes to a small collection decode it whole**: a list, set or sorted
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its

@@ -136,8 +136,23 @@ impl Store {
                 "table moved without a sync"
             );
             flushed += inner.reported as i64 - inner.unflushed as i64;
+            for (key, waiters) in &inner.waiting {
+                assert!(!waiters.is_empty(), "no one waits on {key:?}");
+                assert!(
+                    waiters.iter().all(|w| Arc::strong_count(w) > 1),
+                    "a waiter on {key:?} outlived its client"
+                );
+            }
         }
         assert_eq!(self.used.load(Relaxed), flushed);
+    }
+
+    /// Keys clients are blocked on.
+    fn waiting_keys(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|s| s.inner.lock().waiting.len())
+            .sum()
     }
 }
 
@@ -1583,7 +1598,7 @@ fn big_collections_keep_the_books() {
 /// through `cmd::execute`, with the store's books checked after every one,
 /// so a command that leaves them wrong fails at once rather than later.
 mod random_commands {
-    use crate::cmd::{self, Args};
+    use crate::cmd::{self, Args, Blocked, Reply};
     use crate::context::{Context, Settings};
     use crate::store::{Config, EvictionPolicy, Store};
     use std::sync::Arc;
@@ -1698,6 +1713,11 @@ mod random_commands {
         b"LMOVE",
         b"RPOPLPUSH",
         b"LMPOP",
+        b"BLPOP",
+        b"BRPOP",
+        b"BLMOVE",
+        b"BRPOPLPUSH",
+        b"BLMPOP",
         b"ZADD",
         b"ZINCRBY",
         b"ZREM",
@@ -1721,6 +1741,9 @@ mod random_commands {
         b"ZPOPMIN",
         b"ZPOPMAX",
         b"ZMPOP",
+        b"BZPOPMIN",
+        b"BZPOPMAX",
+        b"BZMPOP",
         b"ZRANDMEMBER",
         b"ZSCAN",
         b"ZUNION",
@@ -1825,6 +1848,57 @@ mod random_commands {
         b"pw",
     ];
 
+    /// A well-formed blocking command, or a write that may serve one, on a
+    /// few keys: random arguments rarely line those up.
+    fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
+        const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
+        let choice = rng.below(14);
+        let mut key = || rng.pick(KEYS).to_vec();
+        let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
+        let mut args = match choice {
+            0 => vec![b"BLPOP".to_vec(), key(), key()],
+            1 => vec![b"BRPOP".to_vec(), key()],
+            2 => [
+                vec![b"BLMOVE".to_vec(), key(), key()],
+                words(&["LEFT", "RIGHT"]),
+            ]
+            .concat(),
+            3 => vec![b"BRPOPLPUSH".to_vec(), key(), key()],
+            4 => [
+                words(&["BLMPOP", "0", "2"]),
+                vec![key(), key()],
+                words(&["LEFT", "COUNT", "2"]),
+            ]
+            .concat(),
+            5 => vec![b"BZPOPMIN".to_vec(), key(), key()],
+            6 => [words(&["BZMPOP", "0", "1"]), vec![key()], words(&["MAX"])].concat(),
+            7 => [vec![b"RPUSH".to_vec(), key()], words(&["a", "b", "c"])].concat(),
+            8 => [vec![b"LPUSH".to_vec(), key()], words(&["x"])].concat(),
+            9 => [vec![b"ZADD".to_vec(), key()], words(&["1", "m", "2", "n"])].concat(),
+            10 => [
+                vec![b"LMOVE".to_vec(), key(), key()],
+                words(&["LEFT", "LEFT"]),
+            ]
+            .concat(),
+            11 => vec![b"RENAME".to_vec(), key(), key()],
+            12 => vec![b"SET".to_vec(), key(), b"v".to_vec()],
+            _ => vec![b"DEL".to_vec(), key()],
+        };
+        // The blocking ones take a timeout last, except the *MPOPs: first.
+        match args[0].as_slice() {
+            b"BLMPOP" | b"BZMPOP" => {}
+            b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BRPOPLPUSH" | b"BZPOPMIN" => {
+                args.push(if rng.below(4) == 0 {
+                    b"0.01".to_vec()
+                } else {
+                    b"0".to_vec()
+                })
+            }
+            _ => {}
+        }
+        args
+    }
+
     fn random_arg(rng: &mut Rng) -> Vec<u8> {
         match rng.below(10) {
             0 => (0..rng.below(40)).map(|_| rng.next() as u8).collect(),
@@ -1862,11 +1936,18 @@ mod random_commands {
             let mut now = 1;
             let mut out = Vec::new();
             let mut history: Vec<String> = Vec::new();
+            // Clients blocked meanwhile, served by the commands that follow.
+            let mut blocked: Vec<Box<Blocked>> = Vec::new();
             for step in 0..15_000 {
-                let mut args = vec![rng.pick(COMMANDS).to_vec()];
-                for _ in 0..rng.below(7) {
-                    args.push(random_arg(&mut rng));
-                }
+                let args = if rng.below(6) == 0 {
+                    blocking_or_serving(&mut rng)
+                } else {
+                    let mut args = vec![rng.pick(COMMANDS).to_vec()];
+                    for _ in 0..rng.below(7) {
+                        args.push(random_arg(&mut rng));
+                    }
+                    args
+                };
                 let mut buf = Vec::new();
                 let mut ranges = Vec::new();
                 for arg in &args {
@@ -1882,7 +1963,22 @@ mod random_commands {
                 if history.len() > 6 {
                     history.remove(0);
                 }
-                let _ = cmd::execute(&ctx, &mut session, now, &Args::new(&buf, &ranges), &mut out);
+                if let Reply::Block(b) =
+                    cmd::execute(&ctx, &mut session, now, &Args::new(&buf, &ranges), &mut out)
+                {
+                    blocked.push(b);
+                }
+                // Now and then one is done waiting: timed out (or served),
+                // or its client left.
+                if !blocked.is_empty() && rng.below(32) == 0 {
+                    let b = blocked.swap_remove(rng.below(blocked.len()));
+                    if rng.below(2) == 0 {
+                        let mut reply = Vec::new();
+                        b.finish(&mut reply);
+                        assert!(reply.ends_with(b"\r\n"), "{history:#?}");
+                    }
+                }
+                assert_eq!(ctx.store.blocked_clients(), blocked.len());
                 let ok =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.store.check()));
                 assert!(
@@ -1891,6 +1987,9 @@ mod random_commands {
                 );
                 now += rng.below(50) as u64;
             }
+            drop(blocked);
+            assert_eq!(ctx.store.waiting_keys(), 0);
+            assert_eq!(ctx.store.blocked_clients(), 0);
         }
     }
 }

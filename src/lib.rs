@@ -1,5 +1,6 @@
 //! tantalum: a small, fast, Redis-protocol key/value store.
 
+pub mod blocking;
 pub mod cmd;
 mod collection;
 pub mod context;

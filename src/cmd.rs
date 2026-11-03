@@ -9,6 +9,7 @@ mod zset;
 use std::ops::Range;
 use std::sync::OnceLock;
 
+pub use crate::blocking::Blocked;
 use crate::context::{Context, Session};
 use crate::glob;
 use crate::resp;
@@ -78,6 +79,10 @@ pub enum Reply {
     Bulk(SharedValue),
     /// The reply is in the output buffer; close after flushing it.
     Close,
+    /// A blocking command found its keys empty: the connection sends what
+    /// it has, then waits for the reply (see `blocking.rs`). Boxed, so
+    /// that every other reply stays as small as before.
+    Block(Box<Blocked>),
 }
 
 type Handler = fn(&Context, &mut Session, Millis, &Args<'_>, &mut Vec<u8>) -> Reply;
@@ -209,6 +214,11 @@ static COMMANDS: &[Command] = &[
     Command { name: "lmove", arity: 5, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::lmove },
     Command { name: "rpoplpush", arity: 3, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::rpoplpush },
     Command { name: "lmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: list::lmpop },
+    Command { name: "blpop", arity: -3, flags: &["write", "blocking"], keys: (1, -2, 1), run: list::blpop },
+    Command { name: "brpop", arity: -3, flags: &["write", "blocking"], keys: (1, -2, 1), run: list::brpop },
+    Command { name: "blmove", arity: 6, flags: &["write", "denyoom", "blocking"], keys: (1, 2, 1), run: list::blmove },
+    Command { name: "brpoplpush", arity: 4, flags: &["write", "denyoom", "blocking"], keys: (1, 2, 1), run: list::brpoplpush },
+    Command { name: "blmpop", arity: -5, flags: &["write", "blocking"], keys: NO_KEYS, run: list::blmpop },
     Command { name: "zadd", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: zset::zadd },
     Command { name: "zscore", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zscore },
     Command { name: "zrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrange },
@@ -232,6 +242,9 @@ static COMMANDS: &[Command] = &[
     Command { name: "zpopmin", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zpopmin },
     Command { name: "zpopmax", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zpopmax },
     Command { name: "zmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: zset::zmpop },
+    Command { name: "bzpopmin", arity: -3, flags: &["write", "blocking", "fast"], keys: (1, -2, 1), run: zset::bzpopmin },
+    Command { name: "bzpopmax", arity: -3, flags: &["write", "blocking", "fast"], keys: (1, -2, 1), run: zset::bzpopmax },
+    Command { name: "bzmpop", arity: -5, flags: &["write", "blocking"], keys: NO_KEYS, run: zset::bzmpop },
     Command { name: "zrandmember", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: zset::zrandmember },
     Command { name: "zscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: zset::zscan },
     Command { name: "zunion", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zunion },
@@ -282,7 +295,11 @@ pub fn execute(
         resp::write_error(out, b"NOAUTH Authentication required.");
         return Reply::Written;
     }
-    (command.run)(ctx, session, now, args, out)
+    let reply = (command.run)(ctx, session, now, args, out);
+    if ctx.store.has_ready() {
+        crate::blocking::serve_ready(ctx, now);
+    }
+    reply
 }
 
 /// The command called `name`, in any case. [`COMMANDS`] is split by name
@@ -1580,13 +1597,14 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
         s,
         "# Server\r\nredis_version:{REDIS_VERSION}\r\ntantalum_version:{}\r\nredis_mode:standalone\r\n\
          process_id:{}\r\nuptime_in_seconds:{}\r\n\r\n\
-         # Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\n\r\n\
+         # Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\n\r\n\
          # Memory\r\nused_memory:{}\r\n",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         server.uptime.as_secs(),
         server.connected_clients,
         ctx.settings.maxclients,
+        ctx.store.blocked_clients(),
         stats.used_memory,
     );
     // Where used_memory goes: packed entries (and how much of that is live),

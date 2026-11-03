@@ -151,3 +151,70 @@ round 2 tantalum         P16  ops  7504629 p50 0.495 p99 0.679 cpu 7.75 ops/core
 #   "short read means drained" shortcut, so every wait first tried a read that found nothing.
 #   final version (read_buf after the readiness wait): 0.97 recvfrom per request, and
 #     1 thread:  P1 0.997, P16 0.999 (4 rounds)      4 threads: P1 0.988, P16 0.984 (3 rounds)
+
+# Blocking commands (0.13.0) against 0.12.0, same box, 2026-11-03. saturate.sh, servers pinned to
+# cores 0..N-1, memtier on 8-31 (24 x 10), paired rounds; ops/s, new / old:
+#   first version: up to -2.3% (4 threads, io_uring, P16, every new round below every old one).
+#   Reply had grown from 24 to 32 bytes (the Block variant), and every command returns one.
+#   final version (Block boxed, Reply back to 24 bytes), median and best round:
+#     1 thread:   per-thread P1 -1.0% / -0.4%, P16 -0.4% / -0.5%; io_uring P1 +0.4% / -1.3%, P16 -1.1% / -1.0%
+#     4 threads:  per-thread P1 -0.7% / -0.4%, P16 +0.4% / +0.4%; io_uring P1 -1.1% / -1.3%, P16 -1.1% / -0.9%
+#   Within the spread of one build's rounds (1-4%); p99 unchanged. Final run's rows:
+### 1 thread(s)
+round 1 new              P1   ops    97637 p50 2.463 p99 2.623 cpu 0.90 ops/core   108585
+round 1 new              P16  ops  1135342 p50 3.375 p99 3.631 cpu 0.90 ops/core  1262766
+round 1 old              P1   ops    97990 p50 2.447 p99 2.639 cpu 0.90 ops/core   109076
+round 1 old              P16  ops  1141449 p50 3.343 p99 3.663 cpu 0.90 ops/core  1269653
+round 1 new-uring        P1   ops   118658 p50 2.015 p99 2.431 cpu 0.90 ops/core   132119
+round 1 new-uring        P16  ops  1365934 p50 2.799 p99 3.151 cpu 0.90 ops/core  1522415
+round 1 old-uring        P1   ops   120206 p50 1.983 p99 2.287 cpu 0.99 ops/core   121724
+round 1 old-uring        P16  ops  1379621 p50 2.767 p99 3.199 cpu 0.90 ops/core  1537371
+round 2 old              P1   ops    94235 p50 2.527 p99 2.815 cpu 0.90 ops/core   104793
+round 2 old              P16  ops  1100687 p50 3.487 p99 3.775 cpu 0.90 ops/core  1226740
+round 2 new-uring        P1   ops   116378 p50 2.047 p99 2.287 cpu 0.99 ops/core   117842
+round 2 new-uring        P16  ops  1353801 p50 2.831 p99 3.103 cpu 0.90 ops/core  1508787
+round 2 old-uring        P1   ops   117956 p50 2.015 p99 2.335 cpu 0.99 ops/core   119439
+round 2 old-uring        P16  ops  1358866 p50 2.815 p99 3.167 cpu 0.90 ops/core  1514480
+round 2 new              P1   ops    92909 p50 2.559 p99 2.879 cpu 0.90 ops/core   103435
+round 2 new              P16  ops  1101603 p50 3.471 p99 3.807 cpu 0.90 ops/core  1226459
+round 3 new-uring        P1   ops   118474 p50 2.007 p99 2.255 cpu 0.99 ops/core   120095
+round 3 new-uring        P16  ops  1322882 p50 2.895 p99 3.199 cpu 0.90 ops/core  1472910
+round 3 old-uring        P1   ops   116463 p50 2.047 p99 2.367 cpu 0.99 ops/core   117914
+round 3 old-uring        P16  ops  1354283 p50 2.831 p99 3.151 cpu 0.99 ops/core  1371271
+round 3 new              P1   ops    94084 p50 2.543 p99 2.815 cpu 0.90 ops/core   104754
+round 3 new              P16  ops  1101747 p50 3.471 p99 3.775 cpu 0.90 ops/core  1226732
+round 3 old              P1   ops    93426 p50 2.559 p99 2.815 cpu 0.90 ops/core   104125
+round 3 old              P16  ops  1112796 p50 3.439 p99 3.759 cpu 0.90 ops/core  1238780
+round 4 old-uring        P1   ops   117256 p50 2.031 p99 2.287 cpu 0.90 ops/core   130554
+round 4 old-uring        P16  ops  1355294 p50 2.815 p99 3.247 cpu 0.90 ops/core  1510304
+round 4 new              P1   ops    92882 p50 2.575 p99 2.847 cpu 0.99 ops/core    94062
+round 4 new              P16  ops  1112941 p50 3.439 p99 3.759 cpu 0.90 ops/core  1238986
+round 4 old              P1   ops    94712 p50 2.511 p99 2.767 cpu 0.90 ops/core   105449
+round 4 old              P16  ops  1111498 p50 3.455 p99 3.743 cpu 0.90 ops/core  1238780
+round 4 new-uring        P1   ops   117615 p50 2.023 p99 2.255 cpu 0.99 ops/core   119201
+round 4 new-uring        P16  ops  1331795 p50 2.879 p99 3.167 cpu 0.90 ops/core  1482644
+### 4 thread(s)
+round 1 new              P1   ops   398683 p50 0.607 p99 0.663 cpu 3.97 ops/core   100469
+round 1 new              P16  ops  4500023 p50 0.847 p99 0.991 cpu 3.95 ops/core  1140359
+round 1 old              P1   ops   400134 p50 0.599 p99 0.663 cpu 3.97 ops/core   100831
+round 1 old              P16  ops  4479730 p50 0.847 p99 0.999 cpu 3.94 ops/core  1136331
+round 1 new-uring        P1   ops   478015 p50 0.519 p99 0.615 cpu 3.97 ops/core   120459
+round 1 new-uring        P16  ops  5148233 p50 0.719 p99 0.983 cpu 3.93 ops/core  1309982
+round 1 old-uring        P1   ops   484144 p50 0.511 p99 0.575 cpu 3.97 ops/core   122087
+round 1 old-uring        P16  ops  5186659 p50 0.679 p99 1.063 cpu 3.94 ops/core  1317970
+round 2 old              P1   ops   397881 p50 0.599 p99 0.695 cpu 3.97 ops/core   100294
+round 2 old              P16  ops  4492739 p50 0.847 p99 0.991 cpu 3.94 ops/core  1138954
+round 2 new-uring        P1   ops   476662 p50 0.519 p99 0.615 cpu 3.97 ops/core   120204
+round 2 new-uring        P16  ops  5213419 p50 0.775 p99 0.943 cpu 3.94 ops/core  1323993
+round 2 old-uring        P1   ops   476546 p50 0.503 p99 0.639 cpu 3.97 ops/core   120124
+round 2 old-uring        P16  ops  5269778 p50 0.743 p99 0.919 cpu 3.94 ops/core  1338180
+round 2 new              P1   ops   394610 p50 0.607 p99 0.703 cpu 3.97 ops/core    99505
+round 2 new              P16  ops  4511470 p50 0.847 p99 0.991 cpu 3.94 ops/core  1145056
+round 3 new-uring        P1   ops   476274 p50 0.511 p99 0.615 cpu 3.97 ops/core   120111
+round 3 new-uring        P16  ops  5235497 p50 0.727 p99 0.903 cpu 3.94 ops/core  1328931
+round 3 old-uring        P1   ops   482139 p50 0.495 p99 0.607 cpu 3.97 ops/core   121595
+round 3 old-uring        P16  ops  5285531 p50 0.711 p99 0.991 cpu 3.94 ops/core  1340023
+round 3 new              P1   ops   395147 p50 0.607 p99 0.703 cpu 3.97 ops/core    99617
+round 3 new              P16  ops  4528883 p50 0.839 p99 0.991 cpu 3.94 ops/core  1148109
+round 3 old              P1   ops   396989 p50 0.607 p99 0.695 cpu 3.97 ops/core   100089
+round 3 old              P16  ops  4511658 p50 0.847 p99 0.991 cpu 3.94 ops/core  1144091
