@@ -3,6 +3,7 @@
 mod hash;
 mod keys;
 mod list;
+mod pubsub;
 mod set;
 mod zset;
 
@@ -161,6 +162,16 @@ static COMMANDS: &[Command] = &[
     Command { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: lastsave },
     Command { name: "flushdb", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
     Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: quit },
+    Command { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"], keys: NO_KEYS, run: pubsub::reset },
+    Command { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::subscribe },
+    Command { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::unsubscribe },
+    Command { name: "psubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::psubscribe },
+    Command { name: "punsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::punsubscribe },
+    Command { name: "ssubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: (1, -1, 1), run: pubsub::ssubscribe },
+    Command { name: "sunsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: (1, -1, 1), run: pubsub::sunsubscribe },
+    Command { name: "publish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], keys: NO_KEYS, run: pubsub::publish },
+    Command { name: "spublish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], keys: ONE_KEY, run: pubsub::spublish },
+    Command { name: "pubsub", arity: -2, flags: &[], keys: NO_KEYS, run: pubsub::pubsub },
     Command { name: "type", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: type_of },
     Command { name: "scan", arity: -2, flags: &["readonly"], keys: NO_KEYS, run: keys::scan },
     Command { name: "keys", arity: 2, flags: &["readonly"], keys: NO_KEYS, run: keys::keys },
@@ -267,13 +278,19 @@ pub fn execute(
     let name = args.get(0);
     session.commands += 1;
     // Most traffic: skip the table.
-    if session.authenticated {
+    if session.unrestricted {
         if args.len() == 2 && name.eq_ignore_ascii_case(b"GET") {
             return get(ctx, session, now, args, out);
         }
         if args.len() >= 3 && name.eq_ignore_ascii_case(b"SET") {
             return set(ctx, session, now, args, out);
         }
+    } else if let Some(subscriber) = session.subscriber()
+        && !subscriber.take(out)
+    {
+        // Messages that came before this command go out first; this
+        // client is over its output limit.
+        return Reply::Close;
     }
     // Checked in Redis' order: unknown command, arity, then authentication.
     let Some(command) = find_command(name) else {
@@ -291,9 +308,20 @@ pub fn execute(
         wrong_arity(out, command.name);
         return Reply::Written;
     }
-    if !session.authenticated && !command.flags.contains(&"no_auth") {
-        resp::write_error(out, b"NOAUTH Authentication required.");
-        return Reply::Written;
+    if !session.unrestricted {
+        if !session.authenticated && !command.flags.contains(&"no_auth") {
+            resp::write_error(out, b"NOAUTH Authentication required.");
+            return Reply::Written;
+        }
+        // A subscribed RESP2 client may only run the pub/sub ones, PING,
+        // QUIT and RESET (but hears about an unknown subcommand first).
+        if session.pubsub.is_some()
+            && !session.resp3
+            && !pubsub::allowed_when_subscribed(command.name)
+            && pubsub::not_allowed(out, command.name, args)
+        {
+            return Reply::Written;
+        }
     }
     let reply = (command.run)(ctx, session, now, args, out);
     if ctx.store.has_ready() {
@@ -1025,11 +1053,31 @@ fn unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
-fn ping(_: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    match args.len() {
-        1 => out.extend_from_slice(resp::PONG),
-        2 => resp::write_bulk(out, args.get(1)),
-        _ => wrong_arity(out, "ping"),
+fn ping(
+    _: &Context,
+    session: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let message = match args.len() {
+        1 => None,
+        2 => Some(args.get(1)),
+        _ => {
+            wrong_arity(out, "ping");
+            return Reply::Written;
+        }
+    };
+    if session.is_subscribed() && !session.resp3 {
+        // Subscribed RESP2 clients get it in a message's shape.
+        resp::write_array_header(out, 2);
+        resp::write_bulk(out, b"pong");
+        resp::write_bulk(out, message.unwrap_or_default());
+    } else {
+        match message {
+            None => out.extend_from_slice(resp::PONG),
+            Some(message) => resp::write_bulk(out, message),
+        }
     }
     Reply::Written
 }
@@ -1086,7 +1134,7 @@ fn auth(
         (args.get(1), args.get(2))
     };
     if ctx.check_password(user, password) {
-        session.authenticated = true;
+        session.set_authenticated(true);
         out.extend_from_slice(resp::OK);
     } else {
         resp::write_error(out, WRONGPASS);
@@ -1145,7 +1193,7 @@ fn hello(
             resp::write_error(out, WRONGPASS);
             return Reply::Written;
         }
-        session.authenticated = true;
+        session.set_authenticated(true);
     }
     if !session.authenticated {
         resp::write_error(
@@ -1161,7 +1209,7 @@ fn hello(
     {
         return Reply::Written;
     }
-    session.resp3 = resp3;
+    session.set_resp3(resp3);
     resp::write_map_header(out, 7, resp3);
     for (field, value) in [("server", "redis"), ("version", REDIS_VERSION)] {
         resp::write_bulk(out, field.as_bytes());
@@ -1652,7 +1700,8 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
         s,
         "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
-         keyspace_hits:{}\r\nkeyspace_misses:{}\r\n\r\n\
+         keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
+         pubsubshard_channels:{}\r\n\r\n\
          # Keyspace\r\n",
         server.total_connections,
         server.total_commands,
@@ -1661,6 +1710,9 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
         stats.evicted_keys,
         server.keyspace_hits,
         server.keyspace_misses,
+        ctx.pubsub.channel_count(false),
+        ctx.pubsub.pattern_count(),
+        ctx.pubsub.channel_count(true),
     );
     if stats.keys > 0 {
         let _ = write!(

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
+use crate::pubsub::{PubSub, Subscriber, Subscriptions};
 use crate::resp;
 use crate::snapshot::Snapshots;
 use crate::store::Store;
@@ -76,6 +77,8 @@ pub struct Context {
     pub settings: Settings,
     /// Set when the server saves snapshots (`--snapshot`).
     pub snapshots: Option<Arc<Snapshots>>,
+    /// Who is subscribed to what.
+    pub pubsub: Arc<PubSub>,
     started: Instant,
     next_client_id: AtomicU64,
     /// Open connections, by client id, so shutdown can reach them: a
@@ -94,6 +97,7 @@ pub struct Context {
 impl Context {
     pub fn new(store: Arc<Store>, settings: Settings) -> Self {
         Context {
+            pubsub: Arc::new(PubSub::new(store.clone())),
             store,
             settings,
             snapshots: None,
@@ -260,9 +264,12 @@ pub struct Client<'a> {
 impl Client<'_> {
     /// Per-connection state for commands.
     pub fn session(&self) -> Session {
+        let authenticated = !self.ctx.has_password();
         Session {
             id: self.id,
-            authenticated: !self.ctx.has_password(),
+            authenticated,
+            unrestricted: authenticated,
+            pubsub: None,
             name: None,
             resp3: false,
             commands: 0,
@@ -301,6 +308,11 @@ impl Drop for Client<'_> {
 pub struct Session {
     pub(crate) id: u64,
     pub(crate) authenticated: bool,
+    /// Authenticated and not subscribed: commands take the fast path and
+    /// skip the checks below it. Kept by the setters.
+    pub(crate) unrestricted: bool,
+    /// What the client is subscribed to, if anything.
+    pub(crate) pubsub: Option<Box<Subscriptions>>,
     /// Set by `CLIENT SETNAME` or `HELLO ... SETNAME`.
     pub(crate) name: Option<Box<[u8]>>,
     /// Whether the client switched to RESP3 with `HELLO 3`.
@@ -328,5 +340,44 @@ impl Session {
         } else {
             self.misses += 1;
         }
+    }
+
+    pub(crate) fn set_authenticated(&mut self, authenticated: bool) {
+        self.authenticated = authenticated;
+        self.unrestricted = authenticated && self.pubsub.is_none();
+    }
+
+    pub(crate) fn set_resp3(&mut self, resp3: bool) {
+        self.resp3 = resp3;
+        if let Some(subscriptions) = &self.pubsub {
+            subscriptions.set_resp3(resp3);
+        }
+    }
+
+    /// Its subscriptions, made on its first subscribe.
+    pub(crate) fn subscriptions(&mut self, pubsub: &Arc<PubSub>) -> &mut Subscriptions {
+        self.unrestricted = false;
+        let (id, resp3) = (self.id, self.resp3);
+        self.pubsub
+            .get_or_insert_with(|| Box::new(Subscriptions::new(pubsub, id, resp3)))
+    }
+
+    /// Leaves pub/sub once it's subscribed to nothing (or always, with
+    /// `force`): what was still waiting to be sent is dropped.
+    pub(crate) fn end_subscriptions(&mut self, force: bool) {
+        if force || self.pubsub.as_ref().is_some_and(|s| s.is_empty()) {
+            self.pubsub = None;
+            self.unrestricted = self.authenticated;
+        }
+    }
+
+    /// Whether the client is subscribed to anything.
+    pub fn is_subscribed(&self) -> bool {
+        self.pubsub.is_some()
+    }
+
+    /// Its outbox while it's subscribed, for its connection to send.
+    pub fn subscriber(&self) -> Option<&Arc<Subscriber>> {
+        self.pubsub.as_deref().map(Subscriptions::subscriber)
     }
 }

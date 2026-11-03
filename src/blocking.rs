@@ -26,7 +26,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::task::{Poll, Waker};
+use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -35,6 +35,7 @@ use crate::cmd::{Args, Reply};
 use crate::context::{Context, Session};
 use crate::resp;
 use crate::store::{Kind, Millis, Store};
+use crate::wake::{Mailbox, Wake};
 
 /// What a blocking command's attempt did.
 pub(crate) enum Attempt {
@@ -85,9 +86,8 @@ pub struct Waiter {
     resp3: bool,
     /// Its reply, once served.
     reply: Mutex<Vec<u8>>,
-    /// Its connection's waker while it waits, and for a monoio connection,
-    /// the mailbox of the thread it runs on.
-    waker: Mutex<Option<(Waker, Option<Arc<Mailbox>>)>>,
+    /// Wakes its connection while it waits.
+    waker: Mutex<Option<Wake>>,
 }
 
 impl Waiter {
@@ -178,6 +178,8 @@ impl Waiter {
         let mut session = Session {
             id: self.client,
             authenticated: true,
+            unrestricted: true,
+            pubsub: None,
             name: None,
             resp3: self.resp3,
             commands: 0,
@@ -192,10 +194,8 @@ impl Waiter {
         *self.reply.lock() = reply;
         self.state.store(SERVED, Ordering::Release);
         let waker = self.waker.lock().take();
-        match waker {
-            Some((waker, Some(home))) => home.send(waker),
-            Some((waker, None)) => waker.wake(),
-            None => {}
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -326,7 +326,7 @@ impl Blocked {
             if waiter.state.load(Ordering::Acquire) == SERVED {
                 return Poll::Ready(());
             }
-            *waiter.waker.lock() = Some((cx.waker().clone(), home.cloned()));
+            *waiter.waker.lock() = Some(Wake::new(cx, home));
             // Served before the waker was in place?
             if waiter.state.load(Ordering::Acquire) == SERVED {
                 Poll::Ready(())
@@ -358,47 +358,6 @@ impl Drop for Blocked {
             self.store.stop_waiting(self.store.key(key), &self.waiter);
         }
         self.store.count_blocked(-1);
-    }
-}
-
-/// Wakes a monoio thread's tasks from other threads, which monoio itself
-/// can't do (without its `sync` feature, which costs every connection).
-/// The thread reads `bell` and wakes what was sent.
-pub struct Mailbox {
-    wakers: Mutex<Vec<Waker>>,
-    bell: std::os::unix::net::UnixStream,
-}
-
-impl Mailbox {
-    /// A mailbox, and the other end of its bell, for its thread to read.
-    pub fn new() -> std::io::Result<(Arc<Mailbox>, std::os::unix::net::UnixStream)> {
-        let (bell, ear) = std::os::unix::net::UnixStream::pair()?;
-        bell.set_nonblocking(true)?;
-        ear.set_nonblocking(true)?;
-        let mailbox = Mailbox {
-            wakers: Mutex::new(Vec::new()),
-            bell,
-        };
-        Ok((Arc::new(mailbox), ear))
-    }
-
-    fn send(&self, waker: Waker) {
-        let first = {
-            let mut wakers = self.wakers.lock();
-            wakers.push(waker);
-            wakers.len() == 1
-        };
-        // Only the first rings: the rest come along with it. (If the bell's
-        // buffer is full, it's ringing already.)
-        if first {
-            let _ = std::io::Write::write(&mut &self.bell, &[1]);
-        }
-    }
-
-    /// On its own thread, after the bell rang: wakes what was sent.
-    pub fn deliver(&self) {
-        let wakers = std::mem::take(&mut *self.wakers.lock());
-        wakers.into_iter().for_each(Waker::wake);
     }
 }
 

@@ -42,11 +42,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 pub use tokio_rustls::TlsAcceptor;
 
-use crate::blocking::Mailbox;
 use crate::cmd::{self, Args, Blocked, Reply};
 use crate::context::{Context, Session};
+use crate::pubsub::Subscriber;
 use crate::resp;
 use crate::store::{KeyHash, Millis, Store};
+use crate::wake::Mailbox;
 
 /// Minimum free space in the read buffer before each read.
 const READ_RESERVE: usize = 16 * 1024;
@@ -520,12 +521,56 @@ async fn deliver_mail(mailbox: Arc<Mailbox>, mut bell: monoio::net::UnixStream) 
     }
 }
 
+/// For a subscribed monoio connection, instead of waiting idle: sends its
+/// messages as they come until the client sends something. `false` if
+/// it's over its output limit and must close.
+async fn forward_messages_uring(
+    socket: &mut monoio::net::TcpStream,
+    subscriber: &Subscriber,
+    mailbox: &Arc<Mailbox>,
+) -> io::Result<bool> {
+    let mut messages = Vec::new();
+    loop {
+        monoio::select! {
+            ready = socket.readable(false) => {
+                ready?;
+                return Ok(true);
+            }
+            () = subscriber.ready(Some(mailbox)) => {}
+        }
+        if !subscriber.take(&mut messages) {
+            return Ok(false);
+        }
+        match write_unless_closed(socket, messages, subscriber, mailbox).await? {
+            Some(buf) => messages = buf,
+            None => return Ok(false),
+        }
+        messages.clear();
+    }
+}
+
+/// Writes `buf`, unless the subscriber goes over its output limit meanwhile
+/// (then `None`): see `send_unless_closed`.
+async fn write_unless_closed(
+    socket: &mut monoio::net::TcpStream,
+    buf: Vec<u8>,
+    subscriber: &Subscriber,
+    mailbox: &Arc<Mailbox>,
+) -> io::Result<Option<Vec<u8>>> {
+    use monoio::io::AsyncWriteRentExt;
+    monoio::select! {
+        (result, buf) = socket.write_all(buf) => result.map(|_| Some(buf)),
+        () = subscriber.closed(Some(mailbox)) => Ok(None),
+    }
+}
+
 /// [`wait_blocked`] for monoio, waking through this thread's `mailbox`.
 async fn wait_blocked_uring(
     socket: &mut monoio::net::TcpStream,
     blocked: &Blocked,
     mut rbuf: Vec<u8>,
     mailbox: &Arc<Mailbox>,
+    subscriber: Option<&Subscriber>,
 ) -> (io::Result<bool>, Vec<u8>) {
     use monoio::buf::IoBufMut;
     use monoio::io::AsyncReadRent;
@@ -538,6 +583,7 @@ async fn wait_blocked_uring(
     });
     loop {
         // Readiness, not a read: a read cancelled in flight could lose data.
+        let mut messages_came = false;
         monoio::select! {
             () = &mut served => return (Ok(true), rbuf),
             () = &mut timeout => return (Ok(true), rbuf),
@@ -546,6 +592,19 @@ async fn wait_blocked_uring(
                     return (Err(e), rbuf);
                 }
             }
+            () = messages_ready(subscriber, Some(mailbox)) => messages_came = true,
+        }
+        if let (true, Some(subscriber)) = (messages_came, subscriber) {
+            let mut messages = Vec::new();
+            if !subscriber.take(&mut messages) {
+                return (Ok(false), rbuf);
+            }
+            match write_unless_closed(socket, messages, subscriber, mailbox).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return (Ok(false), rbuf),
+                Err(e) => return (Err(e), rbuf),
+            }
+            continue;
         }
         if rbuf.capacity() - rbuf.len() < URING_READ_BUFFER / 2 {
             rbuf.reserve(rbuf.capacity().max(URING_READ_BUFFER));
@@ -596,6 +655,12 @@ async fn handle_uring(
     let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
     loop {
+        if let Some(subscriber) = session.subscriber() {
+            let subscriber = subscriber.clone();
+            if !forward_messages_uring(&mut socket, &subscriber, mailbox).await? {
+                return Ok(()); // over its output limit
+            }
+        }
         // Grow by doubling when reads fill it (a big value, a long pipeline).
         if rbuf.capacity() - rbuf.len() < URING_READ_BUFFER / 2 {
             rbuf.reserve(rbuf.capacity().max(URING_READ_BUFFER));
@@ -636,8 +701,15 @@ async fn handle_uring(
                             if !wbuf.is_empty() {
                                 wbuf = flush(&mut socket, wbuf).await?;
                             }
-                            let (result, buf) =
-                                wait_blocked_uring(&mut socket, &blocked, rbuf, mailbox).await;
+                            let subscriber = session.subscriber().cloned();
+                            let (result, buf) = wait_blocked_uring(
+                                &mut socket,
+                                &blocked,
+                                rbuf,
+                                mailbox,
+                                subscriber.as_deref(),
+                            )
+                            .await;
                             rbuf = buf;
                             if !result? {
                                 return Ok(());
@@ -669,8 +741,26 @@ async fn handle_uring(
         }
         ctx.publish(&mut session);
         rbuf.drain(..pos);
+        // Messages that came meanwhile go with the replies.
+        let subscriber = session.subscriber().cloned();
+        if let Some(subscriber) = &subscriber
+            && !subscriber.take(&mut wbuf)
+        {
+            close = true;
+        }
         if !wbuf.is_empty() {
-            wbuf = flush(&mut socket, wbuf).await?;
+            match &subscriber {
+                None => wbuf = flush(&mut socket, wbuf).await?,
+                Some(subscriber) => {
+                    match write_unless_closed(&mut socket, wbuf, subscriber, mailbox).await? {
+                        Some(mut buf) => {
+                            buf.clear();
+                            wbuf = buf;
+                        }
+                        None => return Ok(()),
+                    }
+                }
+            }
         }
         if close {
             return Ok(());
@@ -773,32 +863,42 @@ async fn serve_stream(
             S::WAIT_FOR_DATA
         }
         let plain = wait_for_data(&socket);
-        if plain {
-            // Wait for data before taking a buffer to read it into.
-            let ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx));
+        let n = if let Some(subscriber) = session.subscriber() {
+            let subscriber = subscriber.clone();
+            let read = read_subscribed(&mut socket, &subscriber, plain, &mut rbuf).await?;
+            client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
+            match read {
+                Some(n) => n,
+                None => return Ok(()), // over its output limit
+            }
+        } else {
+            if plain {
+                // Wait for data before taking a buffer to read it into.
+                let ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx));
+                match ctx.settings.timeout {
+                    None => ready.await?,
+                    Some(timeout) => match tokio::time::timeout(timeout, ready).await {
+                        Ok(ready) => ready?,
+                        Err(_) => return Ok(()),
+                    },
+                }
+            }
+            if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
+                rbuf.reserve(READ_RESERVE);
+            }
+            client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
+            // For plain TCP, data is ready, so this reads at once. Through
+            // `read_buf` (unlike `try_read_buf`), a short read tells tokio the
+            // socket is drained, so the next wait doesn't first try a read that
+            // finds nothing: that cost an extra syscall per request.
+            let read = socket.read_buf(&mut rbuf);
             match ctx.settings.timeout {
-                None => ready.await?,
-                Some(timeout) => match tokio::time::timeout(timeout, ready).await {
-                    Ok(ready) => ready?,
+                Some(timeout) if !plain => match tokio::time::timeout(timeout, read).await {
+                    Ok(n) => n?,
                     Err(_) => return Ok(()),
                 },
+                _ => read.await?,
             }
-        }
-        if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
-            rbuf.reserve(READ_RESERVE);
-        }
-        client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
-        // For plain TCP, data is ready, so this reads at once. Through
-        // `read_buf` (unlike `try_read_buf`), a short read tells tokio the
-        // socket is drained, so the next wait doesn't first try a read that
-        // finds nothing: that cost an extra syscall per request.
-        let read = socket.read_buf(&mut rbuf);
-        let n = match ctx.settings.timeout {
-            Some(timeout) if !plain => match tokio::time::timeout(timeout, read).await {
-                Ok(n) => n?,
-                Err(_) => return Ok(()),
-            },
-            _ => read.await?,
         };
         if n == 0 {
             return Ok(());
@@ -838,7 +938,15 @@ async fn serve_stream(
                                 send(&mut socket, &wbuf).await?;
                                 wbuf.clear();
                             }
-                            if !wait_blocked(&mut socket, &blocked, &mut rbuf).await? {
+                            let subscriber = session.subscriber().cloned();
+                            if !wait_blocked(
+                                &mut socket,
+                                &blocked,
+                                &mut rbuf,
+                                subscriber.as_deref(),
+                            )
+                            .await?
+                            {
                                 return Ok(());
                             }
                             blocked.finish(&mut wbuf);
@@ -869,8 +977,17 @@ async fn serve_stream(
         }
         ctx.publish(&mut session);
         rbuf.drain(..pos);
+        // Messages that came meanwhile go with the replies.
+        let subscriber = session.subscriber().cloned();
+        if let Some(subscriber) = &subscriber
+            && !subscriber.take(&mut wbuf)
+        {
+            close = true;
+        }
         if !wbuf.is_empty() {
-            send(&mut socket, &wbuf).await?;
+            if !send_unless_closed(&mut socket, &wbuf, subscriber.as_deref()).await? {
+                return Ok(());
+            }
             wbuf.clear();
         }
         if close {
@@ -894,12 +1011,14 @@ async fn serve_stream(
 
 /// Waits while a command is blocked, until it's served or times out
 /// (`true`), or the client goes away (`false`). What the client sends
-/// meanwhile is read into `rbuf`, to run after. Blocked clients aren't
-/// subject to the idle `timeout`, as in Redis.
+/// meanwhile is read into `rbuf`, to run after; a subscribed client's
+/// messages are sent meanwhile. Blocked clients aren't subject to the idle
+/// `timeout`, as in Redis.
 async fn wait_blocked(
     socket: &mut impl Stream,
     blocked: &Blocked,
     rbuf: &mut Vec<u8>,
+    subscriber: Option<&Subscriber>,
 ) -> io::Result<bool> {
     let mut served = std::pin::pin!(blocked.served(None));
     let mut timeout = std::pin::pin!(async {
@@ -908,6 +1027,7 @@ async fn wait_blocked(
             None => std::future::pending().await,
         }
     });
+    let mut messages = Vec::new();
     loop {
         if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
             rbuf.reserve(READ_RESERVE);
@@ -920,8 +1040,85 @@ async fn wait_blocked(
                     return Ok(false);
                 }
             }
+            () = messages_ready(subscriber, None) => {
+                if !subscriber.is_some_and(|s| s.take(&mut messages))
+                    || !send_unless_closed(socket, &messages, subscriber).await?
+                {
+                    return Ok(false);
+                }
+                messages.clear();
+            }
         }
     }
+}
+
+/// [`send`], given up (`false`) if the connection is a subscriber that goes
+/// over its output limit meanwhile: a client that doesn't read would hold
+/// the write, and its subscriptions, forever.
+async fn send_unless_closed(
+    socket: &mut impl Stream,
+    buf: &[u8],
+    subscriber: Option<&Subscriber>,
+) -> io::Result<bool> {
+    let Some(subscriber) = subscriber else {
+        send(socket, buf).await?;
+        return Ok(true);
+    };
+    tokio::select! {
+        sent = send(socket, buf) => sent.map(|()| true),
+        () = subscriber.closed(None) => Ok(false),
+    }
+}
+
+/// Resolves when a subscriber has messages to send; never without one.
+async fn messages_ready(subscriber: Option<&Subscriber>, home: Option<&Arc<Mailbox>>) {
+    match subscriber {
+        Some(subscriber) => subscriber.ready(home).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// For a subscribed connection, instead of waiting idle: sends its messages
+/// as they come until the client sends something, then reads it. `None` if
+/// it's over its output limit and must close. Subscribed clients aren't
+/// subject to the idle `timeout`, as in Redis.
+async fn read_subscribed(
+    socket: &mut impl Stream,
+    subscriber: &Subscriber,
+    plain: bool,
+    rbuf: &mut Vec<u8>,
+) -> io::Result<Option<usize>> {
+    let mut messages = Vec::new();
+    loop {
+        if plain {
+            tokio::select! {
+                ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx)) => {
+                    ready?;
+                    break;
+                }
+                () = subscriber.ready(None) => {}
+            }
+        } else {
+            // TLS: rustls may hold decrypted bytes already, so read.
+            if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
+                rbuf.reserve(READ_RESERVE);
+            }
+            tokio::select! {
+                read = socket.read_buf(rbuf) => return Ok(Some(read?)),
+                () = subscriber.ready(None) => {}
+            }
+        }
+        if !subscriber.take(&mut messages)
+            || !send_unless_closed(socket, &messages, Some(subscriber)).await?
+        {
+            return Ok(None);
+        }
+        messages.clear();
+    }
+    if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
+        rbuf.reserve(READ_RESERVE);
+    }
+    Ok(Some(socket.read_buf(rbuf).await?))
 }
 
 async fn write_all_vectored(

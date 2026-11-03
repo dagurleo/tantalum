@@ -1744,6 +1744,16 @@ mod random_commands {
         b"BZPOPMIN",
         b"BZPOPMAX",
         b"BZMPOP",
+        b"SUBSCRIBE",
+        b"UNSUBSCRIBE",
+        b"PSUBSCRIBE",
+        b"PUNSUBSCRIBE",
+        b"SSUBSCRIBE",
+        b"SUNSUBSCRIBE",
+        b"PUBLISH",
+        b"SPUBLISH",
+        b"PUBSUB",
+        b"RESET",
         b"ZRANDMEMBER",
         b"ZSCAN",
         b"ZUNION",
@@ -1846,13 +1856,18 @@ mod random_commands {
         b"\r\n",
         b"\0\xff",
         b"pw",
+        b"CHANNELS",
+        b"NUMSUB",
+        b"NUMPAT",
+        b"SHARDCHANNELS",
+        b"SHARDNUMSUB",
     ];
 
     /// A well-formed blocking command, or a write that may serve one, on a
     /// few keys: random arguments rarely line those up.
     fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
         const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
-        let choice = rng.below(14);
+        let choice = rng.below(20);
         let mut key = || rng.pick(KEYS).to_vec();
         let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
         let mut args = match choice {
@@ -1882,6 +1897,12 @@ mod random_commands {
             .concat(),
             11 => vec![b"RENAME".to_vec(), key(), key()],
             12 => vec![b"SET".to_vec(), key(), b"v".to_vec()],
+            13 => vec![b"SUBSCRIBE".to_vec(), key(), key()],
+            14 => vec![b"PSUBSCRIBE".to_vec(), b"k*".to_vec()],
+            15 => vec![b"SSUBSCRIBE".to_vec(), key()],
+            16 => vec![b"PUBLISH".to_vec(), key(), b"m".to_vec()],
+            17 => vec![b"SPUBLISH".to_vec(), key(), b"m".to_vec()],
+            18 => vec![b"UNSUBSCRIBE".to_vec(), key()],
             _ => vec![b"DEL".to_vec(), key()],
         };
         // The blocking ones take a timeout last, except the *MPOPs: first.
@@ -1932,6 +1953,9 @@ mod random_commands {
             let ctx = Context::new(Arc::new(store), settings);
             let client = ctx.connect(-1).unwrap();
             let mut session = client.session();
+            // Subscribing happens on a second client (see tests/fuzz.rs).
+            let listener_client = ctx.connect(-1).unwrap();
+            let mut listener = listener_client.session();
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut now = 1;
             let mut out = Vec::new();
@@ -1963,8 +1987,14 @@ mod random_commands {
                 if history.len() > 6 {
                     history.remove(0);
                 }
+                let subscribing = args[0].ends_with(b"SUBSCRIBE") || args[0] == b"RESET";
+                let session = if subscribing || rng.below(20) == 0 {
+                    &mut listener
+                } else {
+                    &mut session
+                };
                 if let Reply::Block(b) =
-                    cmd::execute(&ctx, &mut session, now, &Args::new(&buf, &ranges), &mut out)
+                    cmd::execute(&ctx, session, now, &Args::new(&buf, &ranges), &mut out)
                 {
                     blocked.push(b);
                 }

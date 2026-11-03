@@ -150,6 +150,16 @@ const COMMANDS: &[&[u8]] = &[
     b"BZPOPMIN",
     b"BZPOPMAX",
     b"BZMPOP",
+    b"SUBSCRIBE",
+    b"UNSUBSCRIBE",
+    b"PSUBSCRIBE",
+    b"PUNSUBSCRIBE",
+    b"SSUBSCRIBE",
+    b"SUNSUBSCRIBE",
+    b"PUBLISH",
+    b"SPUBLISH",
+    b"PUBSUB",
+    b"RESET",
     b"ZRANDMEMBER",
     b"ZSCAN",
     b"ZUNION",
@@ -252,13 +262,18 @@ const WORDS: &[&[u8]] = &[
     b"\r\n",
     b"\0\xff",
     b"pw",
+    b"CHANNELS",
+    b"NUMSUB",
+    b"NUMPAT",
+    b"SHARDCHANNELS",
+    b"SHARDNUMSUB",
 ];
 
 /// A well-formed blocking command, or a write that may serve one, on a
 /// few keys: random arguments rarely line those up.
 fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
     const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
-    let choice = rng.below(14);
+    let choice = rng.below(20);
     let mut key = || rng.pick(KEYS).to_vec();
     let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
     let mut args = match choice {
@@ -288,6 +303,12 @@ fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
         .concat(),
         11 => vec![b"RENAME".to_vec(), key(), key()],
         12 => vec![b"SET".to_vec(), key(), b"v".to_vec()],
+        13 => vec![b"SUBSCRIBE".to_vec(), key(), key()],
+        14 => vec![b"PSUBSCRIBE".to_vec(), b"k*".to_vec()],
+        15 => vec![b"SSUBSCRIBE".to_vec(), key()],
+        16 => vec![b"PUBLISH".to_vec(), key(), b"m".to_vec()],
+        17 => vec![b"SPUBLISH".to_vec(), key(), b"m".to_vec()],
+        18 => vec![b"UNSUBSCRIBE".to_vec(), key()],
         _ => vec![b"DEL".to_vec(), key()],
     };
     // The blocking ones take a timeout last, except the *MPOPs: first.
@@ -380,6 +401,10 @@ fn random_commands_never_panic() {
         let ctx = Context::new(Arc::new(store), settings);
         let client = ctx.connect(-1).unwrap();
         let mut session = client.session();
+        // Subscribing happens on a second client, which the first one's
+        // PUBLISHes reach: subscribed, the first could run little else.
+        let listener_client = ctx.connect(-1).unwrap();
+        let mut listener = listener_client.session();
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut now = 1;
         let mut out = Vec::new();
@@ -401,10 +426,33 @@ fn random_commands_never_panic() {
                 buf.extend_from_slice(arg);
             }
             out.clear();
-            match cmd::execute(&ctx, &mut session, now, &Args::new(&buf, &ranges), &mut out) {
+            let subscribing = [
+                &b"SUBSCRIBE"[..],
+                b"UNSUBSCRIBE",
+                b"PSUBSCRIBE",
+                b"PUNSUBSCRIBE",
+                b"SSUBSCRIBE",
+                b"SUNSUBSCRIBE",
+                b"RESET",
+            ]
+            .contains(&args[0].as_slice());
+            let session = if subscribing || rng.below(20) == 0 {
+                &mut listener
+            } else {
+                &mut session
+            };
+            // A subscriber's output also holds messages that came before
+            // the command, and (un)subscribing replies once per channel.
+            let several = subscribing || session.is_subscribed();
+            match cmd::execute(&ctx, session, now, &Args::new(&buf, &ranges), &mut out) {
                 Reply::Bulk(value) => {
-                    assert_eq!(count_replies(&out), 0, "step {step}");
+                    if !several {
+                        assert_eq!(count_replies(&out), 0, "step {step}");
+                    }
                     assert!(!value.as_bytes().is_empty());
+                }
+                Reply::Written | Reply::Close if several => {
+                    assert!(count_replies(&out) >= 1, "step {step}: {args:?}");
                 }
                 Reply::Written | Reply::Close => {
                     assert_eq!(count_replies(&out), 1, "step {step}: {args:?}");
@@ -412,7 +460,7 @@ fn random_commands_never_panic() {
                 // Blocked: nothing written yet. It waits while later
                 // commands run, which may serve it.
                 Reply::Block(b) => {
-                    assert!(out.is_empty(), "step {step}");
+                    assert!(several || out.is_empty(), "step {step}");
                     blocked.push(b);
                 }
             }

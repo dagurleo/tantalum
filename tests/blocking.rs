@@ -6,15 +6,12 @@
 mod common;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tantalum::context::{Context, Settings};
-use tantalum::server;
-use tantalum::store::Store;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use common::{Client, MODES, start};
+use tantalum::context::Context;
+use tokio::io::AsyncReadExt;
 
 #[rustfmt::skip]
 const SCRIPT: &[(&[&[u8]], &[u8])] = &[
@@ -138,128 +135,6 @@ const SCRIPT: &[(&[&[u8]], &[u8])] = &[
 #[tokio::test]
 async fn replies_match_redis() {
     common::replay(SCRIPT).await;
-}
-
-/// The three ways to run connections.
-#[derive(Clone, Copy, Debug)]
-enum Mode {
-    Shared,
-    PerThread,
-    Uring,
-}
-
-const MODES: [Mode; 3] = [Mode::Shared, Mode::PerThread, Mode::Uring];
-
-/// A server in `mode` on two threads, and its context.
-async fn start(mode: Mode) -> (SocketAddr, Arc<Context>) {
-    let ctx = Arc::new(Context::new(Arc::new(Store::new(16)), Settings::default()));
-    let addr = match mode {
-        Mode::Shared => {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(server::serve(listener, ctx.clone()));
-            addr
-        }
-        Mode::PerThread => {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let ctx = ctx.clone();
-            std::thread::spawn(move || server::serve_per_thread(listener, ctx, 2));
-            addr
-        }
-        Mode::Uring => {
-            let addr = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            let ctx = ctx.clone();
-            std::thread::spawn(move || server::serve_uring(addr, ctx, 2));
-            addr
-        }
-    };
-    (addr, ctx)
-}
-
-struct Client {
-    stream: BufReader<TcpStream>,
-}
-
-impl Client {
-    async fn connect(addr: SocketAddr) -> Client {
-        for _ in 0..100 {
-            if let Ok(stream) = TcpStream::connect(addr).await {
-                stream.set_nodelay(true).unwrap();
-                return Client {
-                    stream: BufReader::new(stream),
-                };
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("server never came up on {addr}");
-    }
-
-    async fn send(&mut self, args: &[&str]) {
-        let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
-        self.send_raw(&common::req(&args)).await;
-    }
-
-    async fn send_raw(&mut self, bytes: &[u8]) {
-        self.stream.get_mut().write_all(bytes).await.unwrap();
-    }
-
-    /// The next reply, raw.
-    async fn reply(&mut self) -> String {
-        let reply = tokio::time::timeout(Duration::from_secs(10), read_reply(&mut self.stream))
-            .await
-            .expect("timed out waiting for a reply");
-        String::from_utf8(reply).unwrap()
-    }
-
-    async fn call(&mut self, args: &[&str]) -> String {
-        self.send(args).await;
-        self.reply().await
-    }
-
-    /// Whether a reply arrives within a moment.
-    async fn has_reply(&mut self) -> bool {
-        if !self.stream.buffer().is_empty() {
-            return true;
-        }
-        let mut byte = [0];
-        let peek = self.stream.get_mut().peek(&mut byte);
-        tokio::time::timeout(Duration::from_millis(100), peek)
-            .await
-            .is_ok()
-    }
-}
-
-/// Reads one whole RESP reply.
-async fn read_reply(r: &mut BufReader<TcpStream>) -> Vec<u8> {
-    let mut line = Vec::new();
-    r.read_until(b'\n', &mut line).await.unwrap();
-    assert!(!line.is_empty(), "connection closed");
-    let n = || {
-        std::str::from_utf8(&line[1..line.len() - 2])
-            .unwrap()
-            .parse::<i64>()
-            .unwrap()
-    };
-    match line[0] {
-        b'$' if n() >= 0 => {
-            let mut body = vec![0; n() as usize + 2];
-            r.read_exact(&mut body).await.unwrap();
-            line.extend_from_slice(&body);
-        }
-        b'*' | b'%' if n() >= 0 => {
-            let count = n() * if line[0] == b'%' { 2 } else { 1 };
-            for _ in 0..count {
-                let item = Box::pin(read_reply(r)).await;
-                line.extend_from_slice(&item);
-            }
-        }
-        _ => {}
-    }
-    line
 }
 
 /// Waits until `n` clients are blocked.

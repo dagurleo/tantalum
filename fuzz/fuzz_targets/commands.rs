@@ -2,6 +2,8 @@
 //! every command run against a small store with a memory limit. Nothing may
 //! panic, and the parser must always make progress. Blocking commands that
 //! block stay blocked for a few more commands, which may serve them.
+//! Subscribing commands run on a second client, which the first one's
+//! PUBLISHes reach (subscribed, the first could run little else).
 //!
 //! cargo +nightly fuzz run commands corpus/commands seeds/commands -- -max_total_time=600
 
@@ -25,6 +27,8 @@ fuzz_target!(|data: &[u8]| {
     let ctx = Context::new(Arc::new(store), Settings::default());
     let client = ctx.connect(-1).unwrap();
     let mut session = client.session();
+    let listener_client = ctx.connect(-1).unwrap();
+    let mut listener = listener_client.session();
     let mut ranges = Vec::new();
     let mut out = Vec::new();
     let mut pos = 0;
@@ -34,7 +38,13 @@ fuzz_target!(|data: &[u8]| {
         assert!(next > pos, "parser made no progress");
         if !ranges.is_empty() {
             out.clear();
-            let reply = cmd::execute(&ctx, &mut session, now, &Args::new(data, &ranges), &mut out);
+            let args = Args::new(data, &ranges);
+            let name = args.get(0);
+            let subscribing = name.len() >= 9
+                && name[name.len() - 9..].eq_ignore_ascii_case(b"SUBSCRIBE")
+                || name.eq_ignore_ascii_case(b"RESET");
+            let session = if subscribing { &mut listener } else { &mut session };
+            let reply = cmd::execute(&ctx, session, now, &args, &mut out);
             if let Reply::Block(b) = reply {
                 blocked.push_back(b);
                 if blocked.len() > 8 {
@@ -47,4 +57,6 @@ fuzz_target!(|data: &[u8]| {
     }
     drop(blocked);
     assert_eq!(ctx.store.blocked_clients(), 0);
+    drop(listener);
+    assert_eq!(ctx.pubsub.channel_count(false) + ctx.pubsub.pattern_count(), 0);
 });
