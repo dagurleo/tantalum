@@ -19,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
         shards: 2,
         maxmemory: 1 << 20,
         policy: EvictionPolicy::AllKeysLru,
+        ..Config::default()
     });
     let ctx = Context::new(Arc::new(store), Settings::default());
     let client = ctx.connect(-1).unwrap();

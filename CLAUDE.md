@@ -44,7 +44,9 @@ come before any feature.
 
 ## Before every commit
 
-1. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+1. `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and
+   when a public API changed, `cd fuzz && cargo +nightly fuzz build` (the fuzz
+   target is its own crate, so the rest doesn't compile it).
 2. `tools/speed-guard.sh` says `ok`, or the commit says why not.
 3. For I/O changes, the end-to-end A/B.
 4. The README matches: commands table, design notes, "Not there yet".
