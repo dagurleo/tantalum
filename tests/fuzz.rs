@@ -160,6 +160,12 @@ const COMMANDS: &[&[u8]] = &[
     b"SPUBLISH",
     b"PUBSUB",
     b"RESET",
+    b"MULTI",
+    b"EXEC",
+    b"DISCARD",
+    b"WATCH",
+    b"UNWATCH",
+    b"TIME",
     b"ZRANDMEMBER",
     b"ZSCAN",
     b"ZUNION",
@@ -410,7 +416,14 @@ fn random_commands_never_panic() {
         let mut out = Vec::new();
         let mut blocked = Vec::new();
         for step in 0..100_000 {
-            let args = if rng.below(6) == 0 {
+            // Transactions end soon, so most commands run.
+            let args = if session.in_transaction() && rng.below(4) == 0 {
+                vec![if rng.below(4) == 0 {
+                    b"DISCARD".to_vec()
+                } else {
+                    b"EXEC".to_vec()
+                }]
+            } else if rng.below(6) == 0 {
                 blocking_or_serving(&mut rng)
             } else {
                 let mut args = vec![rng.pick(COMMANDS).to_vec()];

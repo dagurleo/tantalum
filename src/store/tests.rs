@@ -1754,6 +1754,12 @@ mod random_commands {
         b"SPUBLISH",
         b"PUBSUB",
         b"RESET",
+        b"MULTI",
+        b"EXEC",
+        b"DISCARD",
+        b"WATCH",
+        b"UNWATCH",
+        b"TIME",
         b"ZRANDMEMBER",
         b"ZSCAN",
         b"ZUNION",
@@ -1963,7 +1969,14 @@ mod random_commands {
             // Clients blocked meanwhile, served by the commands that follow.
             let mut blocked: Vec<Box<Blocked>> = Vec::new();
             for step in 0..15_000 {
-                let args = if rng.below(6) == 0 {
+                // Transactions end soon, so most commands run.
+                let args = if session.in_transaction() && rng.below(4) == 0 {
+                    vec![if rng.below(4) == 0 {
+                        b"DISCARD".to_vec()
+                    } else {
+                        b"EXEC".to_vec()
+                    }]
+                } else if rng.below(6) == 0 {
                     blocking_or_serving(&mut rng)
                 } else {
                     let mut args = vec![rng.pick(COMMANDS).to_vec()];
@@ -2057,4 +2070,76 @@ fn renaming_a_packed_collection_to_a_long_key() {
         Renamed::Done
     );
     s.check();
+}
+
+/// `WATCH` sees keys go however they go: the expiry sweep, eviction, and
+/// FLUSHALL; and not a key that had expired already when it was watched.
+#[test]
+fn watched_keys_change_when_they_expire_or_are_evicted() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let set = |s: &Store, key: &[u8], expiry: Expiry| {
+        s.set(key, b"v", Condition::Always, expiry, 1, false)
+            .unwrap();
+    };
+    // The sweep.
+    let s = Store::new(1);
+    set(&s, b"due", Expiry::At(50));
+    set(&s, b"gone", Expiry::At(5));
+    let (due, gone) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    assert!(!s.watch(s.key(b"due"), &due, 10));
+    assert!(s.watch(s.key(b"gone"), &gone, 10), "expired when watched");
+    assert!(s.expire_cycle(100) >= 2);
+    assert!(due.load(Ordering::Relaxed), "the sweep removed it");
+    assert!(!gone.load(Ordering::Relaxed), "it was gone already");
+    s.check();
+
+    // Eviction.
+    let s = limited(1_000_000, EvictionPolicy::AllKeysLru);
+    set(&s, b"old", Expiry::Never);
+    let old = Arc::new(AtomicBool::new(false));
+    s.watch(s.key(b"old"), &old, 1);
+    for i in 0..100_000u32 {
+        s.set(
+            &i.to_le_bytes(),
+            &[0; 100],
+            Condition::Always,
+            Expiry::Never,
+            1,
+            false,
+        )
+        .unwrap();
+        // (Reading it would keep it from being evicted.)
+        if old.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    assert!(old.load(Ordering::Relaxed), "never evicted");
+    assert!(get(&s, b"old", 1).is_none(), "evicted, so gone");
+    s.unwatch(s.key(b"old"), &old);
+    s.check();
+
+    // FLUSHALL: keys that existed, not others.
+    let s = Store::new(4);
+    set(&s, b"here", Expiry::Never);
+    let (here, absent) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    s.watch(s.key(b"here"), &here, 1);
+    s.watch(s.key(b"absent"), &absent, 1);
+    s.clear();
+    assert!(here.load(Ordering::Relaxed));
+    assert!(!absent.load(Ordering::Relaxed));
+    s.unwatch(s.key(b"here"), &here);
+    s.unwatch(s.key(b"absent"), &absent);
+    assert_eq!(
+        s.shards
+            .iter()
+            .map(|sh| sh.inner.lock().watched.len())
+            .sum::<usize>(),
+        0
+    );
 }

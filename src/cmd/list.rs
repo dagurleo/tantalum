@@ -487,8 +487,10 @@ pub(super) fn ltrim(
     let trimmed = change(store, args.key(store), now, false, args, |list, _| {
         if let Some(list) = list {
             let range = range(start, stop, list.len());
-            if range.len() != list.len() {
-                list.edit().trim(range.start, range.end);
+            // A change even if nothing goes, as in Redis (WATCH can tell).
+            let edit = list.edit();
+            if range.len() != edit.len() {
+                edit.trim(range.start, range.end);
             }
         }
         Ok(())
@@ -722,6 +724,7 @@ fn blocking_move(
                 keys: 1..2,
                 timeout,
                 kind: Kind::List,
+                nil_bulk: true,
             };
         }
         Err(msg) => resp::write_error(out, msg),
@@ -769,6 +772,7 @@ fn blocking_pop(
         keys,
         timeout,
         kind: Kind::List,
+        nil_bulk: false,
     }
 }
 
@@ -891,5 +895,6 @@ fn mpop(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, at: usiz
         keys,
         timeout,
         kind: Kind::List,
+        nil_bulk: false,
     }
 }

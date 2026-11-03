@@ -3,6 +3,7 @@
 mod hash;
 mod keys;
 mod list;
+mod multi;
 mod pubsub;
 mod set;
 mod zset;
@@ -162,6 +163,12 @@ static COMMANDS: &[Command] = &[
     Command { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: lastsave },
     Command { name: "flushdb", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
     Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: quit },
+    Command { name: "multi", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: NO_KEYS, run: multi::multi },
+    Command { name: "exec", arity: 1, flags: &["noscript", "loading", "stale", "skip_slowlog"], keys: NO_KEYS, run: multi::exec },
+    Command { name: "discard", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: NO_KEYS, run: multi::discard },
+    Command { name: "watch", arity: -2, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: (1, -1, 1), run: multi::watch },
+    Command { name: "unwatch", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: NO_KEYS, run: multi::unwatch },
+    Command { name: "time", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: time },
     Command { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"], keys: NO_KEYS, run: pubsub::reset },
     Command { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::subscribe },
     Command { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::unsubscribe },
@@ -302,15 +309,18 @@ pub fn execute(
             panic!("{} sent: panicking as asked", String::from_utf8_lossy(name));
         }
         unknown_command(out, args);
+        refuse_in_multi(session);
         return Reply::Written;
     };
     if !command.arity_allows(args.len()) {
         wrong_arity(out, command.name);
+        refuse_in_multi(session);
         return Reply::Written;
     }
     if !session.unrestricted {
         if !session.authenticated && !command.flags.contains(&"no_auth") {
             resp::write_error(out, b"NOAUTH Authentication required.");
+            refuse_in_multi(session);
             return Reply::Written;
         }
         // A subscribed RESP2 client may only run the pub/sub ones, PING,
@@ -320,6 +330,20 @@ pub fn execute(
             && !pubsub::allowed_when_subscribed(command.name)
             && pubsub::not_allowed(out, command.name, args)
         {
+            refuse_in_multi(session);
+            return Reply::Written;
+        }
+        // In a transaction, commands wait for EXEC.
+        if let Some(queue) = &mut session.multi
+            && !multi::runs_in_multi(command.name)
+        {
+            if multi::refused_in_multi(command.name) {
+                resp::write_error(out, b"ERR Command not allowed inside a transaction");
+                queue.refused = true;
+            } else {
+                queue.push(args);
+                out.extend_from_slice(b"+QUEUED\r\n");
+            }
             return Reply::Written;
         }
     }
@@ -713,6 +737,10 @@ fn getex(
     };
     let value = update(store, args.key(store), now, |current| match current {
         Some(current) if current.value.kind() != Kind::String => (Update::Touch, Err(())),
+        // PERSIST of a key without a TTL changes nothing (WATCH can tell).
+        Some(current) if persist && matches!(current.expiry, Expiry::Never) => {
+            (Update::Touch, Ok(Some(current.value.share())))
+        }
         Some(current) => (change.clone(), Ok(Some(current.value.share()))),
         None => (Update::Peek, Ok(None)),
     });
@@ -1095,6 +1123,17 @@ fn select(_: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Ve
         Some(_) => resp::write_error(out, b"ERR DB index is out of range"),
         None => resp::write_error(out, NOT_AN_INTEGER),
     }
+    Reply::Written
+}
+
+/// `TIME`: the Unix time, in seconds and microseconds.
+fn time(_: &Context, _: &mut Session, _: Millis, _: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    resp::write_array_header(out, 2);
+    resp::write_bulk(out, now.as_secs().to_string().as_bytes());
+    resp::write_bulk(out, now.subsec_micros().to_string().as_bytes());
     Reply::Written
 }
 
@@ -1744,6 +1783,14 @@ const SYNTAX_ERROR: &[u8] = b"ERR syntax error";
 const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding the wrong kind of value";
 const INVALID_CURSOR: &[u8] = b"ERR invalid cursor";
 const WRONGPASS: &[u8] = b"WRONGPASS invalid username-password pair or user is disabled.";
+
+/// After an error that refuses a command: in a transaction, EXEC will
+/// refuse it all.
+fn refuse_in_multi(session: &mut Session) {
+    if let Some(queue) = &mut session.multi {
+        queue.refused = true;
+    }
+}
 
 fn wrong_arity(out: &mut Vec<u8>, name: &str) {
     resp::write_error(
