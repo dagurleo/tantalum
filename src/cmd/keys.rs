@@ -50,7 +50,7 @@ pub(super) fn keys(
     let everything = pattern == b"*";
     let (mut keys, mut found) = (Vec::new(), 0);
     for shard in 0..store.shard_count() {
-        store.for_each_live(shard, now, |key, _, _, _| {
+        store.for_each_key(shard, now, |key, _| {
             if everything || glob::matches(pattern, key, false) {
                 resp::write_bulk(&mut keys, key);
                 found += 1;

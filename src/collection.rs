@@ -1,0 +1,70 @@
+//! Big collections: lists, sets and sorted sets too big to stay packed in
+//! their entry. Their shard keeps them as objects and commands change them
+//! in place; the store sees them only through this module.
+
+use crate::segment::Kind;
+use crate::set::{self, BigSet};
+
+#[derive(Clone)]
+pub enum Collection {
+    Set(BigSet),
+}
+
+impl std::fmt::Debug for Collection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a big {} ({} bytes)",
+            self.kind().name(),
+            self.allocation_size()
+        )
+    }
+}
+
+impl Collection {
+    pub fn kind(&self) -> Kind {
+        match self {
+            Collection::Set(_) => Kind::Set,
+        }
+    }
+
+    /// Roughly what it takes in memory, for `used_memory` and eviction.
+    pub fn allocation_size(&self) -> usize {
+        match self {
+            Collection::Set(set) => set.allocation_size(),
+        }
+    }
+
+    /// Its contents in the packed format of its kind (however long), for
+    /// snapshots.
+    pub fn to_compact(&self) -> Vec<u8> {
+        match self {
+            Collection::Set(set) => set.to_compact(),
+        }
+    }
+
+    /// The big form of packed bytes (`is_valid` ones).
+    pub fn from_compact(kind: Kind, bytes: &[u8]) -> Self {
+        match kind {
+            Kind::Set => Collection::Set(BigSet::from_compact(bytes)),
+            other => unreachable!("{} isn't a collection", other.name()),
+        }
+    }
+}
+
+/// Whether packed bytes of a collection `kind` are within its limits for
+/// staying packed; past them it becomes a [`Collection`].
+pub fn fits_compact(kind: Kind, bytes: &[u8]) -> bool {
+    match kind {
+        Kind::Set => set::fits_compact(bytes),
+        _ => true,
+    }
+}
+
+/// Whether `bytes` are packed contents of `kind`, for values read from files.
+pub fn is_valid(kind: Kind, bytes: &[u8]) -> bool {
+    match kind {
+        Kind::Set => set::is_valid(bytes),
+        _ => false,
+    }
+}

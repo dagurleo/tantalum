@@ -75,3 +75,77 @@ pub fn execute(ctx: &Context, session: &mut Session, now: u64, args: &[&[u8]]) -
     assert!(matches!(reply, Reply::Written));
     out
 }
+
+/// A parsed RESP reply.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Int(i64),
+    Bulk(Vec<u8>),
+    Simple(String),
+    Error(String),
+    Nil,
+    /// Arrays, sets and maps (flattened).
+    Array(Vec<Value>),
+    Double(String),
+}
+
+impl Value {
+    pub fn int(&self) -> i64 {
+        match self {
+            Value::Int(n) => *n,
+            other => panic!("not an integer: {other:?}"),
+        }
+    }
+
+    pub fn bulks(&self) -> Vec<Vec<u8>> {
+        match self {
+            Value::Array(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Bulk(b) => b.clone(),
+                    other => panic!("not a bulk: {other:?}"),
+                })
+                .collect(),
+            other => panic!("not an array: {other:?}"),
+        }
+    }
+}
+
+/// Parses exactly one reply from `bytes`.
+pub fn parse(bytes: &[u8]) -> Value {
+    let (value, rest) = parse_one(bytes);
+    assert!(rest.is_empty(), "trailing bytes after {value:?}");
+    value
+}
+
+fn parse_one(bytes: &[u8]) -> (Value, &[u8]) {
+    let end = bytes.windows(2).position(|w| w == b"\r\n").expect("a line");
+    let (line, rest) = (&bytes[1..end], &bytes[end + 2..]);
+    let text = || String::from_utf8(line.to_vec()).unwrap();
+    let n = || text().parse::<i64>().unwrap();
+    match bytes[0] {
+        b':' => (Value::Int(n()), rest),
+        b'+' => (Value::Simple(text()), rest),
+        b'-' => (Value::Error(text()), rest),
+        b'_' => (Value::Nil, rest),
+        b',' => (Value::Double(text()), rest),
+        b'$' if n() < 0 => (Value::Nil, rest),
+        b'$' => {
+            let len = n() as usize;
+            (Value::Bulk(rest[..len].to_vec()), &rest[len + 2..])
+        }
+        b'*' if n() < 0 => (Value::Nil, rest),
+        b'*' | b'~' | b'%' => {
+            let count = n() as usize * if bytes[0] == b'%' { 2 } else { 1 };
+            let mut items = Vec::with_capacity(count);
+            let mut rest = rest;
+            for _ in 0..count {
+                let (item, more) = parse_one(rest);
+                items.push(item);
+                rest = more;
+            }
+            (Value::Array(items), rest)
+        }
+        other => panic!("unknown reply type {:?}", other as char),
+    }
+}

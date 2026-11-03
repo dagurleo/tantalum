@@ -42,14 +42,28 @@ pub enum Kind {
     String = 0,
     /// Fields and values, encoded by `hash.rs`.
     Hash = 1,
+    List = 2,
+    /// Packed by `set.rs`, or with `EXTERNAL`, a big set (`collection.rs`).
+    Set = 3,
+    ZSet = 4,
 }
 
 impl Kind {
+    /// The kind in a flags byte: one table load, as every read asks.
+    #[inline]
     pub fn of(flags: u8) -> Kind {
-        match (flags & KIND_MASK) >> KIND_SHIFT {
-            1 => Kind::Hash,
-            _ => Kind::String,
-        }
+        const KINDS: [Kind; 8] = [
+            Kind::String,
+            Kind::Hash,
+            Kind::List,
+            Kind::Set,
+            Kind::ZSet,
+            // Never written.
+            Kind::String,
+            Kind::String,
+            Kind::String,
+        ];
+        KINDS[usize::from((flags & KIND_MASK) >> KIND_SHIFT)]
     }
 
     /// The name `TYPE` replies with.
@@ -57,7 +71,17 @@ impl Kind {
         match self {
             Kind::String => "string",
             Kind::Hash => "hash",
+            Kind::List => "list",
+            Kind::Set => "set",
+            Kind::ZSet => "zset",
         }
+    }
+
+    /// Lists, sets and sorted sets: when too big to stay packed, an
+    /// `EXTERNAL` entry of these kinds is an object (`collection.rs`) rather
+    /// than bytes in an `entry.rs` allocation.
+    pub fn is_collection(self) -> bool {
+        matches!(self, Kind::List | Kind::Set | Kind::ZSet)
     }
 }
 

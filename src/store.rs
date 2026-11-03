@@ -48,6 +48,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
+use crate::collection::{self, Collection};
 use crate::entry::KeyValue;
 use crate::pages;
 pub use crate::segment::Kind;
@@ -192,12 +193,34 @@ impl SharedValue {
     }
 }
 
+/// A big collection and its key, kept by its shard (for `EXTERNAL` entries
+/// of collection kinds).
+struct Object {
+    key: Box<[u8]>,
+    value: Collection,
+}
+
+/// What a removed entry held outside its segment, freed once the shard lock
+/// is released.
+enum Freed {
+    Value(KeyValue),
+    Object(#[allow(dead_code)] Box<Object>),
+}
+
 /// Borrowed view of a live value, valid while the shard lock is held.
 pub struct ValueRef<'a>(Borrowed<'a>, Kind);
 
 enum Borrowed<'a> {
     Inline(&'a [u8]),
     External(&'a KeyValue),
+    Object(&'a Collection),
+}
+
+/// A value as collection commands read it: bytes (a string, a hash, or a
+/// packed collection), or a big collection.
+pub enum View<'a> {
+    Bytes(&'a [u8]),
+    Object(&'a Collection),
 }
 
 impl ValueRef<'_> {
@@ -206,18 +229,31 @@ impl ValueRef<'_> {
         self.1
     }
 
+    /// The bytes of a string or hash, or of a packed collection. Big
+    /// collections have none: check the kind first, or use [`ValueRef::view`].
     pub fn as_bytes(&self) -> &[u8] {
         match self.0 {
             Borrowed::Inline(bytes) => bytes,
             Borrowed::External(kv) => kv.value(),
+            Borrowed::Object(_) => panic!("a big collection has no bytes"),
         }
     }
 
-    /// Takes the value out from under the lock: shares big values, copies small ones.
+    pub fn view(&self) -> View<'_> {
+        match self.0 {
+            Borrowed::Inline(bytes) => View::Bytes(bytes),
+            Borrowed::External(kv) => View::Bytes(kv.value()),
+            Borrowed::Object(collection) => View::Object(collection),
+        }
+    }
+
+    /// Takes the value out from under the lock: shares big values, copies
+    /// small ones. Not for big collections.
     pub fn share(&self) -> SharedValue {
         SharedValue(match self.0 {
             Borrowed::Inline(bytes) => Shared::Owned(bytes.into()),
             Borrowed::External(kv) => Shared::External(kv.clone()),
+            Borrowed::Object(_) => panic!("a big collection can't be shared"),
         })
     }
 }
@@ -310,7 +346,7 @@ pub struct SetOutcome {
     pub wrong_type: bool,
     /// Big values this write displaced, freed when the outcome is dropped
     /// (after the shard lock is released).
-    _garbage: Vec<KeyValue>,
+    _garbage: Vec<Freed>,
 }
 
 /// A live key, as [`Store::update_key`] shows it.
@@ -320,8 +356,87 @@ pub struct Current<'a> {
     pub expiry: Expiry,
 }
 
+/// A live key, as [`Store::update_collection`] shows it.
+pub struct Entry<'a> {
+    pub kind: Kind,
+    /// `Never` or `At`.
+    pub expiry: Expiry,
+    pub value: EntryValue<'a>,
+}
+
+pub enum EntryValue<'a> {
+    /// A string, a hash, or a packed collection.
+    Bytes(&'a [u8]),
+    /// A big collection, to change in place if need be.
+    Object(&'a mut Collection),
+}
+
+fn expiry_of(header: &Header) -> Expiry {
+    match header.deadline {
+        NO_EXPIRY => Expiry::Never,
+        deadline => Expiry::At(deadline),
+    }
+}
+
+/// Why [`Store::apply`] couldn't write.
+enum Retry {
+    /// `maxmemory` needs this many bytes freed first.
+    NeedRoom(usize),
+    /// The shard is out of segment ids (practically unreachable).
+    OutOfIds,
+}
+
+/// Two keys with their shards locked, from [`Store::update_pair`].
+pub struct Pair<'a> {
+    store: &'a Store,
+    low: &'a mut ShardInner,
+    high: Option<&'a mut ShardInner>,
+    low_index: usize,
+    /// Each key, its slot hash and its shard.
+    keys: [(&'a [u8], u32, usize); 2],
+    now: Millis,
+    garbage: Vec<Freed>,
+    /// Whether memory changed in the low and the high shard.
+    changed: [bool; 2],
+    out_of_ids: bool,
+}
+
+impl Pair<'_> {
+    /// Shows `f` key `which` (0 or 1, in the order given) as
+    /// [`Store::update_collection`] does, and applies its update at once.
+    pub fn update<R>(
+        &mut self,
+        which: usize,
+        mut f: impl FnMut(Option<Entry<'_>>) -> (Update, R),
+    ) -> R {
+        let (key, hash, shard) = self.keys[which];
+        let side = usize::from(shard != self.low_index);
+        let inner: &mut ShardInner = match self.high.as_deref_mut() {
+            Some(high) if side == 1 => high,
+            _ => self.low,
+        };
+        let (existing, removed) = inner.lookup_live(hash, key, self.now, &mut self.garbage);
+        let (update, result) =
+            inner.with_entry(existing.as_ref().map(|(loc, h)| (*loc, h)), &mut f);
+        match self.store.apply(
+            inner,
+            hash,
+            key,
+            existing,
+            update,
+            self.now,
+            false,
+            &mut self.garbage,
+        ) {
+            Ok(applied) => self.changed[side] |= applied || removed,
+            Err(_) => self.out_of_ids = true,
+        }
+        result
+    }
+}
+
 /// What [`Store::update_key`] does to the key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Update {
     /// Leaves it as it is, and doesn't count as using it.
     Peek,
@@ -338,6 +453,11 @@ pub enum Update {
     /// Sets its value to this, of this kind, keeping its TTL, or creates it
     /// without one.
     Replace(Kind, Vec<u8>),
+    /// Sets its value to this big collection, keeping its TTL, or creates it
+    /// without one.
+    Object(Collection),
+    /// Its big collection was changed in place.
+    Changed,
 }
 
 fn join(id: usize, offset: usize) -> u32 {
@@ -424,6 +544,9 @@ struct ShardInner {
     /// Entries too big to pack, indexed by their external index.
     externals: Vec<Option<KeyValue>>,
     free_externals: Vec<u32>,
+    /// Big collections, indexed the same way by their entries.
+    objects: Vec<Option<Object>>,
+    free_objects: Vec<u32>,
     mem: Mem,
     /// Footprint as of the last `sync_usage`, of which `unflushed` hasn't
     /// been added to the global counter yet.
@@ -445,6 +568,8 @@ struct Mem {
     live: usize,
     /// Sum of external allocations.
     external: usize,
+    /// Sum of big collections' sizes.
+    objects: usize,
     with_ttl: usize,
     expired: u64,
     evicted: u64,
@@ -467,9 +592,13 @@ impl ShardInner {
         buf: &'a [u8],
         header: &Header,
         externals: &'a [Option<KeyValue>],
+        objects: &'a [Option<Object>],
     ) -> &'a [u8] {
         match &header.body {
             Body::Inline { key, .. } => &buf[key.clone()],
+            Body::External(i) if header.kind().is_collection() => {
+                &objects[*i as usize].as_ref().expect("live object").key
+            }
             Body::External(i) => externals[*i as usize]
                 .as_ref()
                 .expect("live external")
@@ -484,7 +613,7 @@ impl ShardInner {
             let (id, offset) = split(slot.loc);
             let buf = &self.segment(id).buf;
             let header = segment::parse(buf, offset);
-            if Self::entry_key(buf, &header, &self.externals) != key {
+            if Self::entry_key(buf, &header, &self.externals, &self.objects) != key {
                 return false;
             }
             found = Some((slot.loc, header));
@@ -493,11 +622,82 @@ impl ShardInner {
         found
     }
 
+    /// [`ShardInner::lookup`], removing the entry if it has expired (its
+    /// memory into `garbage`). Also returns whether it removed one.
+    fn lookup_live(
+        &mut self,
+        hash: u32,
+        key: &[u8],
+        now: Millis,
+        garbage: &mut Vec<Freed>,
+    ) -> (Option<(u32, Header)>, bool) {
+        let existing = self.lookup(hash, key);
+        if let Some((loc, header)) = &existing
+            && header.is_expired(now)
+        {
+            self.unlink(hash, *loc);
+            garbage.extend(self.kill(*loc));
+            self.mem.expired += 1;
+            return (None, true);
+        }
+        (existing, false)
+    }
+
+    /// Calls `f` with the entry as [`Store::update_collection`] shows it,
+    /// counting any change in size of a big collection it changes.
+    fn with_entry<R>(
+        &mut self,
+        existing: Option<(u32, &Header)>,
+        f: &mut impl FnMut(Option<Entry<'_>>) -> (Update, R),
+    ) -> (Update, R) {
+        let Some((loc, header)) = existing else {
+            return f(None);
+        };
+        let (kind, expiry) = (header.kind(), expiry_of(header));
+        if kind.is_collection()
+            && let Body::External(i) = header.body
+        {
+            let object = &mut self.objects[i as usize]
+                .as_mut()
+                .expect("live object")
+                .value;
+            let before = object.allocation_size();
+            let result = f(Some(Entry {
+                kind,
+                expiry,
+                value: EntryValue::Object(object),
+            }));
+            let after = self.objects[i as usize]
+                .as_ref()
+                .expect("live object")
+                .value
+                .allocation_size();
+            self.mem.objects = self.mem.objects + after - before;
+            return result;
+        }
+        let value = match self.value_ref(loc, header).0 {
+            Borrowed::Inline(bytes) => bytes,
+            Borrowed::External(kv) => kv.value(),
+            Borrowed::Object(_) => unreachable!("objects are collections"),
+        };
+        f(Some(Entry {
+            kind,
+            expiry,
+            value: EntryValue::Bytes(value),
+        }))
+    }
+
     fn value_ref(&self, loc: u32, header: &Header) -> ValueRef<'_> {
         let value = match &header.body {
             Body::Inline { value, .. } => {
                 Borrowed::Inline(&self.segment(split(loc).0).buf[value.clone()])
             }
+            Body::External(i) if header.kind().is_collection() => Borrowed::Object(
+                &self.objects[*i as usize]
+                    .as_ref()
+                    .expect("live object")
+                    .value,
+            ),
             Body::External(i) => {
                 Borrowed::External(self.externals[*i as usize].as_ref().expect("live external"))
             }
@@ -647,6 +847,51 @@ impl ShardInner {
         kv
     }
 
+    fn store_object(&mut self, key: &[u8], value: Collection) -> u32 {
+        self.mem.objects += value.allocation_size();
+        let object = Some(Object {
+            key: key.into(),
+            value,
+        });
+        match self.free_objects.pop() {
+            Some(index) => {
+                self.objects[index as usize] = object;
+                index
+            }
+            None => {
+                self.objects.push(object);
+                (self.objects.len() - 1) as u32
+            }
+        }
+    }
+
+    fn take_object(&mut self, index: u32) -> Object {
+        let object = self.objects[index as usize].take().expect("live object");
+        self.mem.objects -= object.value.allocation_size();
+        self.free_objects.push(index);
+        object
+    }
+
+    /// Puts an object taken with `take_object` back at `index`.
+    fn put_object(&mut self, index: u32, key: &[u8], value: Collection) {
+        self.mem.objects += value.allocation_size();
+        self.objects[index as usize] = Some(Object {
+            key: key.into(),
+            value,
+        });
+        self.free_objects.retain(|&free| free != index);
+    }
+
+    /// What an `EXTERNAL` entry of `kind` holds outside its segment, taken
+    /// out to be freed.
+    fn take_outside(&mut self, kind: Kind, index: u32) -> Freed {
+        if kind.is_collection() {
+            Freed::Object(Box::new(self.take_object(index)))
+        } else {
+            Freed::Value(self.take_external(index))
+        }
+    }
+
     /// The index `store_external` will hand out next.
     fn next_external_index(&self) -> u32 {
         self.free_externals
@@ -658,9 +903,10 @@ impl ShardInner {
     /// Marks the (unlinked) entry at `loc` dead, freeing its segment if that
     /// was the last live entry. Returns its external allocation, if any, for
     /// the caller to free outside the lock or hand out.
-    fn kill(&mut self, loc: u32) -> Option<KeyValue> {
-        match self.mark_dead(loc).body {
-            Body::External(index) => Some(self.take_external(index)),
+    fn kill(&mut self, loc: u32) -> Option<Freed> {
+        let header = self.mark_dead(loc);
+        match header.body {
+            Body::External(index) => Some(self.take_outside(header.kind(), index)),
             Body::Inline { .. } => None,
         }
     }
@@ -694,7 +940,7 @@ impl ShardInner {
     /// Points the key at `hash` to its new entry `new`: instead of `old`,
     /// which is killed (returning its external allocation, if any), or as a
     /// new key.
-    fn replace(&mut self, hash: u32, old: Option<u32>, new: u32) -> Option<KeyValue> {
+    fn replace(&mut self, hash: u32, old: Option<u32>, new: u32) -> Option<Freed> {
         match old {
             Some(old) => {
                 let linked = self.relink(hash, old, new);
@@ -767,7 +1013,7 @@ impl ShardInner {
         mode: Compaction,
         now: Millis,
         hasher: &Hasher,
-        garbage: &mut Vec<KeyValue>,
+        garbage: &mut Vec<Freed>,
     ) -> usize {
         if self.active == Some(id) {
             self.active = None;
@@ -789,7 +1035,10 @@ impl ShardInner {
                 continue;
             }
             let old = join(id, offset);
-            let hash = slot_hash(hasher, Self::entry_key(&seg.buf, &header, &self.externals));
+            let hash = slot_hash(
+                hasher,
+                Self::entry_key(&seg.buf, &header, &self.externals, &self.objects),
+            );
             let expired = header.is_expired(now);
             let usage = header.usage();
             let keep = !expired
@@ -816,7 +1065,7 @@ impl ShardInner {
             let unlinked = self.unlink(hash, old);
             debug_assert!(unlinked, "live entry without a slot");
             if let Body::External(index) = header.body {
-                garbage.push(self.take_external(index));
+                garbage.push(self.take_outside(header.kind(), index));
             }
             if expired {
                 self.mem.expired += 1;
@@ -840,7 +1089,7 @@ impl ShardInner {
         thorough: bool,
         now: Millis,
         hasher: &Hasher,
-        garbage: &mut Vec<KeyValue>,
+        garbage: &mut Vec<Freed>,
     ) -> usize {
         let suitable = |seg: &Segment| seg.live > 0 && (!volatile_only || seg.ttl_live > 0);
         let rounds = if thorough { self.sealed.len() + 1 } else { 1 };
@@ -910,7 +1159,7 @@ impl ShardInner {
         eager: bool,
         now: Millis,
         hasher: &Hasher,
-        garbage: &mut Vec<KeyValue>,
+        garbage: &mut Vec<Freed>,
     ) {
         let divisor = if eager { 10 } else { 4 };
         let dead = self.mem.segment_used - self.mem.live;
@@ -933,12 +1182,7 @@ impl ShardInner {
 
     /// Removes expired entries from segments whose earliest deadline has
     /// passed, scanning at most `EXPIRE_SCAN_BYTES`. Returns how many.
-    fn sweep_expired(
-        &mut self,
-        now: Millis,
-        hasher: &Hasher,
-        garbage: &mut Vec<KeyValue>,
-    ) -> usize {
+    fn sweep_expired(&mut self, now: Millis, hasher: &Hasher, garbage: &mut Vec<Freed>) -> usize {
         let count = self.segments.len();
         let mut budget = EXPIRE_SCAN_BYTES;
         let mut removed = 0;
@@ -963,7 +1207,7 @@ impl ShardInner {
                     continue;
                 }
                 if header.deadline <= now {
-                    let key = Self::entry_key(&seg.buf, &header, &self.externals);
+                    let key = Self::entry_key(&seg.buf, &header, &self.externals, &self.objects);
                     due.push((offset, slot_hash(hasher, key)));
                 } else if next == NO_EXPIRY || header.deadline < next {
                     next = header.deadline;
@@ -1044,7 +1288,7 @@ impl ShardInner {
             let header = segment::parse(buf, offset);
             if !header.is_expired(now) {
                 f(
-                    Self::entry_key(buf, &header, &self.externals),
+                    Self::entry_key(buf, &header, &self.externals, &self.objects),
                     header.kind(),
                 );
             }
@@ -1055,13 +1299,17 @@ impl ShardInner {
 
     /// Bytes this shard is responsible for.
     fn footprint(&self) -> usize {
-        let small_vecs =
-            (self.free_ids.capacity() + self.free_externals.capacity() + self.sealed.capacity())
-                * size_of::<u32>()
-                + self.segments.capacity() * size_of::<Option<Segment>>()
-                + self.externals.capacity() * size_of::<Option<KeyValue>>();
+        let small_vecs = (self.free_ids.capacity()
+            + self.free_externals.capacity()
+            + self.free_objects.capacity()
+            + self.sealed.capacity())
+            * size_of::<u32>()
+            + self.segments.capacity() * size_of::<Option<Segment>>()
+            + self.externals.capacity() * size_of::<Option<KeyValue>>()
+            + self.objects.capacity() * size_of::<Option<Object>>();
         self.mem.segment_resident
             + self.mem.external
+            + self.mem.objects
             + pages::reserved(self.table.allocation_size())
             + small_vecs
     }
@@ -1351,6 +1599,17 @@ impl Store {
         expiry: Expiry,
         now: Millis,
     ) -> Result<(), OutOfMemory> {
+        if kind.is_collection() && !collection::fits_compact(kind, value) {
+            let key = self.key(key);
+            let mut big = Some(Collection::from_compact(kind, value));
+            self.update_collection(key, now, true, |_| {
+                (Update::Object(big.take().expect("written once")), ())
+            })?;
+            if let Expiry::At(deadline) = expiry {
+                self.update_key(key, now, |_| (Update::Expire(Expiry::At(deadline)), ()))?;
+            }
+            return Ok(());
+        }
         self.set_kind(
             self.key(key),
             kind,
@@ -1471,19 +1730,18 @@ impl Store {
             let Some(new) = inner.append(kind, usage, &payload, deadline) else {
                 // Out of segment ids: practically unreachable (4 GB per shard).
                 if let Payload::External(index) = payload {
-                    garbage.push(inner.take_external(index));
+                    garbage.push(Freed::Value(inner.take_external(index)));
                 }
                 self.sync_usage(shard, inner, false);
                 drop(guard);
                 drop(garbage);
                 return Err(OutOfMemory);
             };
-            if let Some(kv) = inner.replace(hash, existing.as_ref().map(|(old, _)| *old), new) {
-                if want_previous && live.is_some() {
+            match inner.replace(hash, existing.as_ref().map(|(old, _)| *old), new) {
+                Some(Freed::Value(kv)) if want_previous && live.is_some() => {
                     previous = Some(SharedValue(Shared::External(kv)));
-                } else {
-                    garbage.push(kv);
                 }
+                freed => garbage.extend(freed),
             }
             if existing.is_some() && live.is_none() {
                 inner.mem.expired += 1;
@@ -1505,7 +1763,7 @@ impl Store {
     /// commands like `INCR`, `GETDEL` or `EXPIRE ... GT` are atomic. Keep `f`
     /// short.
     ///
-    /// Only `SetInt` may need memory (when the value changes length). Like
+    /// Only writing a value may need memory (when it changes length). Like
     /// [`Store::set`], it fails if `maxmemory` can't make room, and `f` runs
     /// again after room was made.
     pub fn update_key<R>(
@@ -1514,134 +1772,149 @@ impl Store {
         now: Millis,
         mut f: impl FnMut(Option<Current<'_>>) -> (Update, R),
     ) -> Result<R, OutOfMemory> {
+        self.update_with(key, now, false, |inner, existing| {
+            f(existing.map(|(loc, header)| Current {
+                value: inner.value_ref(loc, header),
+                expiry: expiry_of(header),
+            }))
+        })
+    }
+
+    /// [`Store::update_key`] for lists, sets and sorted sets, whose big
+    /// forms `f` may change in place (returning [`Update::Changed`]); a
+    /// packed one comes as bytes. With `grows` (commands that may add data,
+    /// Redis' `denyoom`), it refuses with `OutOfMemory` when memory is over
+    /// `maxmemory` and eviction can't make room first. As then nothing has
+    /// changed yet, `f` doesn't run again after that.
+    pub fn update_collection<R>(
+        &self,
+        key: Key<'_>,
+        now: Millis,
+        grows: bool,
+        mut f: impl FnMut(Option<Entry<'_>>) -> (Update, R),
+    ) -> Result<R, OutOfMemory> {
+        self.update_with(key, now, grows, |inner, existing| {
+            inner.with_entry(existing, &mut f)
+        })
+    }
+
+    /// Runs `f` with both keys' shards locked, for commands that change two
+    /// keys at once, such as `SMOVE`: `f` reads and changes each through
+    /// [`Pair::update`]. The locks are taken in shard order, as `rename`
+    /// takes them, so this can't deadlock. `grows` as in
+    /// [`Store::update_collection`].
+    pub fn update_pair<R>(
+        &self,
+        a: Key<'_>,
+        b: Key<'_>,
+        now: Millis,
+        grows: bool,
+        f: impl FnOnce(&mut Pair<'_>) -> R,
+    ) -> Result<R, OutOfMemory> {
+        let (hash_a, ia) = self.locate(a.hash);
+        let (hash_b, ib) = self.locate(b.hash);
+        if grows && !self.room_for(ia, hash_a, a.bytes.len() + b.bytes.len(), now) {
+            return Err(OutOfMemory);
+        }
+        let mut low = self.shards[ia.min(ib)].inner.lock();
+        let mut high = (ia != ib).then(|| self.shards[ia.max(ib)].inner.lock());
+        let mut pair = Pair {
+            store: self,
+            low: &mut low,
+            high: high.as_deref_mut(),
+            low_index: ia.min(ib),
+            keys: [(a.bytes, hash_a, ia), (b.bytes, hash_b, ib)],
+            now,
+            garbage: Vec::new(),
+            changed: [false; 2],
+            out_of_ids: false,
+        };
+        let result = f(&mut pair);
+        let Pair {
+            mut garbage,
+            changed,
+            out_of_ids,
+            ..
+        } = pair;
+        let eager = self.near_limit();
+        if changed[0] {
+            low.maybe_defrag(eager, now, &self.hasher, &mut garbage);
+            self.sync_usage(&self.shards[ia.min(ib)], &mut low, false);
+        }
+        if let Some(high) = high.as_deref_mut()
+            && changed[1]
+        {
+            high.maybe_defrag(eager, now, &self.hasher, &mut garbage);
+            self.sync_usage(&self.shards[ia.max(ib)], high, false);
+        }
+        drop((low, high));
+        drop(garbage); // frees values outside the locks
+        if out_of_ids {
+            return Err(OutOfMemory);
+        }
+        Ok(result)
+    }
+
+    /// For commands that may add data: whether there's room under
+    /// `maxmemory` for about `incoming` more bytes, evicting if the policy
+    /// allows.
+    fn room_for(&self, home: usize, seed: u32, incoming: usize, now: Millis) -> bool {
+        let incoming = incoming + 64;
+        self.maxmemory == 0
+            || self.used_memory() + incoming <= self.maxmemory
+            || self.make_room(home, seed, incoming, now)
+    }
+
+    /// The single-key write loop: looks the key up, lets `view` decide the
+    /// update, applies it, and evicts and retries if a write needs room.
+    fn update_with<R>(
+        &self,
+        key: Key<'_>,
+        now: Millis,
+        grows: bool,
+        mut view: impl FnMut(&mut ShardInner, Option<(u32, &Header)>) -> (Update, R),
+    ) -> Result<R, OutOfMemory> {
         let (hash, index) = self.locate(key.hash);
         let key = key.bytes;
         let shard = &self.shards[index];
+        if grows && !self.room_for(index, hash, key.len(), now) {
+            return Err(OutOfMemory);
+        }
         let mut attempts = 0;
         loop {
             let mut garbage = Vec::new();
             let mut guard = shard.inner.lock();
             let inner = &mut *guard;
-            let mut existing = inner.lookup(hash, key);
-            let mut changed = false;
-            if let Some((loc, header)) = &existing
-                && header.is_expired(now)
-            {
-                inner.unlink(hash, *loc);
-                garbage.extend(inner.kill(*loc));
-                inner.mem.expired += 1;
-                existing = None;
-                changed = true;
-            }
-            let (update, result) = f(existing.as_ref().map(|(loc, header)| Current {
-                value: inner.value_ref(*loc, header),
-                expiry: match header.deadline {
-                    NO_EXPIRY => Expiry::Never,
-                    deadline => Expiry::At(deadline),
-                },
-            }));
-            let mut digits = itoa::Buffer::new();
-            let write = match &update {
-                Update::SetInt(n) => Some((Kind::String, digits.format(*n).as_bytes())),
-                Update::Replace(kind, value) => Some((*kind, value.as_slice())),
-                _ => None,
-            };
-            match (&update, &existing) {
-                (Update::SetInt(_) | Update::Replace(..), _) => {
-                    let (kind, value) = write.expect("a write");
-                    // Same length and kind: overwrite the bytes where they are.
-                    let in_place = existing
-                        .as_ref()
-                        .and_then(|(loc, header)| match &header.body {
-                            Body::Inline { value: range, .. }
-                                if range.len() == value.len() && header.kind() == kind =>
-                            {
-                                Some((*loc, header, range.clone()))
-                            }
-                            _ => None,
-                        });
-                    if let Some((loc, header, range)) = in_place {
-                        inner.segment_mut(split(loc).0).buf[range].copy_from_slice(value);
-                        inner.touch(loc, header);
-                        inner.mem.writes += 1;
-                    } else {
-                        let (old, deadline, usage) = match &existing {
-                            Some((loc, header)) => (
-                                Some(*loc),
-                                header.deadline,
-                                (header.usage() + 1).min(MAX_USAGE),
-                            ),
-                            None => (None, NO_EXPIRY, 0),
-                        };
-                        // Only a huge key makes this external.
-                        let external = (key.len() + value.len() + 20 > INLINE_MAX)
-                            .then(|| KeyValue::new(key, value));
-                        let needed = match &external {
-                            Some(kv) => {
-                                kv.allocation_size()
-                                    + segment::encoded_len(
-                                        &Payload::External(inner.next_external_index()),
-                                        deadline,
-                                    )
-                            }
-                            None => segment::encoded_len(&Payload::Inline { key, value }, deadline),
-                        };
-                        if self.maxmemory != 0
-                            && attempts < 2
-                            && self.used_memory() + needed > self.maxmemory
-                        {
-                            if changed {
-                                self.sync_usage(shard, inner, false);
-                            }
-                            drop(guard);
-                            drop(garbage);
-                            attempts += 1;
-                            if !self.make_room(index, hash, needed, now) {
-                                return Err(OutOfMemory);
-                            }
-                            continue;
-                        }
-                        let payload = match external {
-                            Some(kv) => Payload::External(inner.store_external(kv)),
-                            None => Payload::Inline { key, value },
-                        };
-                        let Some(new) = inner.append(kind, usage, &payload, deadline) else {
-                            // Out of segment ids: practically unreachable.
-                            if let Payload::External(index) = payload {
-                                garbage.push(inner.take_external(index));
-                            }
-                            self.sync_usage(shard, inner, false);
-                            drop(guard);
-                            drop(garbage);
-                            return Err(OutOfMemory);
-                        };
-                        garbage.extend(inner.replace(hash, old, new));
-                        inner.mem.writes += 1;
-                        changed = true;
+            let (existing, mut changed) = inner.lookup_live(hash, key, now, &mut garbage);
+            let (update, result) = view(inner, existing.as_ref().map(|(loc, h)| (*loc, h)));
+            match self.apply(
+                inner,
+                hash,
+                key,
+                existing,
+                update,
+                now,
+                attempts < 2,
+                &mut garbage,
+            ) {
+                Ok(applied) => changed |= applied,
+                Err(Retry::NeedRoom(needed)) => {
+                    if changed {
+                        self.sync_usage(shard, inner, false);
                     }
-                }
-                (Update::Peek, _) | (_, None) => {}
-                (Update::Touch, Some((loc, header))) => inner.touch(*loc, header),
-                (Update::Delete, Some((loc, _))) => {
-                    inner.unlink(hash, *loc);
-                    garbage.extend(inner.kill(*loc));
-                    inner.mem.writes += 1;
-                    changed = true;
-                }
-                (Update::Expire(expiry), Some((loc, header))) => {
-                    let deadline = match *expiry {
-                        Expiry::Keep => header.deadline,
-                        Expiry::Never => NO_EXPIRY,
-                        Expiry::At(deadline) => deadline,
-                    };
-                    if deadline != NO_EXPIRY && deadline <= now {
-                        inner.unlink(hash, *loc);
-                        garbage.extend(inner.kill(*loc));
-                    } else {
-                        inner.set_deadline(hash, key, *loc, header, deadline);
+                    drop(guard);
+                    drop(garbage);
+                    attempts += 1;
+                    if !self.make_room(index, hash, needed, now) {
+                        return Err(OutOfMemory);
                     }
-                    inner.mem.writes += 1;
-                    changed = true;
+                    continue;
+                }
+                Err(Retry::OutOfIds) => {
+                    self.sync_usage(shard, inner, false);
+                    drop(guard);
+                    drop(garbage);
+                    return Err(OutOfMemory);
                 }
             }
             if changed {
@@ -1652,6 +1925,164 @@ impl Store {
             drop(garbage); // frees values outside the lock
             return Ok(result);
         }
+    }
+
+    /// Applies `update` to the key's live entry (`existing`) under its
+    /// shard's lock. Returns whether memory changed. A write that needs
+    /// room under `maxmemory` returns [`Retry::NeedRoom`] instead, if
+    /// `may_evict`, having changed nothing.
+    #[allow(clippy::too_many_arguments)]
+    fn apply(
+        &self,
+        inner: &mut ShardInner,
+        hash: u32,
+        key: &[u8],
+        existing: Option<(u32, Header)>,
+        update: Update,
+        now: Millis,
+        may_evict: bool,
+        garbage: &mut Vec<Freed>,
+    ) -> Result<bool, Retry> {
+        let mut digits = itoa::Buffer::new();
+        let collection = match (update, &existing) {
+            (Update::SetInt(n), _) => {
+                let value = digits.format(n).as_bytes();
+                return self.write_bytes(
+                    inner,
+                    hash,
+                    key,
+                    &existing,
+                    Kind::String,
+                    value,
+                    may_evict,
+                    garbage,
+                );
+            }
+            (Update::Replace(kind, value), _)
+                if !kind.is_collection() || key.len() + value.len() + 20 <= INLINE_MAX =>
+            {
+                return self.write_bytes(
+                    inner, hash, key, &existing, kind, &value, may_evict, garbage,
+                );
+            }
+            // A packed collection with a key too big to pack it with.
+            (Update::Replace(kind, value), _) => Collection::from_compact(kind, &value),
+            (Update::Object(collection), _) => collection,
+            (Update::Peek, _) | (_, None) => return Ok(false),
+            (Update::Touch, Some((loc, header))) => {
+                inner.touch(*loc, header);
+                return Ok(false);
+            }
+            (Update::Changed, Some((loc, header))) => {
+                // `with_entry` already counted its new size.
+                inner.touch(*loc, header);
+                inner.mem.writes += 1;
+                return Ok(true);
+            }
+            (Update::Delete, Some((loc, _))) => {
+                inner.unlink(hash, *loc);
+                garbage.extend(inner.kill(*loc));
+                inner.mem.writes += 1;
+                return Ok(true);
+            }
+            (Update::Expire(expiry), Some((loc, header))) => {
+                let deadline = match expiry {
+                    Expiry::Keep => header.deadline,
+                    Expiry::Never => NO_EXPIRY,
+                    Expiry::At(deadline) => deadline,
+                };
+                if deadline != NO_EXPIRY && deadline <= now {
+                    inner.unlink(hash, *loc);
+                    garbage.extend(inner.kill(*loc));
+                } else {
+                    inner.set_deadline(hash, key, *loc, header, deadline);
+                }
+                inner.mem.writes += 1;
+                return Ok(true);
+            }
+        };
+        // A big collection: an entry pointing at it, keeping the TTL.
+        let (old, deadline, usage) = match &existing {
+            Some((loc, header)) => (
+                Some(*loc),
+                header.deadline,
+                (header.usage() + 1).min(MAX_USAGE),
+            ),
+            None => (None, NO_EXPIRY, 0),
+        };
+        let kind = collection.kind();
+        let index = inner.store_object(key, collection);
+        let Some(new) = inner.append(kind, usage, &Payload::External(index), deadline) else {
+            garbage.push(Freed::Object(Box::new(inner.take_object(index))));
+            return Err(Retry::OutOfIds);
+        };
+        garbage.extend(inner.replace(hash, old, new));
+        inner.mem.writes += 1;
+        Ok(true)
+    }
+
+    /// Writes `value` of `kind` as the key's value: in place when it's as
+    /// long as the old one and of the same kind, otherwise as a new entry.
+    #[allow(clippy::too_many_arguments)]
+    fn write_bytes(
+        &self,
+        inner: &mut ShardInner,
+        hash: u32,
+        key: &[u8],
+        existing: &Option<(u32, Header)>,
+        kind: Kind,
+        value: &[u8],
+        may_evict: bool,
+        garbage: &mut Vec<Freed>,
+    ) -> Result<bool, Retry> {
+        if let Some((loc, header)) = existing
+            && let Body::Inline { value: range, .. } = &header.body
+            && range.len() == value.len()
+            && header.kind() == kind
+        {
+            inner.segment_mut(split(*loc).0).buf[range.clone()].copy_from_slice(value);
+            inner.touch(*loc, header);
+            inner.mem.writes += 1;
+            return Ok(false);
+        }
+        let (old, deadline, usage) = match existing {
+            Some((loc, header)) => (
+                Some(*loc),
+                header.deadline,
+                (header.usage() + 1).min(MAX_USAGE),
+            ),
+            None => (None, NO_EXPIRY, 0),
+        };
+        // Only a huge key makes this external.
+        let external =
+            (key.len() + value.len() + 20 > INLINE_MAX).then(|| KeyValue::new(key, value));
+        let needed = match &external {
+            Some(kv) => {
+                kv.allocation_size()
+                    + segment::encoded_len(
+                        &Payload::External(inner.next_external_index()),
+                        deadline,
+                    )
+            }
+            None => segment::encoded_len(&Payload::Inline { key, value }, deadline),
+        };
+        if may_evict && self.maxmemory != 0 && self.used_memory() + needed > self.maxmemory {
+            return Err(Retry::NeedRoom(needed));
+        }
+        let payload = match external {
+            Some(kv) => Payload::External(inner.store_external(kv)),
+            None => Payload::Inline { key, value },
+        };
+        let Some(new) = inner.append(kind, usage, &payload, deadline) else {
+            // Out of segment ids: practically unreachable.
+            if let Payload::External(index) = payload {
+                garbage.push(Freed::Value(inner.take_external(index)));
+            }
+            return Err(Retry::OutOfIds);
+        };
+        garbage.extend(inner.replace(hash, old, new));
+        inner.mem.writes += 1;
+        Ok(true)
     }
 
     /// Removes every key. Not atomic across shards: writes running meanwhile
@@ -1784,37 +2215,57 @@ impl Store {
             if only_if_absent && live.is_some() {
                 return Ok(Renamed::Exists);
             }
-            // The value, out from under the source's segment, which the
-            // destination's appends may share.
-            let value = src.value_ref(loc, &header).share();
-            let payload = if to.bytes.len() + value.as_bytes().len() + 20 > INLINE_MAX {
-                let kv = match prepared.take() {
-                    Some((copied, kv)) if same_bytes(copied.as_bytes(), value.as_bytes()) => kv,
-                    _ if attempts < 2 => {
-                        // Copy it without the locks, then check again.
-                        drop((low, high));
-                        attempts += 1;
-                        let kv = KeyValue::new(to.bytes, value.as_bytes());
-                        prepared = Some((value, kv));
-                        continue;
+            // A big collection moves as it is: its object goes to the
+            // destination's shard, under the new name.
+            let moved = header.kind().is_collection() && matches!(header.body, Body::External(_));
+            let new = if let (true, Body::External(i)) = (moved, &header.body) {
+                let object = src.take_object(*i);
+                let target = target!();
+                let index = target.store_object(to.bytes, object.value);
+                let entry = Payload::External(index);
+                match target.append(header.kind(), header.usage(), &entry, header.deadline) {
+                    Some(new) => new,
+                    None => {
+                        // Out of segment ids (practically unreachable): put it back.
+                        let object = target!().take_object(index);
+                        src.put_object(*i, from.bytes, object.value);
+                        return Err(OutOfMemory);
                     }
-                    _ => KeyValue::new(to.bytes, value.as_bytes()),
-                };
-                Payload::External(target!().store_external(kv))
+                }
             } else {
-                Payload::Inline {
-                    key: to.bytes,
-                    value: value.as_bytes(),
-                }
-            };
-            let Some(new) =
-                target!().append(header.kind(), header.usage(), &payload, header.deadline)
-            else {
-                // Out of segment ids: practically unreachable (4 GB per shard).
-                if let Payload::External(index) = payload {
-                    garbage.push(target!().take_external(index));
-                }
-                return Err(OutOfMemory);
+                // The value, out from under the source's segment, which the
+                // destination's appends may share.
+                let value = src.value_ref(loc, &header).share();
+                let payload = if to.bytes.len() + value.as_bytes().len() + 20 > INLINE_MAX {
+                    let kv = match prepared.take() {
+                        Some((copied, kv)) if same_bytes(copied.as_bytes(), value.as_bytes()) => kv,
+                        _ if attempts < 2 => {
+                            // Copy it without the locks, then check again.
+                            drop((low, high));
+                            attempts += 1;
+                            let kv = KeyValue::new(to.bytes, value.as_bytes());
+                            prepared = Some((value, kv));
+                            continue;
+                        }
+                        _ => KeyValue::new(to.bytes, value.as_bytes()),
+                    };
+                    Payload::External(target!().store_external(kv))
+                } else {
+                    Payload::Inline {
+                        key: to.bytes,
+                        value: value.as_bytes(),
+                    }
+                };
+                let appended =
+                    target!().append(header.kind(), header.usage(), &payload, header.deadline);
+                let Some(new) = appended else {
+                    // Out of segment ids: practically unreachable (4 GB per shard).
+                    if let Payload::External(index) = payload {
+                        garbage.push(Freed::Value(target!().take_external(index)));
+                    }
+                    return Err(OutOfMemory);
+                };
+                new
             };
             let old = existing.as_ref().map(|(old, _)| *old);
             let expired = existing.is_some() && live.is_none();
@@ -1825,7 +2276,11 @@ impl Store {
             }
             target.mem.writes += 1;
             src.unlink(from_hash, loc);
-            garbage.extend(src.kill(loc));
+            if moved {
+                src.mark_dead(loc); // its object went with it
+            } else {
+                garbage.extend(src.kill(loc));
+            }
             src.mem.writes += 1;
             let eager = self.near_limit();
             src.maybe_defrag(eager, now, &self.hasher, &mut garbage);
@@ -1855,15 +2310,40 @@ impl Store {
                 if header.is_dead() || header.is_expired(now) {
                     continue;
                 }
-                let key = ShardInner::entry_key(&seg.buf, &header, &inner.externals);
+                let packed;
+                let key =
+                    ShardInner::entry_key(&seg.buf, &header, &inner.externals, &inner.objects);
                 let value = match &header.body {
                     Body::Inline { value, .. } => &seg.buf[value.clone()],
+                    Body::External(i) if header.kind().is_collection() => {
+                        packed = inner.objects[*i as usize]
+                            .as_ref()
+                            .expect("live object")
+                            .value
+                            .to_compact();
+                        &packed
+                    }
                     Body::External(i) => inner.externals[*i as usize]
                         .as_ref()
                         .expect("live external")
                         .value(),
                 };
                 f(key, header.kind(), value, header.deadline);
+            }
+        }
+    }
+
+    /// Calls `f` with the key and kind of every live entry in shard
+    /// `index`, under its lock.
+    pub fn for_each_key(&self, index: usize, now: Millis, mut f: impl FnMut(&[u8], Kind)) {
+        let inner = self.shards[index].inner.lock();
+        for seg in inner.segments.iter().flatten() {
+            for (_, header) in seg.entries() {
+                if !header.is_dead() && !header.is_expired(now) {
+                    let key =
+                        ShardInner::entry_key(&seg.buf, &header, &inner.externals, &inner.objects);
+                    f(key, header.kind());
+                }
             }
         }
     }

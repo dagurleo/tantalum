@@ -13,6 +13,7 @@ impl ShardInner {
         };
         let mut live_locs = HashSet::new();
         let mut externals_seen = vec![false; self.externals.len()];
+        let mut objects_seen = vec![false; self.objects.len()];
         for (id, seg) in self.segments.iter().enumerate() {
             let free = self.free_ids.contains(&(id as u32));
             let Some(seg) = seg else {
@@ -40,9 +41,17 @@ impl ShardInner {
                 }
                 if let Body::External(index) = header.body {
                     let index = index as usize;
-                    assert!(!externals_seen[index], "external {index} referenced twice");
-                    externals_seen[index] = true;
-                    mem.external += self.externals[index].as_ref().unwrap().allocation_size();
+                    if header.kind().is_collection() {
+                        assert!(!objects_seen[index], "object {index} referenced twice");
+                        objects_seen[index] = true;
+                        let object = self.objects[index].as_ref().unwrap();
+                        assert_eq!(object.value.kind(), header.kind(), "object {index} kind");
+                        mem.objects += object.value.allocation_size();
+                    } else {
+                        assert!(!externals_seen[index], "external {index} referenced twice");
+                        externals_seen[index] = true;
+                        mem.external += self.externals[index].as_ref().unwrap().allocation_size();
+                    }
                 }
                 live_locs.insert(join(id, offset));
             }
@@ -70,6 +79,17 @@ impl ShardInner {
             );
             assert_eq!(kv.is_none(), self.free_externals.contains(&(index as u32)));
         }
+        for (index, object) in self.objects.iter().enumerate() {
+            assert_eq!(
+                object.is_some(),
+                objects_seen[index],
+                "object {index} leaked or dangling"
+            );
+            assert_eq!(
+                object.is_none(),
+                self.free_objects.contains(&(index as u32))
+            );
+        }
         let mut slot_locs = HashSet::new();
         for slot in self.table.iter() {
             assert!(slot_locs.insert(slot.loc), "two slots point at one entry");
@@ -80,7 +100,7 @@ impl ShardInner {
             let (id, offset) = split(slot.loc);
             let seg = self.segment(id);
             let header = segment::parse(&seg.buf, offset);
-            let key = Self::entry_key(&seg.buf, &header, &self.externals);
+            let key = Self::entry_key(&seg.buf, &header, &self.externals, &self.objects);
             assert_eq!(slot_hash(hasher, key), slot.hash, "slot hash");
             assert_eq!(
                 self.lookup(slot.hash, key).map(|(loc, _)| loc),
@@ -543,7 +563,7 @@ fn matches_a_model() {
                         };
                         model.insert(key, (kind, value, deadline));
                     }
-                    (Update::Peek, _) => unreachable!(),
+                    (Update::Peek | Update::Object(_) | Update::Changed, _) => unreachable!(),
                 }
             }
             85..88 => {
@@ -1392,5 +1412,126 @@ fn scan_never_splits_keys_with_the_same_hash() {
         let mut expected: Vec<_> = colliding.iter().chain(&others).cloned().collect();
         expected.sort();
         assert_eq!(seen, expected, "count {count}");
+    }
+}
+
+/// Big collections as objects: made, changed in place, renamed, given and
+/// past TTLs, overwritten, evicted and moved by compaction, with the books
+/// checked throughout.
+#[test]
+fn big_collections_keep_the_books() {
+    use crate::set::BigSet;
+    for policy in [EvictionPolicy::NoEviction, EvictionPolicy::AllKeysLru] {
+        let s = Store::with_config(Config {
+            shards: 2,
+            maxmemory: 2 << 20,
+            policy,
+            ..Config::default()
+        });
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut now: Millis = 1;
+        let big = |n: u64, tag: u64| {
+            let mut set = BigSet::with_capacity(n as usize);
+            for i in 0..n {
+                set.insert(format!("{tag}-{i}").as_bytes());
+            }
+            Collection::Set(set)
+        };
+        for step in 0..4_000u64 {
+            let key = format!("c{}", rng.below(40)).into_bytes();
+            let k = s.key(&key);
+            match rng.below(9) {
+                0 | 1 => {
+                    let mut made = Some(big(200 + rng.below(300), step));
+                    let _ = s.update_collection(k, now, true, |_| {
+                        (Update::Object(made.take().expect("once")), ())
+                    });
+                }
+                2 | 3 => {
+                    let extra = rng.below(50);
+                    let _ = s.update_collection(k, now, true, |entry| match entry {
+                        Some(Entry {
+                            value: EntryValue::Object(Collection::Set(set)),
+                            ..
+                        }) => {
+                            for i in 0..extra {
+                                set.insert(format!("x{step}-{i}").as_bytes());
+                            }
+                            set.remove(b"0-0");
+                            (Update::Changed, ())
+                        }
+                        _ => (Update::Peek, ()),
+                    });
+                }
+                4 => {
+                    let to = format!("c{}", rng.below(40)).into_bytes();
+                    let _ = s.rename(k, s.key(&to), rng.below(2) == 0, now);
+                }
+                5 => {
+                    let expiry = Expiry::At(now + 1 + rng.below(30));
+                    s.update_key(k, now, |c| {
+                        (
+                            if c.is_some() {
+                                Update::Expire(expiry)
+                            } else {
+                                Update::Peek
+                            },
+                            (),
+                        )
+                    })
+                    .unwrap();
+                }
+                6 => {
+                    // A string over it, or a delete.
+                    if rng.below(2) == 0 {
+                        let _ = s.set(&key, b"plain", Condition::Always, Expiry::Never, now, false);
+                    } else {
+                        s.update_key(k, now, |c| {
+                            (
+                                if c.is_some() {
+                                    Update::Delete
+                                } else {
+                                    Update::Peek
+                                },
+                                (),
+                            )
+                        })
+                        .unwrap();
+                    }
+                }
+                7 => {
+                    // Some strings, to fill and churn segments.
+                    for i in 0..50 {
+                        let _ = s.set(
+                            format!("str{}", rng.below(2_000) + i).as_bytes(),
+                            &[1; 300],
+                            Condition::Always,
+                            Expiry::Never,
+                            now,
+                            false,
+                        );
+                    }
+                }
+                _ => {
+                    now += rng.below(20);
+                    s.expire_cycle(now);
+                }
+            }
+            if step % 500 == 0 {
+                s.check();
+            }
+        }
+        s.check();
+        // A big set reads back as one, and snapshots see it packed.
+        let mut sets = 0;
+        for shard in 0..s.shard_count() {
+            s.for_each_live(shard, now, |_, kind, value, _| {
+                if kind == Kind::Set {
+                    assert!(crate::set::is_valid(value));
+                    sets += 1;
+                }
+            });
+        }
+        assert!(sets > 0, "{policy:?}: no sets survived");
     }
 }

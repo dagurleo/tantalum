@@ -2,6 +2,7 @@
 
 mod hash;
 mod keys;
+mod set;
 
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -172,6 +173,23 @@ static COMMANDS: &[Command] = &[
     Command { name: "hvals", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hvals },
     Command { name: "hstrlen", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hstrlen },
     Command { name: "hscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: hash::hscan },
+    Command { name: "sadd", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: set::sadd },
+    Command { name: "sismember", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: set::sismember },
+    Command { name: "smembers", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: set::smembers },
+    Command { name: "srem", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: set::srem },
+    Command { name: "scard", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: set::scard },
+    Command { name: "smismember", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: set::smismember },
+    Command { name: "spop", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: set::spop },
+    Command { name: "srandmember", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: set::srandmember },
+    Command { name: "smove", arity: 4, flags: &["write", "fast"], keys: (1, 2, 1), run: set::smove },
+    Command { name: "sinter", arity: -2, flags: &["readonly"], keys: ALL_KEYS, run: set::sinter },
+    Command { name: "sinterstore", arity: -3, flags: &["write", "denyoom"], keys: ALL_KEYS, run: set::sinterstore },
+    Command { name: "sintercard", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: set::sintercard },
+    Command { name: "sunion", arity: -2, flags: &["readonly"], keys: ALL_KEYS, run: set::sunion },
+    Command { name: "sunionstore", arity: -3, flags: &["write", "denyoom"], keys: ALL_KEYS, run: set::sunionstore },
+    Command { name: "sdiff", arity: -2, flags: &["readonly"], keys: ALL_KEYS, run: set::sdiff },
+    Command { name: "sdiffstore", arity: -3, flags: &["write", "denyoom"], keys: ALL_KEYS, run: set::sdiffstore },
+    Command { name: "sscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: set::sscan },
 ];
 
 /// Runs one command and writes its reply to `out`. `args` must be non-empty.
@@ -1359,6 +1377,8 @@ enum Scan {
     Keys,
     /// `HSCAN`, which also takes `NOVALUES`.
     Hash,
+    /// `SSCAN` and `ZSCAN`.
+    Other,
 }
 
 /// `MATCH`, `COUNT` and `TYPE` or `NOVALUES`.

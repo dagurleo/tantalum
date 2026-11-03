@@ -3,19 +3,22 @@
 //! Redis' RDB files, though in a format of our own:
 //!
 //! ```text
-//! "TANTALUM SNAPSHOT 2\n"
+//! "TANTALUM SNAPSHOT 3\n"
 //! per key:  kind, key length, key, value length, value, expiry
 //! trailer:  0x00, key count (u64 LE), CRC32 of everything before it (u32 LE)
 //! ```
 //!
-//! The kind is 0x01 for a string and 0x02 for a hash, whose value is its
-//! encoding in memory (see `hash.rs`). Lengths and expiries are LEB128
-//! varints; an expiry is a Unix time in milliseconds, 0 for none, so TTLs
-//! carry over a restart and keys that expired meanwhile are dropped on load.
+//! The kind is 0x01 for a string, 0x02 a hash, 0x03 a list, 0x04 a set and
+//! 0x05 a sorted set; a collection's value is its packed encoding (see
+//! `hash.rs`, `set.rs`), however big it is in memory. Lengths and expiries
+//! are LEB128 varints; an expiry is a Unix time in milliseconds, 0 for none,
+//! so TTLs carry over a restart and keys that expired meanwhile are dropped
+//! on load.
 //!
-//! Version 1 is the same without hashes. A save writes it when it holds no
-//! hashes, so a build from before hashes can still read it (after a
-//! rollback, say), and loading reads both.
+//! Version 1 has only strings, version 2 adds hashes and version 3 the
+//! other collections. A save writes the lowest version that holds its data,
+//! so a build from before a kind existed can still read a snapshot without
+//! it (after a rollback, say), and loading reads every version.
 //!
 //! A save copies one shard at a time under its lock, so it's consistent per
 //! shard rather than across the whole store: a write made during a save may
@@ -31,16 +34,31 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
-use crate::hash;
 use crate::store::{Expiry, Kind, NO_EXPIRY, Store};
+use crate::{collection, hash};
 
 /// The header, with the version in its next-to-last byte.
-const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 2\n";
+const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 3\n";
 const VERSION_AT: usize = MAGIC.len() - 2;
 const MAGIC_V1: &[u8] = b"TANTALUM SNAPSHOT 1\n";
+const MAGIC_V2: &[u8] = b"TANTALUM SNAPSHOT 2\n";
 const STRING: u8 = 1;
 const HASH: u8 = 2;
+const LIST: u8 = 3;
+const SET: u8 = 4;
+const ZSET: u8 = 5;
 const END: u8 = 0;
+
+/// A record's tag and the first format version that has it.
+fn tag_of(kind: Kind) -> (u8, u8) {
+    match kind {
+        Kind::String => (STRING, b'1'),
+        Kind::Hash => (HASH, b'2'),
+        Kind::List => (LIST, b'3'),
+        Kind::Set => (SET, b'3'),
+        Kind::ZSet => (ZSET, b'3'),
+    }
+}
 
 fn unix_ms() -> i64 {
     SystemTime::now()
@@ -119,13 +137,9 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
     for shard in 0..store.shard_count() {
         buf.clear();
         store.for_each_live(shard, now, |key, kind, value, deadline| {
-            buf.push(match kind {
-                Kind::String => STRING,
-                Kind::Hash => {
-                    magic[VERSION_AT] = MAGIC[VERSION_AT];
-                    HASH
-                }
-            });
+            let (tag, version) = tag_of(kind);
+            magic[VERSION_AT] = magic[VERSION_AT].max(version);
+            buf.push(tag);
             put_varint(&mut buf, key.len() as u64);
             buf.extend_from_slice(key);
             put_varint(&mut buf, value.len() as u64);
@@ -183,7 +197,8 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
     reader.read_exact(&mut magic)?;
     let version = match &magic[..] {
         MAGIC_V1 => 1,
-        MAGIC => 2,
+        MAGIC_V2 => 2,
+        MAGIC => 3,
         _ if magic.starts_with(&MAGIC[..VERSION_AT]) => {
             return Err(invalid(
                 "a snapshot from a newer Tantalum: upgrade to load it",
@@ -202,6 +217,9 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
         let kind = match tag[0] {
             STRING => Kind::String,
             HASH if version >= 2 => Kind::Hash,
+            LIST if version >= 3 => Kind::List,
+            SET if version >= 3 => Kind::Set,
+            ZSET if version >= 3 => Kind::ZSet,
             END => break,
             other => return Err(invalid(format!("unknown record type {other}"))),
         };
@@ -209,8 +227,13 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
         read_bytes(&mut reader, &mut key)?;
         read_bytes(&mut reader, &mut value)?;
         let expires = read_varint(&mut reader)?;
-        if kind == Kind::Hash && !hash::is_valid(&value) {
-            return Err(invalid("a damaged hash"));
+        let valid = match kind {
+            Kind::String => true,
+            Kind::Hash => hash::is_valid(&value),
+            _ => collection::is_valid(kind, &value),
+        };
+        if !valid {
+            return Err(invalid(format!("a damaged {}", kind.name())));
         }
         if loaded.dropped > 0 {
             // Full: count the rest without trying.
@@ -537,7 +560,8 @@ mod tests {
         s.restore(b"big", Kind::Hash, &big, Expiry::At(now + 3_600_000), now)
             .unwrap();
         assert_eq!(save(&s, &path).unwrap(), 5_005);
-        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        // Hashes need version 2, no more.
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V2));
         let t = Store::new(4);
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 5_005);
         assert_eq!(kind_and_value(&t, b"h"), Some((Kind::Hash, small)));
@@ -551,6 +575,64 @@ mod tests {
         save(&u, &path).unwrap();
         assert!(fs::read(&path).unwrap().starts_with(MAGIC_V1));
         assert_eq!(load(&Store::new(1), &path).unwrap().unwrap().keys, 5_004);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn sets_roundtrip_in_version_3() {
+        use crate::collection::Collection;
+        use crate::set::{BigSet, Finished, SetMut};
+        use crate::store::Update;
+        let path = temp_path("sets");
+        let s = filled();
+        let now = s.now();
+        // A packed integer set, a packed one of strings, a big one with a TTL.
+        let packed = |members: &[&[u8]]| {
+            let mut set = SetMut::new(members[0], members.len());
+            members.iter().for_each(|m| _ = set.insert(m));
+            match set.finish() {
+                Some(Finished::Packed(bytes)) => bytes,
+                _ => unreachable!(),
+            }
+        };
+        let ints = packed(&[b"3", b"1", b"2"]);
+        let strings = packed(&[b"b", b"a"]);
+        s.restore(b"ints", Kind::Set, &ints, Expiry::Never, now)
+            .unwrap();
+        s.restore(b"strings", Kind::Set, &strings, Expiry::Never, now)
+            .unwrap();
+        let mut big = BigSet::default();
+        for i in 0..1_000 {
+            big.insert(format!("member{i}").as_bytes());
+        }
+        let mut made = Some(Collection::Set(big));
+        s.update_collection(s.key(b"bigset"), now, false, |_| {
+            (Update::Object(made.take().unwrap()), ())
+        })
+        .unwrap();
+        s.update_key(s.key(b"bigset"), now, |_| {
+            (Update::Expire(Expiry::At(now + 60_000)), ())
+        })
+        .unwrap();
+        assert_eq!(save(&s, &path).unwrap(), 5_007);
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        let t = Store::new(4);
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 5_007);
+        assert_eq!(kind_and_value(&t, b"ints"), Some((Kind::Set, ints)));
+        assert_eq!(kind_and_value(&t, b"strings"), Some((Kind::Set, strings)));
+        // The big one is big again, with its members and TTL.
+        let (members, expiry) = t
+            .update_collection(t.key(b"bigset"), t.now(), false, |entry| {
+                let entry = entry.expect("loaded");
+                let members = match entry.value {
+                    crate::store::EntryValue::Object(Collection::Set(set)) => set.len(),
+                    _ => panic!("not big"),
+                };
+                (Update::Peek, (members, entry.expiry))
+            })
+            .unwrap();
+        assert_eq!(members, 1_000);
+        assert!(matches!(expiry, Expiry::At(_)));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -625,7 +707,7 @@ mod tests {
             ),
             ("an empty hash", file_of(MAGIC, &record(HASH, b"\x00"), 1)),
             ("an unknown kind", file_of(MAGIC, &record(9, b"x"), 1)),
-            ("a newer version", file_of(b"TANTALUM SNAPSHOT 3\n", &[], 0)),
+            ("a newer version", file_of(b"TANTALUM SNAPSHOT 4\n", &[], 0)),
         ] {
             fs::write(&path, file).unwrap();
             let err = load(&Store::new(1), &path).unwrap_err();

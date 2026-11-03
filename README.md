@@ -2,8 +2,8 @@
 
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
-`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes (`HSET`,
-`HGET`, `HGETALL` and the rest) and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
+`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
+and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
 optional snapshots to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
@@ -64,7 +64,12 @@ recorded from Redis 7.0 with `tools/redis-diff.py`).
 | `HGET key field`, `HMGET key field [field ...]`, `HGETALL`, `HKEYS`, `HVALS` | `HGETALL` is a map in RESP3 |
 | `HDEL key field [field ...]`, `HEXISTS`, `HLEN`, `HSTRLEN`, `HINCRBY key field n` | `HDEL` of the last field deletes the key |
 | `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0 (as Redis does for small hashes). Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
-| `TYPE key` | `string`, `hash` or `none`. Commands for one type reply `-WRONGTYPE` to the other, and `MGET` gives nil for hashes, as in Redis |
+| `SADD key member [member ...]`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SMEMBERS` | Small sets reply in Redis' order: integers sorted, others in the order added. `SMEMBERS` is a set in RESP3 |
+| `SPOP key [count]`, `SRANDMEMBER key [count]` | Random members; a negative `SRANDMEMBER` count may repeat them. A count covering the whole set gives it in Redis' order |
+| `SMOVE source destination member` | Atomic: holds both keys' shards |
+| `SINTER`, `SUNION`, `SDIFF key [key ...]`, their `STORE` forms, `SINTERCARD numkeys key ... [LIMIT n]` | Each key is read on its own, so unlike Redis, a write to another key meanwhile may or may not be seen |
+| `SSCAN key cursor [MATCH pattern] [COUNT n]` | Small sets come whole with cursor 0, as in Redis; big ones `COUNT` at a time, each member there throughout returned at least once |
+| `TYPE key` | `string`, `hash`, `set` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
 | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | A whole scan returns every key that existed throughout exactly once (Redis may repeat keys), and any cursor is safe. `COUNT` is about how many keys a call looks at, as in Redis; for big shards a call looks at a 1024th of the shard at least. Cursors are Tantalum's own and stay under 2^53, so clients that read them as JavaScript numbers work |
 | `KEYS pattern` | Every match at once, like Redis: it holds each shard's lock in turn while reading it, so prefer `SCAN` on big stores |
 | `RENAME key newkey`, `RENAMENX key newkey` | Atomic across shards; keeps the type and TTL. As in Redis, it overwrites `newkey` of any type and ignores `maxmemory` |
@@ -143,6 +148,19 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   is unchanged (a field set to a value of the same length). Strings pay
   nothing for this: the type was already in the flags byte, so `GET` and
   `SET` read the same bytes, and the speed guard measured no difference.
+- **Sets** (`src/set.rs`) are packed in their entry while small, the way
+  Redis packs them, and so reply in its order: up to 512 integers, sorted, as
+  zigzag varints (Redis' intset), or up to 128 members of up to 64 bytes in
+  the order added (its listpack). A write decodes, changes and writes the
+  entry again. Past those limits a set becomes an object the shard keeps
+  (`src/collection.rs`) and changes in place: its members back to back in
+  one buffer, a list of their offsets (the set's order, so `SPOP` and
+  `SRANDMEMBER` pick in O(1) and `SSCAN` walks positions), and a hash table
+  of positions. Measured with `used_memory` against Redis 7.2.4 (Docker):
+  100k sets of ten 8-byte members take 12.5 bytes per member (Redis 17.8),
+  and one set of 1M take 23.0 (Redis 29.3). Entries of object kinds use the
+  external bit to point into the shard's object table, so strings and
+  hashes read the same bytes as before.
 - **`SCAN` goes in hash order** (`Store::scan`): a cursor is a shard and a
   32-bit slot hash, and each call takes the keys with the next smallest
   hashes in that shard, every key with the same hash at once, under its
@@ -582,7 +600,10 @@ hit rates share the seeding flaw described above.
   at 100M keys (390k per shard) a call holds a lock for ~165 µs, which
   commands on that shard wait out, and a whole scan reads each table up to
   1024 times.
-- An append-only log (snapshots only), replication, lists, sets, sorted sets,
+- **Multi-key set commands read one key at a time** (`SINTER`, `SUNION`,
+  `SDIFF` and their stores), as `MSET` writes one at a time; `SMOVE` and
+  `RENAME` are atomic.
+- An append-only log (snapshots only), replication, lists, sorted sets,
   ACL users, Lua, pub/sub, `COPY`, `RANDOMKEY`, `OBJECT`, `DUMP`/`RESTORE`.
 - LFU and random eviction policies, `CONFIG SET` at runtime.
 
