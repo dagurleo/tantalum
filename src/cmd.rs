@@ -1,6 +1,7 @@
 //! Command dispatch. Replies match Redis 7 byte for byte where practical.
 
 mod hash;
+mod keys;
 
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -153,6 +154,10 @@ static COMMANDS: &[Command] = &[
     Command { name: "flushdb", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
     Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: quit },
     Command { name: "type", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: type_of },
+    Command { name: "scan", arity: -2, flags: &["readonly"], keys: NO_KEYS, run: keys::scan },
+    Command { name: "keys", arity: 2, flags: &["readonly"], keys: NO_KEYS, run: keys::keys },
+    Command { name: "rename", arity: 3, flags: &["write"], keys: (1, 2, 1), run: keys::rename },
+    Command { name: "renamenx", arity: 3, flags: &["write", "fast"], keys: (1, 2, 1), run: keys::renamenx },
     Command { name: "hget", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hget },
     Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hset },
     Command { name: "hgetall", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hgetall },
@@ -1329,6 +1334,105 @@ fn type_of(
     Reply::Written
 }
 
+/// A `SCAN`-family cursor as Redis reads it (with C's `strtoul`): decimal
+/// digits after an optional sign (a minus wraps around), in range, or
+/// nothing at all (0), up to any NUL byte.
+fn parse_cursor(cursor: &[u8]) -> Option<u64> {
+    let cursor = cursor.split(|&b| b == 0).next().unwrap_or_default();
+    let (negative, digits) = match cursor.first() {
+        None => return Some(0),
+        Some(b'-') => (true, &cursor[1..]),
+        Some(b'+') => (false, &cursor[1..]),
+        Some(_) => (false, cursor),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let n: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    Some(if negative { n.wrapping_neg() } else { n })
+}
+
+/// Which command's options [`ScanOptions::parse`] reads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    /// `SCAN`, which also takes `TYPE`.
+    Keys,
+    /// `HSCAN`, which also takes `NOVALUES`.
+    Hash,
+}
+
+/// `MATCH`, `COUNT` and `TYPE` or `NOVALUES`.
+struct ScanOptions<'a> {
+    /// `None` for no pattern, or a lone `*`.
+    pattern: Option<&'a [u8]>,
+    count: usize,
+    type_name: Option<&'a [u8]>,
+    values: bool,
+}
+
+impl<'a> ScanOptions<'a> {
+    /// Reads the options from argument `from` on, as Redis does: the last
+    /// of a repeated option wins. Writes the error if they're bad.
+    fn parse(args: &Args<'a>, from: usize, scan: Scan, out: &mut Vec<u8>) -> Option<Self> {
+        let mut options = ScanOptions {
+            pattern: None,
+            count: 10,
+            type_name: None,
+            values: true,
+        };
+        let mut i = from;
+        while i < args.len() {
+            let opt = args.get(i);
+            let is = |name: &[u8]| opt.eq_ignore_ascii_case(name);
+            let has_value = i + 1 < args.len();
+            if is(b"COUNT") && has_value {
+                match resp::parse_int(args.get(i + 1)) {
+                    None => {
+                        resp::write_error(out, NOT_AN_INTEGER);
+                        return None;
+                    }
+                    Some(count) if count < 1 => {
+                        resp::write_error(out, SYNTAX_ERROR);
+                        return None;
+                    }
+                    Some(count) => options.count = usize::try_from(count).unwrap_or(usize::MAX),
+                }
+                i += 2;
+            } else if is(b"MATCH") && has_value {
+                options.pattern = Some(args.get(i + 1)).filter(|p| *p != b"*");
+                i += 2;
+            } else if is(b"TYPE") && scan == Scan::Keys && has_value {
+                options.type_name = Some(args.get(i + 1));
+                i += 2;
+            } else if is(b"NOVALUES") {
+                if scan != Scan::Hash {
+                    // As Redis 7.4, which added it.
+                    resp::write_error(out, b"ERR NOVALUES option can only be used in HSCAN");
+                    return None;
+                }
+                options.values = false;
+                i += 1;
+            } else {
+                resp::write_error(out, SYNTAX_ERROR);
+                return None;
+            }
+        }
+        Some(options)
+    }
+
+    /// Whether a key or field passes `MATCH`.
+    fn matches(&self, name: &[u8]) -> bool {
+        self.pattern.is_none_or(|p| glob::matches(p, name, false))
+    }
+
+    /// Whether a key of this kind passes `TYPE`. Names of types Tantalum
+    /// doesn't have match nothing, as in Redis 7.
+    fn has_type(&self, kind: Kind) -> bool {
+        self.type_name
+            .is_none_or(|t| t.eq_ignore_ascii_case(kind.name().as_bytes()))
+    }
+}
+
 fn bulk_or_null(out: &mut Vec<u8>, session: &Session, value: Option<SharedValue>) -> Reply {
     match value {
         Some(value) => bulk(out, value),
@@ -1497,6 +1601,7 @@ const OOM: &[u8] = b"OOM command not allowed when used memory > 'maxmemory'.";
 const NOT_AN_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
 const SYNTAX_ERROR: &[u8] = b"ERR syntax error";
 const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding the wrong kind of value";
+const INVALID_CURSOR: &[u8] = b"ERR invalid cursor";
 const WRONGPASS: &[u8] = b"WRONGPASS invalid username-password pair or user is disabled.";
 
 fn wrong_arity(out: &mut Vec<u8>, name: &str) {
@@ -1537,6 +1642,30 @@ fn unknown_command(out: &mut Vec<u8>, args: &Args<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursors_parse_like_strtoul() {
+        for (cursor, parsed) in [
+            ("0", Some(0)),
+            ("", Some(0)),
+            ("123", Some(123)),
+            ("+5", Some(5)),
+            ("-1", Some(u64::MAX)),
+            ("-0", Some(0)),
+            ("007", Some(7)),
+            ("18446744073709551615", Some(u64::MAX)),
+            ("18446744073709551616", None),
+            ("-", None),
+            ("+", None),
+            (" 1", None),
+            ("1 ", None),
+            ("0x10", None),
+            ("abc", None),
+            ("12\0junk", Some(12)),
+        ] {
+            assert_eq!(parse_cursor(cursor.as_bytes()), parsed, "{cursor:?}");
+        }
+    }
 
     #[test]
     fn finds_every_command_in_any_case() {

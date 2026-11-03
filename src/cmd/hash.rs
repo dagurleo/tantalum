@@ -1,9 +1,11 @@
 //! Hash commands. A hash is one entry (see `crate::hash`), so reads scan it
 //! and changes write it again whole.
 
-use super::{Args, NOT_AN_INTEGER, OOM, Reply, SYNTAX_ERROR, WRONGTYPE, wrong_arity};
+use super::{
+    Args, INVALID_CURSOR, NOT_AN_INTEGER, OOM, Reply, Scan, ScanOptions, WRONGTYPE, parse_cursor,
+    wrong_arity,
+};
 use crate::context::{Context, Session};
-use crate::glob;
 use crate::hash::{self, Edit};
 use crate::resp;
 use crate::store::{COPY_UNDER_LOCK_MAX, Kind, Millis, OutOfMemory, Store, Update};
@@ -392,8 +394,8 @@ pub(super) fn hscan(
     out: &mut Vec<u8>,
 ) -> Reply {
     // In Redis' order: the cursor, then the key, then the options.
-    if !valid_cursor(args.get(2)) {
-        resp::write_error(out, b"ERR invalid cursor");
+    if parse_cursor(args.get(2)).is_none() {
+        resp::write_error(out, INVALID_CURSOR);
         return Reply::Written;
     }
     read(ctx, session, now, args, out, |hash, out| {
@@ -401,83 +403,20 @@ pub(super) fn hscan(
             out.extend_from_slice(b"*2\r\n$1\r\n0\r\n*0\r\n");
             return;
         };
-        let (mut pattern, mut values) = (None, true);
-        let mut i = 3;
-        while i < args.len() {
-            let opt = args.get(i);
-            let is = |name: &[u8]| opt.eq_ignore_ascii_case(name);
-            let has_value = i + 1 < args.len();
-            if is(b"COUNT") && has_value {
-                match resp::parse_int(args.get(i + 1)) {
-                    None => return resp::write_error(out, NOT_AN_INTEGER),
-                    Some(count) if count < 1 => return resp::write_error(out, SYNTAX_ERROR),
-                    Some(_) => {}
-                }
-                i += 2;
-            } else if is(b"MATCH") && has_value {
-                // A lone `*` is no pattern at all.
-                pattern = Some(args.get(i + 1)).filter(|p| *p != b"*");
-                i += 2;
-            } else if is(b"NOVALUES") {
-                values = false;
-                i += 1;
-            } else {
-                return resp::write_error(out, SYNTAX_ERROR);
-            }
-        }
+        let Some(options) = ScanOptions::parse(args, 3, Scan::Hash, out) else {
+            return;
+        };
         let found: Vec<_> = hash::iter(hash)
-            .filter(|(field, _)| pattern.is_none_or(|p| glob::matches(p, field, false)))
+            .filter(|(field, _)| options.matches(field))
             .collect();
         out.extend_from_slice(b"*2\r\n$1\r\n0\r\n");
-        resp::write_array_header(out, found.len() * if values { 2 } else { 1 });
+        let per_field = if options.values { 2 } else { 1 };
+        resp::write_array_header(out, found.len() * per_field);
         for (field, value) in found {
             resp::write_bulk(out, field);
-            if values {
+            if options.values {
                 resp::write_bulk(out, value);
             }
         }
     })
-}
-
-/// Whether `cursor` is one Redis accepts (it reads cursors with C's
-/// `strtoul`): decimal digits after an optional sign, in range, or nothing
-/// at all, up to any NUL byte.
-fn valid_cursor(cursor: &[u8]) -> bool {
-    let cursor = cursor.split(|&b| b == 0).next().unwrap_or_default();
-    let digits = match cursor.first() {
-        None => return true,
-        Some(b'+' | b'-') => &cursor[1..],
-        Some(_) => cursor,
-    };
-    !digits.is_empty()
-        && digits.iter().all(u8::is_ascii_digit)
-        && std::str::from_utf8(digits).is_ok_and(|d| d.parse::<u64>().is_ok())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::valid_cursor;
-
-    #[test]
-    fn cursors_parse_like_strtoul() {
-        for (cursor, valid) in [
-            ("0", true),
-            ("", true),
-            ("123", true),
-            ("+5", true),
-            ("-1", true),
-            ("007", true),
-            ("18446744073709551615", true),
-            ("18446744073709551616", false),
-            ("-", false),
-            ("+", false),
-            (" 1", false),
-            ("1 ", false),
-            ("0x10", false),
-            ("abc", false),
-            ("12\0junk", true),
-        ] {
-            assert_eq!(valid_cursor(cursor.as_bytes()), valid, "{cursor:?}");
-        }
-    }
 }

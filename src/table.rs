@@ -34,7 +34,7 @@ const VACANT: Slot = Slot {
     loc: EMPTY,
 };
 
-const WAYS: usize = 8;
+pub const WAYS: usize = 8;
 
 /// One cache line of slots, aligned so a bucket never straddles two.
 #[derive(Clone, Copy)]
@@ -166,7 +166,18 @@ impl Table {
         self.buckets.capacity() * size_of::<Bucket>() + self.overflow.capacity() * size_of::<Slot>()
     }
 
-    #[cfg(test)]
+    /// Every bucket's slots, in use or not (`loc == EMPTY`), for tight loops
+    /// over the whole table. The rest are in [`Table::overflow`].
+    pub fn buckets(&self) -> impl Iterator<Item = &[Slot; WAYS]> {
+        self.buckets.iter().map(|bucket| &bucket.0)
+    }
+
+    /// Slots that didn't fit a bucket (practically never any).
+    pub fn overflow(&self) -> &[Slot] {
+        &self.overflow
+    }
+
+    /// Every slot in use, in no particular order.
     pub fn iter(&self) -> impl Iterator<Item = &Slot> {
         self.buckets
             .iter()

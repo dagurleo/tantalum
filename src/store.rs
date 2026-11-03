@@ -40,7 +40,7 @@
 //!   It holds one shard lock at a time and never while the writer holds its
 //!   own, so it can't deadlock.
 
-use std::collections::VecDeque;
+use std::collections::{BinaryHeap, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering::Relaxed};
@@ -220,6 +220,84 @@ impl ValueRef<'_> {
             Borrowed::External(kv) => Shared::External(kv.clone()),
         })
     }
+}
+
+/// The `want` smallest slot hashes from `from` on, and where they live, for
+/// [`ShardInner::scan`].
+struct Smallest {
+    heap: BinaryHeap<(u32, u32)>,
+    from: u32,
+    want: usize,
+    /// The largest hash kept once there are `want`: nothing above it can be.
+    threshold: u32,
+    /// The smallest hash left out at or below the threshold: if it ties with
+    /// the last one kept, those keys come too.
+    tie: Option<u32>,
+}
+
+impl Smallest {
+    /// For a table of `len` slots in use, at most.
+    fn new(from: u32, want: usize, len: usize) -> Self {
+        Smallest {
+            heap: BinaryHeap::with_capacity(want.min(len)),
+            from,
+            want,
+            threshold: u32::MAX,
+            tie: None,
+        }
+    }
+
+    /// Hashes in `from..=from + span` may be kept.
+    fn span(&self) -> u32 {
+        self.threshold.wrapping_sub(self.from)
+    }
+
+    fn is_full(&self) -> bool {
+        self.heap.len() >= self.want
+    }
+
+    fn last(&self) -> Option<u32> {
+        self.heap.peek().map(|&(hash, _)| hash)
+    }
+
+    fn offer(&mut self, slot: &table::Slot) {
+        let hash = slot.hash;
+        if slot.loc == table::EMPTY || hash < self.from || hash > self.threshold {
+            return;
+        }
+        if !self.is_full() {
+            self.heap.push((hash, slot.loc));
+            if self.is_full() {
+                self.threshold = self.last().expect("full");
+            }
+            return;
+        }
+        let mut top = self.heap.peek_mut().expect("full");
+        let out = if hash < top.0 {
+            std::mem::replace(&mut *top, (hash, slot.loc)).0
+        } else {
+            hash
+        };
+        drop(top);
+        self.tie = Some(self.tie.map_or(out, |tie| tie.min(out)));
+        self.threshold = self.last().expect("full");
+    }
+}
+
+/// What [`Store::rename`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Renamed {
+    Done,
+    /// There's no source key.
+    NoSuchKey,
+    /// With `only_if_absent`: the destination exists (or is the source).
+    Exists,
+}
+
+/// Whether two byte strings are equal, at once if they're the same bytes
+/// (a shared big value).
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    (a.as_ptr() == b.as_ptr() && a.len() == b.len()) || a == b
 }
 
 pub struct SetOutcome {
@@ -916,6 +994,65 @@ impl ShardInner {
         self.table.shrink_if_sparse();
     }
 
+    /// One step of [`Store::scan`] in this shard: the keys with the `want`
+    /// smallest slot hashes from `from` on (more on a tie: every key with
+    /// the last of those hashes), expired ones counted but not passed to
+    /// `f`. Returns how many it counted and the hash to go on from, or
+    /// `None` if none are left.
+    fn scan(
+        &self,
+        from: u32,
+        want: usize,
+        now: Millis,
+        f: &mut impl FnMut(&[u8], Kind),
+    ) -> (usize, Option<u32>) {
+        let mut picked = Smallest::new(from, want, self.table.len());
+        // A bucket at a time, checked in one vectorizable pass for a slot
+        // that could be picked; once there are `want`, that's rare.
+        for bucket in self.table.buckets() {
+            let span = picked.span();
+            let mut any = false;
+            for slot in bucket {
+                any |= (slot.hash.wrapping_sub(from) <= span) & (slot.loc != table::EMPTY);
+            }
+            if any {
+                bucket.iter().for_each(|slot| picked.offer(slot));
+            }
+        }
+        self.table
+            .overflow()
+            .iter()
+            .for_each(|slot| picked.offer(slot));
+        let Some(last) = picked.last() else {
+            return (0, None);
+        };
+        // A full set may have left keys out; if not, the next step finds
+        // none and moves on.
+        let more = picked.is_full();
+        let tie = picked.tie == Some(last);
+        let mut taken = picked.heap.into_vec();
+        if tie {
+            for slot in self.table.iter().filter(|slot| slot.hash == last) {
+                if !taken.contains(&(slot.hash, slot.loc)) {
+                    taken.push((slot.hash, slot.loc));
+                }
+            }
+        }
+        for &(_, loc) in &taken {
+            let (id, offset) = split(loc);
+            let buf = &self.segment(id).buf;
+            let header = segment::parse(buf, offset);
+            if !header.is_expired(now) {
+                f(
+                    Self::entry_key(buf, &header, &self.externals),
+                    header.kind(),
+                );
+            }
+        }
+        let next = if more { last.checked_add(1) } else { None };
+        (taken.len(), next)
+    }
+
     /// Bytes this shard is responsible for.
     fn footprint(&self) -> usize {
         let small_vecs =
@@ -1541,6 +1678,166 @@ impl Store {
 
     pub fn shard_count(&self) -> usize {
         self.shards.len()
+    }
+
+    /// One step of `SCAN`: calls `f` with the key and kind of about `count`
+    /// keys and returns the cursor for the next step, 0 when every key has
+    /// been seen. Keys go in order of their hash within each shard: a cursor
+    /// is a shard (high 32 bits) and the slot hash to go on from (low 32).
+    /// A key's hash never changes, so a whole scan returns every key that
+    /// existed throughout exactly once, whatever was written, moved or
+    /// resized meanwhile, and any cursor is safe to pass. Each step reads
+    /// its shard's whole table (8 bytes per key) under the lock, so for big
+    /// shards it takes at least a 1024th of the shard, which bounds a whole
+    /// scan to 1024 reads of each table.
+    pub fn scan(
+        &self,
+        cursor: u64,
+        count: usize,
+        now: Millis,
+        mut f: impl FnMut(&[u8], Kind),
+    ) -> u64 {
+        let mut shard = (cursor >> 32) as usize;
+        let mut from = cursor as u32;
+        let mut left = count.max(1);
+        while shard < self.shards.len() {
+            let inner = self.shards[shard].inner.lock();
+            let want = left.max(inner.table.len() / 1024);
+            let (taken, next) = inner.scan(from, want, now, &mut f);
+            drop(inner);
+            if let Some(next) = next {
+                return (shard as u64) << 32 | u64::from(next);
+            }
+            // That was the rest of this shard.
+            shard += 1;
+            from = 0;
+            left = left.saturating_sub(taken);
+            if left == 0 {
+                break;
+            }
+        }
+        if shard < self.shards.len() {
+            (shard as u64) << 32
+        } else {
+            0
+        }
+    }
+
+    /// `RENAME` (and with `only_if_absent`, `RENAMENX`): gives `from`'s
+    /// value, kind, TTL and usage to `to`, replacing whatever `to` held, and
+    /// removes `from`, atomically. It holds both shards' locks, taken in
+    /// shard order, which nothing else does, so it can't deadlock. When the
+    /// entry will be too big to pack under its new name, its allocation is
+    /// made before locking and used if the source hasn't changed meanwhile.
+    /// Like Redis' `RENAME`, it doesn't check `maxmemory`.
+    pub fn rename(
+        &self,
+        from: Key<'_>,
+        to: Key<'_>,
+        only_if_absent: bool,
+        now: Millis,
+    ) -> Result<Renamed, OutOfMemory> {
+        let (from_hash, a) = self.locate(from.hash);
+        let (to_hash, b) = self.locate(to.hash);
+        // A big entry's new allocation, and the value it was copied from.
+        let mut prepared: Option<(SharedValue, KeyValue)> = None;
+        let mut attempts = 0;
+        loop {
+            let mut garbage = Vec::new();
+            let mut low = self.shards[a.min(b)].inner.lock();
+            let mut high = (a != b).then(|| self.shards[a.max(b)].inner.lock());
+            let (src, mut dst): (&mut ShardInner, Option<&mut ShardInner>) =
+                match high.as_deref_mut() {
+                    None => (&mut *low, None),
+                    Some(high) if a < b => (&mut *low, Some(high)),
+                    Some(high) => (high, Some(&mut *low)),
+                };
+            // The destination's shard, which may be the source's.
+            macro_rules! target {
+                () => {
+                    match dst.as_deref_mut() {
+                        Some(dst) => dst,
+                        None => &mut *src,
+                    }
+                };
+            }
+            let Some((loc, header)) = src.lookup(from_hash, from.bytes) else {
+                return Ok(Renamed::NoSuchKey);
+            };
+            if header.is_expired(now) {
+                src.unlink(from_hash, loc);
+                garbage.extend(src.kill(loc));
+                src.mem.expired += 1;
+                self.sync_usage(&self.shards[a], src, false);
+                drop((low, high));
+                return Ok(Renamed::NoSuchKey);
+            }
+            if from.bytes == to.bytes {
+                return Ok(if only_if_absent {
+                    Renamed::Exists
+                } else {
+                    Renamed::Done
+                });
+            }
+            let existing = target!().lookup(to_hash, to.bytes);
+            let live = existing.as_ref().filter(|(_, h)| !h.is_expired(now));
+            if only_if_absent && live.is_some() {
+                return Ok(Renamed::Exists);
+            }
+            // The value, out from under the source's segment, which the
+            // destination's appends may share.
+            let value = src.value_ref(loc, &header).share();
+            let payload = if to.bytes.len() + value.as_bytes().len() + 20 > INLINE_MAX {
+                let kv = match prepared.take() {
+                    Some((copied, kv)) if same_bytes(copied.as_bytes(), value.as_bytes()) => kv,
+                    _ if attempts < 2 => {
+                        // Copy it without the locks, then check again.
+                        drop((low, high));
+                        attempts += 1;
+                        let kv = KeyValue::new(to.bytes, value.as_bytes());
+                        prepared = Some((value, kv));
+                        continue;
+                    }
+                    _ => KeyValue::new(to.bytes, value.as_bytes()),
+                };
+                Payload::External(target!().store_external(kv))
+            } else {
+                Payload::Inline {
+                    key: to.bytes,
+                    value: value.as_bytes(),
+                }
+            };
+            let Some(new) =
+                target!().append(header.kind(), header.usage(), &payload, header.deadline)
+            else {
+                // Out of segment ids: practically unreachable (4 GB per shard).
+                if let Payload::External(index) = payload {
+                    garbage.push(target!().take_external(index));
+                }
+                return Err(OutOfMemory);
+            };
+            let old = existing.as_ref().map(|(old, _)| *old);
+            let expired = existing.is_some() && live.is_none();
+            let target = target!();
+            garbage.extend(target.replace(to_hash, old, new));
+            if expired {
+                target.mem.expired += 1;
+            }
+            target.mem.writes += 1;
+            src.unlink(from_hash, loc);
+            garbage.extend(src.kill(loc));
+            src.mem.writes += 1;
+            let eager = self.near_limit();
+            src.maybe_defrag(eager, now, &self.hasher, &mut garbage);
+            self.sync_usage(&self.shards[a], src, false);
+            if let Some(dst) = dst {
+                dst.maybe_defrag(eager, now, &self.hasher, &mut garbage);
+                self.sync_usage(&self.shards[b], dst, false);
+            }
+            drop((low, high));
+            drop(garbage); // frees values outside the locks
+            return Ok(Renamed::Done);
+        }
     }
 
     /// Calls `f` with the key, kind, value and deadline (`NO_EXPIRY` for

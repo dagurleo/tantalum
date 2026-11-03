@@ -2,8 +2,8 @@
 
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
-`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends) and hashes (`HSET`,
-`HGET`, `HGETALL` and the rest), with TTLs, eviction, a password, TLS and
+`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes (`HSET`,
+`HGET`, `HGETALL` and the rest) and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
 optional snapshots to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
@@ -65,6 +65,9 @@ recorded from Redis 7.0 with `tools/redis-diff.py`).
 | `HDEL key field [field ...]`, `HEXISTS`, `HLEN`, `HSTRLEN`, `HINCRBY key field n` | `HDEL` of the last field deletes the key |
 | `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0 (as Redis does for small hashes). Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
 | `TYPE key` | `string`, `hash` or `none`. Commands for one type reply `-WRONGTYPE` to the other, and `MGET` gives nil for hashes, as in Redis |
+| `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | A whole scan returns every key that existed throughout exactly once (Redis may repeat keys), and any cursor is safe. `COUNT` is about how many keys a call looks at, as in Redis; for big shards a call looks at a 1024th of the shard at least. Cursors are Tantalum's own and stay under 2^53, so clients that read them as JavaScript numbers work |
+| `KEYS pattern` | Every match at once, like Redis: it holds each shard's lock in turn while reading it, so prefer `SCAN` on big stores |
+| `RENAME key newkey`, `RENAMENX key newkey` | Atomic across shards; keeps the type and TTL. As in Redis, it overwrites `newkey` of any type and ignores `maxmemory` |
 | `FLUSHALL [ASYNC\|SYNC]`, `FLUSHDB [ASYNC\|SYNC]` | Not atomic across shards: writes running at the same time may survive |
 | `AUTH [username] password` | With `--requirepass` (or `TANTALUM_REQUIREPASS`). One user, `default`, as in Redis without ACLs |
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | RESP3 too: redis-py 8 won't connect without it. For these commands it only changes nulls, maps (`HELLO`, `CONFIG GET`, `HGETALL`), sets (`COMMAND` flags) and `INFO` (verbatim text) |
@@ -140,6 +143,19 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   is unchanged (a field set to a value of the same length). Strings pay
   nothing for this: the type was already in the flags byte, so `GET` and
   `SET` read the same bytes, and the speed guard measured no difference.
+- **`SCAN` goes in hash order** (`Store::scan`): a cursor is a shard and a
+  32-bit slot hash, and each call takes the keys with the next smallest
+  hashes in that shard, every key with the same hash at once, under its
+  lock. Walking the table's buckets, as Redis does, would miss keys here:
+  cuckoo inserts move keys between their two buckets, behind the cursor. A
+  key's hash never changes, so overwrites, compaction, cuckoo moves and
+  resizes can't hide one, and no key comes twice. The cost is that a call
+  reads its shard's whole table (8 bytes per key) to find the next hashes,
+  a bucket at a time in a loop the compiler vectorizes (~0.3 ns per slot).
+  A whole scan of 1M keys at `COUNT 100` takes ~45 ns per key in-process,
+  and a call holds its shard's lock for ~3.5 µs at 1M keys, ~36 µs at 10M
+  and ~165 µs at 100M (M1 Pro, 256 shards). `RENAME` is the one command
+  that holds two shard locks, taken in shard order.
 - **Commands** (`src/cmd.rs`) are found by name length and first letter, a
   comparison or two however many there are; `GET` and `SET` skip even that.
 - **Table** (`src/table.rs`): bucketized cuckoo hashing over 8-byte slots,
@@ -562,8 +578,12 @@ hit rates share the seeding flaw described above.
   scan it. `HGET` costs about 1.7× a `GET` at pipeline 16 (235 against 145 ns
   in the in-process benchmark, 10 fields), mostly in the cache lines the
   scan touches. No `HRANDFIELD`, `HINCRBYFLOAT` or field TTLs (`HEXPIRE`).
+- **`SCAN` on very big stores**: each call reads a whole shard's table, so
+  at 100M keys (390k per shard) a call holds a lock for ~165 µs, which
+  commands on that shard wait out, and a whole scan reads each table up to
+  1024 times.
 - An append-only log (snapshots only), replication, lists, sets, sorted sets,
-  ACL users, Lua, pub/sub, `SCAN`/`KEYS`, `RENAME`.
+  ACL users, Lua, pub/sub, `COPY`, `RANDOMKEY`, `OBJECT`, `DUMP`/`RESTORE`.
 - LFU and random eviction policies, `CONFIG SET` at runtime.
 
 ## Development

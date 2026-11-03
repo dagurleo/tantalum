@@ -564,7 +564,29 @@ fn matches_a_model() {
                 s.restore(&key, kind, &value, expiry, now).unwrap();
                 model.insert(key, (kind, value, deadline));
             }
-            88..96 => now += rng.below(20),
+            88..93 => {
+                // RENAME and RENAMENX, sometimes onto itself.
+                let to = format!("k{}", rng.below(300)).into_bytes();
+                let only_if_absent = rng.below(3) == 0;
+                let done = s
+                    .rename(s.key(&key), s.key(&to), only_if_absent, now)
+                    .unwrap();
+                let target = model
+                    .get(&to)
+                    .filter(|(_, _, d)| *d == 0 || *d > now)
+                    .cloned();
+                let expected = match &live {
+                    None => Renamed::NoSuchKey,
+                    Some(_) if only_if_absent && (to == key || target.is_some()) => Renamed::Exists,
+                    Some(_) => Renamed::Done,
+                };
+                assert_eq!(done, expected, "step {step}");
+                if done == Renamed::Done && to != key {
+                    let moved = model.remove(&key).unwrap();
+                    model.insert(to, moved);
+                }
+            }
+            93..97 => now += rng.below(20),
             _ => {
                 s.expire_cycle(now);
             }
@@ -1035,4 +1057,340 @@ fn memory_budget() {
         per_key <= 60.0,
         "{per_key:.2} bytes per key, over the 60 budget"
     );
+}
+
+/// A whole scan returns every key that existed throughout exactly once, and
+/// no key twice, whatever happens between its steps: overwrites and
+/// compaction move entries, new keys move slots and grow the table, deletes
+/// shrink it, TTL and type changes rewrite entries.
+#[test]
+fn scan_returns_lasting_keys_exactly_once() {
+    for (round, count) in [1, 3, 50, 1000].into_iter().enumerate() {
+        let s = Store::new(4);
+        let mut rng = Rng(0xA076_1D64_78BD_642F ^ round as u64);
+        let mut now: Millis = 1;
+        let lasting: Vec<Vec<u8>> = (0..3_000)
+            .map(|i| format!("keep{i}").into_bytes())
+            .collect();
+        for key in &lasting {
+            put(&s, key, b"v", Condition::Always, Expiry::Never, now);
+        }
+        let mut ever: HashSet<Vec<u8>> = lasting.iter().cloned().collect();
+        let mut temporary: Vec<Vec<u8>> = Vec::new();
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut cursor = 0;
+        let mut steps = 0;
+        loop {
+            cursor = s.scan(cursor, count, now, |key, _| {
+                *seen.entry(key.to_vec()).or_default() += 1;
+            });
+            if cursor == 0 {
+                break;
+            }
+            steps += 1;
+            assert!(steps < 100_000, "the scan never ended");
+            for _ in 0..rng.below(8) {
+                let keep = &lasting[rng.below(lasting.len() as u64) as usize];
+                match rng.below(8) {
+                    0 | 1 => {
+                        let len = if rng.below(20) == 0 {
+                            20_000
+                        } else {
+                            rng.below(200)
+                        };
+                        put(
+                            &s,
+                            keep,
+                            &vec![b'x'; len as usize],
+                            Condition::Always,
+                            Expiry::Keep,
+                            now,
+                        );
+                    }
+                    2 => {
+                        let deadline = if rng.below(2) == 0 {
+                            Expiry::At(now + 1_000_000 + rng.below(1_000_000))
+                        } else {
+                            Expiry::Never
+                        };
+                        s.update_key(s.key(keep), now, |_| (Update::Expire(deadline), ()))
+                            .unwrap();
+                    }
+                    3 => {
+                        let kind = if rng.below(2) == 0 {
+                            Kind::Hash
+                        } else {
+                            Kind::String
+                        };
+                        let value = vec![b'h'; rng.below(100) as usize];
+                        s.update_key(s.key(keep), now, |_| {
+                            (Update::Replace(kind, value.clone()), ())
+                        })
+                        .unwrap();
+                    }
+                    4 | 5 => {
+                        // New keys, some expiring soon.
+                        for _ in 0..rng.below(100) {
+                            let key = format!("tmp{}", rng.below(20_000)).into_bytes();
+                            let expiry = if rng.below(4) == 0 {
+                                Expiry::At(now + 1 + rng.below(30))
+                            } else {
+                                Expiry::Never
+                            };
+                            put(&s, &key, b"t", Condition::Always, expiry, now);
+                            ever.insert(key.clone());
+                            temporary.push(key);
+                        }
+                    }
+                    6 => {
+                        for _ in 0..rng.below(150).min(temporary.len() as u64) {
+                            let i = rng.below(temporary.len() as u64) as usize;
+                            let key = temporary.swap_remove(i);
+                            s.update_key(s.key(&key), now, |c| {
+                                (
+                                    if c.is_some() {
+                                        Update::Delete
+                                    } else {
+                                        Update::Peek
+                                    },
+                                    (),
+                                )
+                            })
+                            .unwrap();
+                        }
+                    }
+                    _ => {
+                        now += rng.below(10);
+                        s.expire_cycle(now);
+                    }
+                }
+            }
+        }
+        for key in &lasting {
+            assert_eq!(seen.get(key), Some(&1), "count {count}: {key:?}");
+        }
+        for (key, times) in &seen {
+            assert!(
+                ever.contains(key),
+                "count {count}: returned {key:?}, never written"
+            );
+            assert_eq!(*times, 1, "count {count}: returned {key:?} twice");
+        }
+        s.check();
+    }
+}
+
+#[test]
+fn scan_skips_expired_keys_and_takes_any_cursor() {
+    let s = Store::new(8);
+    for i in 0..2_000u32 {
+        let expiry = if i % 2 == 0 {
+            Expiry::At(50)
+        } else {
+            Expiry::Never
+        };
+        put(
+            &s,
+            format!("k{i}").as_bytes(),
+            b"v",
+            Condition::Always,
+            expiry,
+            1,
+        );
+    }
+    let mut all = Vec::new();
+    let mut cursor = 0;
+    loop {
+        cursor = s.scan(cursor, 100, 60, |key, kind| {
+            assert_eq!(kind, Kind::String);
+            all.push(key.to_vec());
+        });
+        if cursor == 0 {
+            break;
+        }
+    }
+    all.sort();
+    let mut expected: Vec<Vec<u8>> = (1..2_000u32)
+        .step_by(2)
+        .map(|i| format!("k{i}").into_bytes())
+        .collect();
+    expected.sort();
+    assert_eq!(all, expected);
+    // Cursors from anywhere only ever give real keys. (`f` runs under the
+    // shard's lock, so check them after.)
+    let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+    for _ in 0..2_000 {
+        let mut cursor = rng.below(u64::MAX) >> rng.below(64);
+        for _ in 0..3 {
+            let mut keys = Vec::new();
+            cursor = s.scan(cursor, 1 + rng.below(50) as usize, 60, |key, _| {
+                keys.push(key.to_vec());
+            });
+            for key in keys {
+                assert!(get(&s, &key, 60).is_some(), "{key:?}");
+            }
+            if cursor == 0 {
+                break;
+            }
+        }
+    }
+    // An empty store is done at once.
+    assert_eq!(Store::new(16).scan(0, 10, 1, |_, _| panic!("a key")), 0);
+}
+
+#[test]
+fn rename_keeps_kind_ttl_and_big_values() {
+    let s = Store::new(8);
+    let now = 1;
+    let big = vec![7u8; 100_000];
+    let long_key = vec![b'k'; 16_300];
+    put(
+        &s,
+        b"small",
+        b"v",
+        Condition::Always,
+        Expiry::At(10_000),
+        now,
+    );
+    put(&s, b"big", &big, Condition::Always, Expiry::Never, now);
+    s.restore(b"hash", Kind::Hash, b"\x01\x01f\x01v", Expiry::Never, now)
+        .unwrap();
+    let kind_and_value =
+        |key: &[u8]| s.get_with(key, now, |v| v.map(|v| (v.kind(), v.as_bytes().to_vec())));
+    let rename =
+        |from: &[u8], to: &[u8], nx: bool| s.rename(s.key(from), s.key(to), nx, now).unwrap();
+    // Across many destinations, so across shards and within one.
+    let mut name = b"small".to_vec();
+    for i in 0..50 {
+        let next = format!("small{i}").into_bytes();
+        assert_eq!(rename(&name, &next, false), Renamed::Done);
+        assert_eq!(kind_and_value(&name), None);
+        name = next;
+    }
+    assert_eq!(kind_and_value(&name), Some((Kind::String, b"v".to_vec())));
+    let ttl = s
+        .update_key(s.key(&name), now, |c| (Update::Peek, c.map(|c| c.expiry)))
+        .unwrap();
+    assert_eq!(ttl, Some(Expiry::At(10_000)));
+    // Big values: external to external, to a key that makes it external, and back.
+    assert_eq!(rename(b"big", b"big2", false), Renamed::Done);
+    assert_eq!(kind_and_value(b"big2"), Some((Kind::String, big.clone())));
+    put(&s, b"v", &[1; 100], Condition::Always, Expiry::Never, now);
+    assert_eq!(rename(b"v", &long_key, false), Renamed::Done);
+    assert_eq!(
+        kind_and_value(&long_key),
+        Some((Kind::String, vec![1; 100]))
+    );
+    assert_eq!(rename(&long_key, b"short", false), Renamed::Done);
+    assert_eq!(kind_and_value(b"short"), Some((Kind::String, vec![1; 100])));
+    // Over another kind, and NX.
+    assert_eq!(rename(b"hash", b"short", true), Renamed::Exists);
+    assert_eq!(rename(b"hash", b"short", false), Renamed::Done);
+    assert_eq!(
+        kind_and_value(b"short"),
+        Some((Kind::Hash, b"\x01\x01f\x01v".to_vec()))
+    );
+    assert_eq!(rename(b"short", b"short", true), Renamed::Exists);
+    assert_eq!(rename(b"short", b"short", false), Renamed::Done);
+    assert_eq!(rename(b"missing", b"short", false), Renamed::NoSuchKey);
+    // An expired source is gone, and an expired destination doesn't block NX.
+    put(&s, b"old", b"o", Condition::Always, Expiry::At(5), now);
+    assert_eq!(
+        s.rename(s.key(b"old"), s.key(b"x"), false, 6).unwrap(),
+        Renamed::NoSuchKey
+    );
+    put(&s, b"gone", b"g", Condition::Always, Expiry::At(5), now);
+    assert_eq!(
+        s.rename(s.key(b"big2"), s.key(b"gone"), true, 6).unwrap(),
+        Renamed::Done
+    );
+    s.check();
+}
+
+/// Renames between keys in different shards from many threads at once,
+/// each thread moving its own value back and forth: nothing deadlocks and
+/// every value ends up under exactly one of its two names.
+#[test]
+fn concurrent_renames_neither_deadlock_nor_lose_values() {
+    let s = Arc::new(Store::new(4));
+    let threads = 8;
+    let names = |t: usize| (format!("a{t}").into_bytes(), format!("b{t}").into_bytes());
+    for t in 0..threads {
+        put(
+            &s,
+            &names(t).0,
+            format!("value{t}").as_bytes(),
+            Condition::Always,
+            Expiry::Never,
+            1,
+        );
+    }
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                let (a, b) = names(t);
+                for i in 0..5_000 {
+                    let (from, to) = if i % 2 == 0 { (&a, &b) } else { (&b, &a) };
+                    assert_eq!(
+                        s.rename(s.key(from), s.key(to), false, 1).unwrap(),
+                        Renamed::Done
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    for t in 0..threads {
+        let (a, b) = names(t);
+        assert_eq!(get(&s, &a, 1), Some(format!("value{t}").into_bytes()));
+        assert_eq!(get(&s, &b, 1), None);
+    }
+    s.check();
+}
+
+/// Keys that share a slot hash come in the same scan step, so a step that
+/// ends on one doesn't lose the others.
+#[test]
+fn scan_never_splits_keys_with_the_same_hash() {
+    let s = Store::with_config(Config {
+        shards: 1,
+        fixed_seed: true,
+        ..Config::default()
+    });
+    // A 32-bit hash repeats within a few hundred thousand keys.
+    let mut by_hash: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+    let mut colliding = Vec::new();
+    for i in 0..1_000_000u32 {
+        let key = format!("c{i}").into_bytes();
+        let keys = by_hash.entry(s.locate(s.key(&key).hash).0).or_default();
+        keys.push(key);
+        if keys.len() == 2 {
+            colliding.extend(keys.iter().cloned());
+            if colliding.len() >= 10 {
+                break;
+            }
+        }
+    }
+    assert!(colliding.len() >= 10, "no collisions found");
+    let others: Vec<Vec<u8>> = (0..200).map(|i| format!("o{i}").into_bytes()).collect();
+    for key in colliding.iter().chain(&others) {
+        put(&s, key, b"v", Condition::Always, Expiry::Never, 1);
+    }
+    for count in [1, 2, 3] {
+        let mut seen = Vec::new();
+        let mut cursor = 0;
+        loop {
+            cursor = s.scan(cursor, count, 1, |key, _| seen.push(key.to_vec()));
+            if cursor == 0 {
+                break;
+            }
+        }
+        seen.sort();
+        let mut expected: Vec<_> = colliding.iter().chain(&others).cloned().collect();
+        expected.sort();
+        assert_eq!(seen, expected, "count {count}");
+    }
 }

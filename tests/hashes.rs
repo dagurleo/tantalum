@@ -1,50 +1,13 @@
 //! Hash commands over the wire, against replies recorded from a real Redis
 //! (7.0.11, with `tools/redis-diff.py --rust`), errors included.
 
+mod common;
+
 use std::sync::Arc;
-use std::time::Duration;
 
+use common::{bulk, check, connect, req};
 use tantalum::context::{Context, Settings};
-use tantalum::server;
 use tantalum::store::Store;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-
-async fn connect() -> TcpStream {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let ctx = Arc::new(Context::new(Arc::new(Store::new(16)), Settings::default()));
-    tokio::spawn(server::serve(listener, ctx));
-    let stream = TcpStream::connect(addr).await.unwrap();
-    stream.set_nodelay(true).unwrap();
-    stream
-}
-
-fn req(args: &[&[u8]]) -> Vec<u8> {
-    let mut out = format!("*{}\r\n", args.len()).into_bytes();
-    for a in args {
-        out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
-        out.extend_from_slice(a);
-        out.extend_from_slice(b"\r\n");
-    }
-    out
-}
-
-/// Sends `request` and asserts the server replies with exactly `expected`.
-async fn check(c: &mut TcpStream, request: &[u8], expected: &[u8]) {
-    c.write_all(request).await.unwrap();
-    let mut got = vec![0; expected.len()];
-    tokio::time::timeout(Duration::from_secs(10), c.read_exact(&mut got))
-        .await
-        .expect("timed out waiting for a reply")
-        .unwrap();
-    assert_eq!(
-        got.escape_ascii().to_string(),
-        expected.escape_ascii().to_string(),
-        "after {}",
-        request.escape_ascii()
-    );
-}
 
 /// Commands and Redis' replies, in order, on one connection.
 #[rustfmt::skip]
@@ -204,10 +167,7 @@ const SCRIPT: &[(&[&[u8]], &[u8])] = &[
 
 #[tokio::test]
 async fn replies_match_redis() {
-    let mut c = connect().await;
-    for (args, expected) in SCRIPT {
-        check(&mut c, &req(args), expected).await;
-    }
+    common::replay(SCRIPT).await;
 }
 
 /// Hashes big enough to live outside the segments (over 16 KB) and with
@@ -255,10 +215,6 @@ async fn big_hashes() {
     del.extend(fields[290..].iter().map(|f| &f[..]));
     check(&mut c, &req(&del), b":10\r\n").await;
     check(&mut c, &req(&[b"EXISTS", b"big"]), b":0\r\n").await;
-}
-
-fn bulk(b: &[u8]) -> Vec<u8> {
-    [format!("${}\r\n", b.len()).as_bytes(), b, b"\r\n"].concat()
 }
 
 fn array(items: &[Vec<u8>]) -> Vec<u8> {

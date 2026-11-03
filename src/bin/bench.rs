@@ -6,6 +6,8 @@
 //! - `memory_per_key`: accounted bytes per key after the fill (exact, so any
 //!   change shows);
 //! - `<workload>`: nanoseconds per command, one number per run;
+//! - `scan_ns_per_key`: a whole `Store::scan` of the string fill, 100 keys
+//!   a step, per key;
 //! - `hash_memory_per_field`: the same for a fill of hashes, per field.
 //!
 //! The string workloads run first and alone, as they did before hashes
@@ -195,6 +197,24 @@ fn main() {
             let reqs = |seed| requests(keys, ops, pipeline, seed);
             results.push(time(name, runs, serve, reqs, pipeline));
         }
+        let mut times = Vec::new();
+        for _ in 0..runs {
+            let (mut cursor, mut seen, mut bytes) = (0, 0usize, 0usize);
+            let started = Instant::now();
+            loop {
+                cursor = store.scan(cursor, 100, store.now(), |key, _| {
+                    seen += 1;
+                    bytes += key.len();
+                });
+                if cursor == 0 {
+                    break;
+                }
+            }
+            let ns = started.elapsed().as_nanos() as f64 / seen as f64;
+            assert!(seen >= keys && bytes > 0, "the scan missed keys");
+            times.push(format!("{ns:.1}"));
+        }
+        results.push(format!("\"scan_ns_per_key\":[{}]", times.join(",")));
     });
 
     // Hashes in a store of their own, so the string workloads run as they
