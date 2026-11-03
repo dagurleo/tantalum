@@ -953,3 +953,21 @@ fn removed_ttls_are_spared_by_volatile_lru() {
     }
     s.check();
 }
+
+/// Memory per key for the benchmark's dataset (`src/bin/bench.rs`), smaller.
+/// A backstop for CI; `tools/speed-guard.sh` compares exactly between commits.
+/// Raise the budget only with a written reason (CLAUDE.md).
+#[test]
+fn memory_budget() {
+    let s = Store::new(256);
+    let keys = 200_000;
+    for i in 0..keys {
+        set(&s, format!("key:{i}").as_bytes(), &[b'v'; 32], 1);
+    }
+    let per_key = s.stats().used_memory as f64 / keys as f64;
+    println!("memory per key: {per_key:.2} bytes");
+    assert!(
+        per_key <= 60.0,
+        "{per_key:.2} bytes per key, over the 60 budget"
+    );
+}

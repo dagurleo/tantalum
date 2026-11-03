@@ -75,7 +75,8 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// the entries of the commands a few ahead while command `i` runs
 /// ([`Store::prefetch_ahead`]), so the misses overlap.
 #[derive(Default)]
-struct Batch {
+#[doc(hidden)] // public for the in-process benchmark (src/bin/bench.rs)
+pub struct Batch {
     /// Argument ranges of every parsed command, back to back.
     args: Vec<Range<usize>>,
     cmds: Vec<Parsed>,
@@ -95,7 +96,7 @@ struct Parsed {
 impl Batch {
     /// Parses up to `MAX_BATCH` complete commands from `buf[pos..]`. On a
     /// protocol error, the commands before it stay parsed.
-    fn parse(
+    pub fn parse(
         &mut self,
         buf: &[u8],
         mut pos: usize,
@@ -121,18 +122,22 @@ impl Batch {
         Ok(())
     }
 
-    fn len(&self) -> usize {
+    pub fn is_empty(&self) -> bool {
+        self.cmds.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
         self.cmds.len()
     }
 
     /// Command `i`, ready to run.
-    fn command<'b>(&'b self, i: usize, buf: &'b [u8]) -> Args<'b> {
+    pub fn command<'b>(&'b self, i: usize, buf: &'b [u8]) -> Args<'b> {
         let start = if i == 0 { 0 } else { self.cmds[i - 1].args_end };
         Args::new(buf, &self.args[start..self.cmds[i].args_end]).with_key_hash(self.cmds[i].key)
     }
 
     /// The read buffer position after command `i`.
-    fn end(&self, i: usize) -> usize {
+    pub fn end(&self, i: usize) -> usize {
         self.cmds[i].end
     }
 
@@ -147,7 +152,7 @@ impl Batch {
     }
 
     /// Prefetches for the commands ahead of command `i`, before it runs.
-    fn prefetch(&self, i: usize, store: &Store) {
+    pub fn prefetch(&self, i: usize, store: &Store) {
         store.prefetch_ahead(i, |j| self.ahead(j));
     }
 }
@@ -450,7 +455,8 @@ fn set_keepalive(socket: socket2::SockRef<'_>, time: Option<Duration>) {
 /// connection, which gets an error: monoio, unlike tokio, doesn't contain a
 /// panicking task, so it would take its whole thread down. Returns `None`
 /// if it panicked.
-fn run(
+#[doc(hidden)] // public for the in-process benchmark
+pub fn run(
     ctx: &Context,
     session: &mut Session,
     now: Millis,
