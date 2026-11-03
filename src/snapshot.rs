@@ -3,20 +3,21 @@
 //! Redis' RDB files, though in a format of our own:
 //!
 //! ```text
-//! "TANTALUM SNAPSHOT 3\n"
+//! "TANTALUM SNAPSHOT 4\n"
 //! per key:  kind, key length, key, value length, value, expiry
 //! trailer:  0x00, key count (u64 LE), CRC32 of everything before it (u32 LE)
 //! ```
 //!
-//! The kind is 0x01 for a string, 0x02 a hash, 0x03 a list, 0x04 a set and
-//! 0x05 a sorted set; a collection's value is its packed encoding (see
-//! `hash.rs`, `set.rs`), however big it is in memory. Lengths and expiries
+//! The kind is 0x01 for a string, 0x02 a hash, 0x03 a list, 0x04 a set,
+//! 0x05 a sorted set and 0x06 a stream; a collection's value is its packed
+//! encoding (see `hash.rs`, `set.rs`; for a stream, its chunks as they are,
+//! `stream.rs`), however big it is in memory. Lengths and expiries
 //! are LEB128 varints; an expiry is a Unix time in milliseconds, 0 for none,
 //! so TTLs carry over a restart and keys that expired meanwhile are dropped
 //! on load.
 //!
-//! Version 1 has only strings, version 2 adds hashes and version 3 the
-//! other collections. A save writes the lowest version that holds its data,
+//! Version 1 has only strings, version 2 adds hashes, version 3 the other
+//! collections and version 4 streams. A save writes the lowest version that holds its data,
 //! so a build from before a kind existed can still read a snapshot without
 //! it (after a rollback, say), and loading reads every version.
 //!
@@ -38,15 +39,17 @@ use crate::store::{Expiry, Kind, NO_EXPIRY, Store};
 use crate::{collection, hash};
 
 /// The header, with the version in its next-to-last byte.
-const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 3\n";
+const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 4\n";
 const VERSION_AT: usize = MAGIC.len() - 2;
 const MAGIC_V1: &[u8] = b"TANTALUM SNAPSHOT 1\n";
 const MAGIC_V2: &[u8] = b"TANTALUM SNAPSHOT 2\n";
+const MAGIC_V3: &[u8] = b"TANTALUM SNAPSHOT 3\n";
 const STRING: u8 = 1;
 const HASH: u8 = 2;
 const LIST: u8 = 3;
 const SET: u8 = 4;
 const ZSET: u8 = 5;
+const STREAM: u8 = 6;
 const END: u8 = 0;
 
 /// A record's tag and the first format version that has it.
@@ -57,6 +60,7 @@ fn tag_of(kind: Kind) -> (u8, u8) {
         Kind::List => (LIST, b'3'),
         Kind::Set => (SET, b'3'),
         Kind::ZSet => (ZSET, b'3'),
+        Kind::Stream => (STREAM, b'4'),
     }
 }
 
@@ -198,7 +202,8 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
     let version = match &magic[..] {
         MAGIC_V1 => 1,
         MAGIC_V2 => 2,
-        MAGIC => 3,
+        MAGIC_V3 => 3,
+        MAGIC => 4,
         _ if magic.starts_with(&MAGIC[..VERSION_AT]) => {
             return Err(invalid(
                 "a snapshot from a newer Tantalum: upgrade to load it",
@@ -220,6 +225,7 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
             LIST if version >= 3 => Kind::List,
             SET if version >= 3 => Kind::Set,
             ZSET if version >= 3 => Kind::ZSet,
+            STREAM if version >= 4 => Kind::Stream,
             END => break,
             other => return Err(invalid(format!("unknown record type {other}"))),
         };
@@ -615,7 +621,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(save(&s, &path).unwrap(), 5_007);
-        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V3));
         let t = Store::new(4);
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 5_007);
         assert_eq!(kind_and_value(&t, b"ints"), Some((Kind::Set, ints)));
@@ -633,6 +639,66 @@ mod tests {
             .unwrap();
         assert_eq!(members, 1_000);
         assert!(matches!(expiry, Expiry::At(_)));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn streams_roundtrip_in_version_4() {
+        use crate::collection::Collection;
+        use crate::store::Update;
+        use crate::stream::{BigStream, StreamId, Trim};
+        let path = temp_path("streams");
+        let s = Store::new(2);
+        let now = s.now();
+        // Chunks with entries removed from them, and an emptied stream that
+        // keeps its last ID: trimming must go the same after a restart.
+        let mut stream = BigStream::default();
+        for i in 1..=350u64 {
+            let value = "v".repeat((i % 40) as usize);
+            stream.add(StreamId { ms: i, seq: 0 }, &[(b"f", value.as_bytes())]);
+        }
+        stream.delete(StreamId { ms: 120, seq: 0 });
+        stream.trim(Trim::MaxLen(300), false, 0);
+        let mut empty = BigStream::default();
+        empty.add(StreamId { ms: 9, seq: 9 }, &[(b"a", b"b")]);
+        empty.trim(Trim::MaxLen(0), false, 0);
+        for (key, value) in [(&b"s"[..], stream.clone()), (b"empty", empty)] {
+            let mut made = Some(Collection::Stream(value));
+            s.update_collection(s.key(key), now, false, |_| {
+                (Update::Object(made.take().unwrap()), ())
+            })
+            .unwrap();
+        }
+        assert_eq!(save(&s, &path).unwrap(), 2);
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        let t = Store::new(4);
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
+        let mut reloaded = t
+            .update_collection(t.key(b"s"), t.now(), false, |entry| {
+                match entry.unwrap().value {
+                    crate::store::EntryValue::Object(Collection::Stream(s)) => {
+                        (Update::Peek, s.clone())
+                    }
+                    _ => panic!("not a stream"),
+                }
+            })
+            .unwrap();
+        assert_eq!(reloaded.to_compact(), stream.to_compact());
+        assert_eq!(
+            reloaded.trim(Trim::MaxLen(1), true, 0),
+            stream.trim(Trim::MaxLen(1), true, 0)
+        );
+        let last = t
+            .update_collection(t.key(b"empty"), t.now(), false, |entry| {
+                match entry.unwrap().value {
+                    crate::store::EntryValue::Object(Collection::Stream(s)) => {
+                        (Update::Peek, (s.len(), s.last_id()))
+                    }
+                    _ => panic!("not a stream"),
+                }
+            })
+            .unwrap();
+        assert_eq!(last, (0, StreamId { ms: 9, seq: 9 }));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -660,7 +726,8 @@ mod tests {
         })
         .unwrap();
         save(&s, &path).unwrap();
-        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        // No streams: still version 3, which 0.14 reads.
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V3));
         let t = Store::new(4);
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
         assert_eq!(
@@ -798,7 +865,7 @@ mod tests {
             ),
             ("an empty hash", file_of(MAGIC, &record(HASH, b"\x00"), 1)),
             ("an unknown kind", file_of(MAGIC, &record(9, b"x"), 1)),
-            ("a newer version", file_of(b"TANTALUM SNAPSHOT 4\n", &[], 0)),
+            ("a newer version", file_of(b"TANTALUM SNAPSHOT 5\n", &[], 0)),
         ] {
             fs::write(&path, file).unwrap();
             let err = load(&Store::new(1), &path).unwrap_err();

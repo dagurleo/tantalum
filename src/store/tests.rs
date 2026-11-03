@@ -47,6 +47,9 @@ impl ShardInner {
                         let object = self.objects[index].as_ref().unwrap();
                         assert_eq!(object.value.kind(), header.kind(), "object {index} kind");
                         mem.objects += object.value.allocation_size();
+                        if let Collection::Stream(stream) = &object.value {
+                            stream.check();
+                        }
                     } else {
                         assert!(!externals_seen[index], "external {index} referenced twice");
                         externals_seen[index] = true;
@@ -1760,6 +1763,13 @@ mod random_commands {
         b"WATCH",
         b"UNWATCH",
         b"TIME",
+        b"XADD",
+        b"XLEN",
+        b"XRANGE",
+        b"XREVRANGE",
+        b"XDEL",
+        b"XTRIM",
+        b"XREAD",
         b"ZRANDMEMBER",
         b"ZSCAN",
         b"ZUNION",
@@ -1873,7 +1883,7 @@ mod random_commands {
     /// few keys: random arguments rarely line those up.
     fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
         const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
-        let choice = rng.below(20);
+        let choice = rng.below(25);
         let mut key = || rng.pick(KEYS).to_vec();
         let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
         let mut args = match choice {
@@ -1909,6 +1919,19 @@ mod random_commands {
             16 => vec![b"PUBLISH".to_vec(), key(), b"m".to_vec()],
             17 => vec![b"SPUBLISH".to_vec(), key(), b"m".to_vec()],
             18 => vec![b"UNSUBSCRIBE".to_vec(), key()],
+            19 => [vec![b"XADD".to_vec(), key()], words(&["*", "f", "v"])].concat(),
+            20 => [
+                vec![b"XADD".to_vec(), key()],
+                words(&["MAXLEN", "~", "3", "*", "a", "1", "b", "2"]),
+            ]
+            .concat(),
+            21 => [
+                words(&["XREAD", "BLOCK", "0", "STREAMS"]),
+                vec![key(), b"$".to_vec()],
+            ]
+            .concat(),
+            22 => [vec![b"XTRIM".to_vec(), key()], words(&["MAXLEN", "1"])].concat(),
+            23 => [vec![b"XDEL".to_vec(), key()], words(&["0-1"])].concat(),
             _ => vec![b"DEL".to_vec(), key()],
         };
         // The blocking ones take a timeout last, except the *MPOPs: first.

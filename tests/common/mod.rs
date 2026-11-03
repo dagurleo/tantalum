@@ -272,3 +272,20 @@ pub async fn read_reply(r: &mut BufReader<TcpStream>) -> Vec<u8> {
     }
     line
 }
+
+/// A buffered connection to a fresh server (`serve`), for raw replies.
+pub async fn connect_buffered() -> Client {
+    let stream = connect().await;
+    Client {
+        stream: BufReader::new(stream),
+    }
+}
+
+impl Client {
+    /// The next reply, raw bytes.
+    pub async fn raw_reply(&mut self) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(10), read_reply(&mut self.stream))
+            .await
+            .expect("timed out waiting for a reply")
+    }
+}

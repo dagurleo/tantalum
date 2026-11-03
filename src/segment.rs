@@ -46,6 +46,8 @@ pub enum Kind {
     /// Packed by `set.rs`, or with `EXTERNAL`, a big set (`collection.rs`).
     Set = 3,
     ZSet = 4,
+    /// Always an object (`stream.rs`).
+    Stream = 5,
 }
 
 impl Kind {
@@ -58,8 +60,8 @@ impl Kind {
             Kind::List,
             Kind::Set,
             Kind::ZSet,
+            Kind::Stream,
             // Never written.
-            Kind::String,
             Kind::String,
             Kind::String,
         ];
@@ -74,14 +76,15 @@ impl Kind {
             Kind::List => "list",
             Kind::Set => "set",
             Kind::ZSet => "zset",
+            Kind::Stream => "stream",
         }
     }
 
-    /// Lists, sets and sorted sets: when too big to stay packed, an
-    /// `EXTERNAL` entry of these kinds is an object (`collection.rs`) rather
-    /// than bytes in an `entry.rs` allocation.
+    /// Lists, sets, sorted sets and streams: when too big to stay packed
+    /// (streams always), an `EXTERNAL` entry of these kinds is an object
+    /// (`collection.rs`) rather than bytes in an `entry.rs` allocation.
     pub fn is_collection(self) -> bool {
-        matches!(self, Kind::List | Kind::Set | Kind::ZSet)
+        matches!(self, Kind::List | Kind::Set | Kind::ZSet | Kind::Stream)
     }
 }
 

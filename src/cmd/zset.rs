@@ -1069,6 +1069,7 @@ fn mpop(
         timeout,
         kind: Kind::ZSet,
         nil_bulk: false,
+        args: None,
     }
 }
 
@@ -1116,6 +1117,7 @@ fn blocking_pop(
         timeout,
         kind: Kind::ZSet,
         nil_bulk: false,
+        args: None,
     }
 }
 

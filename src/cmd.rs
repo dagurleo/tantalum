@@ -6,6 +6,7 @@ mod list;
 mod multi;
 mod pubsub;
 mod set;
+mod stream;
 mod zset;
 
 use std::ops::Range;
@@ -262,6 +263,13 @@ static COMMANDS: &[Command] = &[
     Command { name: "zmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: zset::zmpop },
     Command { name: "bzpopmin", arity: -3, flags: &["write", "blocking", "fast"], keys: (1, -2, 1), run: zset::bzpopmin },
     Command { name: "bzpopmax", arity: -3, flags: &["write", "blocking", "fast"], keys: (1, -2, 1), run: zset::bzpopmax },
+    Command { name: "xadd", arity: -5, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: stream::xadd },
+    Command { name: "xlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: stream::xlen },
+    Command { name: "xrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: stream::xrange },
+    Command { name: "xrevrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: stream::xrevrange },
+    Command { name: "xdel", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: stream::xdel },
+    Command { name: "xtrim", arity: -4, flags: &["write"], keys: ONE_KEY, run: stream::xtrim },
+    Command { name: "xread", arity: -4, flags: &["readonly", "blocking"], keys: NO_KEYS, run: stream::xread },
     Command { name: "bzmpop", arity: -5, flags: &["write", "blocking"], keys: NO_KEYS, run: zset::bzmpop },
     Command { name: "zrandmember", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: zset::zrandmember },
     Command { name: "zscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: zset::zscan },

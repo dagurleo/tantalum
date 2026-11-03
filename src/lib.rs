@@ -17,6 +17,7 @@ mod set;
 mod shard_lock;
 pub mod snapshot;
 pub mod store;
+mod stream;
 mod table;
 mod transaction;
 mod wake;
