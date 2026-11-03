@@ -8,6 +8,7 @@ impl ShardInner {
         let mut mem = Mem {
             expired: self.mem.expired,
             evicted: self.mem.evicted,
+            writes: self.mem.writes,
             ..Mem::default()
         };
         let mut live_locs = HashSet::new();

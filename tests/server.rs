@@ -1421,3 +1421,32 @@ async fn connection_buffers_count_as_used_memory() {
     }
     assert!(now_held < 200_000, "{now_held}");
 }
+
+#[tokio::test]
+async fn snapshot_commands_when_snapshots_are_off() {
+    let mut c = connect(start().await).await;
+    let off: &[u8] = b"-ERR snapshots are off: start Tantalum with --snapshot <file>\r\n";
+    check(
+        &mut c,
+        &[
+            req(&[b"SAVE"]),
+            req(&[b"BGSAVE"]),
+            req(&[b"BGSAVE", b"SCHEDULE"]),
+        ]
+        .concat(),
+        &[off, off, b"-ERR syntax error\r\n"].concat(),
+    )
+    .await;
+    let lastsave = integer(&mut c, &req(&[b"LASTSAVE"])).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert!((now - 60..=now).contains(&lastsave), "{lastsave}");
+    c.write_all(&req(&[b"INFO"])).await.unwrap();
+    let info = String::from_utf8(read_reply(&mut c).await).unwrap();
+    assert!(
+        info.contains("# Persistence\r\nloading:0\r\nsnapshots:off\r\n"),
+        "{info}"
+    );
+}

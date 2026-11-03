@@ -7,5 +7,6 @@ mod pages;
 pub mod resp;
 mod segment;
 pub mod server;
+pub mod snapshot;
 pub mod store;
 mod table;

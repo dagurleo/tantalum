@@ -2,9 +2,10 @@
 
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
-`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends) with TTLs, eviction
-and a password, and that's the point: be a faster drop-in for the "Redis as a
-cache" use case, using as little memory as possible.
+`MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends) with TTLs, eviction,
+a password and optional snapshots to disk, and that's the point: be a faster
+drop-in for the "Redis as a cache" use case, using as little memory as
+possible.
 
 Named after the metal of tantalum capacitors, known for packing the most into
 the least space. (It was called ferrokv until v0.2; the raw logs in
@@ -15,6 +16,7 @@ cargo run --release -- --port 6379      # --threads N, --shards N, --bind ADDR
 cargo run --release -- --maxmemory 2gb --maxmemory-policy allkeys-lru
 TANTALUM_REQUIREPASS=s3cret cargo run --release -- --bind 0.0.0.0   # or --requirepass
 cargo run --release -- --maxclients 2000 --timeout 300 --tcp-keepalive 60
+cargo run --release -- --snapshot data/tantalum.snapshot   # keep data across restarts
 redis-cli SET greeting hello EX 60
 redis-cli GET greeting
 ```
@@ -47,7 +49,8 @@ check (`tests/server.rs`).
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | RESP3 too: redis-py 8 won't connect without it. For these commands it only changes nulls, maps (`HELLO`, `CONFIG GET`), sets (`COMMAND` flags) and `INFO` (verbatim text) |
 | `CLIENT SETNAME\|GETNAME\|ID\|SETINFO` | What client libraries send on connect |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
-| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX` and `GETDEL`), `evicted_keys`, `expired_keys` and the keyspace line |
+| `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
+| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX` and `GETDEL`), `evicted_keys`, `expired_keys`, a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
 | `PING [msg]`, `ECHO msg`, `SELECT 0`, `QUIT` | |
 
 Anything else gets `-ERR unknown command ...` and the connection stays open.
@@ -162,6 +165,17 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
     without this a panic on `--io uring` would take down a whole I/O thread.
   - Server counters are per thread (one cache line each) and published once
     per read, so `INFO`'s totals cost the request path no shared writes.
+- **Snapshots** (`src/snapshot.rs`, `--snapshot FILE`): like Redis' RDB
+  files. Every `--snapshot-interval` (60 s) with changes, on `SAVE`/`BGSAVE`
+  and after a graceful shutdown, the live keys go to the file: key, value,
+  and the expiry as a Unix time, so TTLs carry over and keys that expired
+  while the server was down are dropped at startup. Each shard is copied out
+  under its lock (a few MB: about a millisecond) and written after, so a save
+  is consistent per shard, not across the store. It writes `FILE.tmp`, syncs
+  it and renames it over the old one, and a CRC32 over the whole file is
+  checked before anything loads: a damaged snapshot stops the server rather
+  than being overwritten by an empty one. A crash loses what changed since
+  the last save; a deploy (SIGTERM) loses nothing.
 - **Lock hygiene**: hashing and big-value allocations happen before locking.
   Values ≤ 16 KB are copied out under the lock; larger ones are shared by
   refcount and written with `writev` after unlocking. Freed big values are
@@ -496,8 +510,8 @@ hit rates share the seeding flaw described above.
 - No `instantaneous_ops_per_sec`, latency histograms or a slow log.
 - The server binds to `127.0.0.1` by default. If you expose it, set a password:
   traffic isn't encrypted (no TLS), so keep it on a private network.
-- Persistence, replication, other data types, ACL users, Lua, pub/sub,
-  `SCAN`/`KEYS`.
+- An append-only log (snapshots only), replication, other data types, ACL
+  users, Lua, pub/sub, `SCAN`/`KEYS`.
 - LFU and random eviction policies, `CONFIG SET` at runtime.
 
 ## Development

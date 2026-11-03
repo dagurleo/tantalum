@@ -1,9 +1,11 @@
 use std::net::ToSocketAddrs;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tantalum::context::{Context, Settings};
 use tantalum::server;
+use tantalum::snapshot::{self, Snapshots};
 use tantalum::store::{self, EvictionPolicy};
 use tokio::net::TcpListener;
 
@@ -38,11 +40,17 @@ Options:
   --tcp-keepalive <SECS>
                     Probe idle connections after this long to detect dead
                     clients; 0 turns it off [default: 300]
+  --snapshot <FILE> Keep the data across restarts: load FILE at startup if it
+                    exists, save to it periodically and at shutdown
+                    [default: none, nothing is saved]
+  --snapshot-interval <SECS>
+                    Save this often if anything changed; 0 saves only at
+                    shutdown and on SAVE or BGSAVE [default: 60]
   -h, --help        Print this help
 
 On SIGTERM or SIGINT, Tantalum stops accepting, lets each connection finish
-the commands it has read, and exits once they've closed (at most 10 s). A
-second signal exits at once.";
+the commands it has read, waits until they've closed (at most 10 s), saves a
+snapshot if --snapshot is set, and exits. A second signal exits at once.";
 
 /// How long a graceful shutdown waits for connections to close.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,6 +63,8 @@ struct Config {
     io: Option<Io>,
     store: store::Config,
     settings: Settings,
+    snapshot: Option<PathBuf>,
+    snapshot_interval: Option<Duration>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +143,8 @@ fn parse_args() -> Result<Config, String> {
                 .map(String::into_bytes),
             ..Settings::default()
         },
+        snapshot: None,
+        snapshot_interval: Some(Duration::from_secs(60)),
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -168,6 +180,10 @@ fn parse_args() -> Result<Config, String> {
             "--timeout" => config.settings.timeout = parse_secs(&value).ok_or_else(|| bad(()))?,
             "--tcp-keepalive" => {
                 config.settings.tcp_keepalive = parse_secs(&value).ok_or_else(|| bad(()))?;
+            }
+            "--snapshot" => config.snapshot = Some(PathBuf::from(value)),
+            "--snapshot-interval" => {
+                config.snapshot_interval = parse_secs(&value).ok_or_else(|| bad(()))?;
             }
             _ => return Err(format!("unknown option: {flag}")),
         }
@@ -210,8 +226,15 @@ fn main() -> std::io::Result<()> {
     #[cfg(unix)]
     raise_open_file_limit(config.settings.maxclients);
     let store = Arc::new(store::Store::with_config(config.store.clone()));
+    let mut ctx = Context::new(store.clone(), config.settings.clone());
+    if let Some(path) = &config.snapshot {
+        load_snapshot(&store, path);
+        let snapshots = Snapshots::new(store.clone(), path.clone(), config.snapshot_interval);
+        snapshots.spawn_periodic()?;
+        ctx = ctx.with_snapshots(snapshots);
+    }
     let _expirer = store::spawn_expirer(&store, Duration::from_millis(100));
-    let ctx = Arc::new(Context::new(store, config.settings.clone()));
+    let ctx = Arc::new(ctx);
     server::handle_signals(ctx.clone())?;
     let banner = |addr: std::net::SocketAddr| {
         let limit = match config.store.maxmemory {
@@ -265,10 +288,48 @@ fn main() -> std::io::Result<()> {
         }
     }
     match server::drain(&ctx, SHUTDOWN_TIMEOUT) {
-        0 => eprintln!("all connections closed: exiting"),
-        open => {
-            eprintln!("{open} connections still open after {SHUTDOWN_TIMEOUT:?}: exiting anyway")
+        0 => eprintln!("all connections closed"),
+        open => eprintln!("{open} connections still open after {SHUTDOWN_TIMEOUT:?}"),
+    }
+    if let Some(snapshots) = &ctx.snapshots
+        && let Ok(keys) = snapshots.save()
+    {
+        eprintln!("saved {keys} keys to {}", snapshots.path.display());
+    }
+    eprintln!("exiting");
+    Ok(())
+}
+
+/// Loads the snapshot at `path`, if there is one. A damaged one stops the
+/// server, as in Redis: starting empty would overwrite it at the next save.
+fn load_snapshot(store: &store::Store, path: &std::path::Path) {
+    let started = Instant::now();
+    match snapshot::load(store, path) {
+        Ok(None) => eprintln!("no snapshot at {} yet: starting empty", path.display()),
+        Ok(Some(loaded)) => {
+            let mut line = format!(
+                "loaded {} keys from {} in {} ms",
+                loaded.keys,
+                path.display(),
+                started.elapsed().as_millis()
+            );
+            if loaded.expired > 0 {
+                line += &format!("; {} had expired", loaded.expired);
+            }
+            if loaded.dropped > 0 {
+                line += &format!(
+                    "; {} didn't fit in --maxmemory and were dropped",
+                    loaded.dropped
+                );
+            }
+            eprintln!("{line}");
+        }
+        Err(e) => {
+            eprintln!(
+                "error: can't load the snapshot {}: {e}. Move it away to start without it.",
+                path.display()
+            );
+            std::process::exit(1);
         }
     }
-    Ok(())
 }

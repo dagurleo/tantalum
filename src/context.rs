@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use crate::resp;
+use crate::snapshot::Snapshots;
 use crate::store::Store;
 
 /// Settings that apply to connections rather than the store.
@@ -73,6 +74,8 @@ thread_local! {
 pub struct Context {
     pub store: Arc<Store>,
     pub settings: Settings,
+    /// Set when the server saves snapshots (`--snapshot`).
+    pub snapshots: Option<Arc<Snapshots>>,
     started: Instant,
     next_client_id: AtomicU64,
     /// Open connections, by client id, so shutdown can reach them.
@@ -91,6 +94,7 @@ impl Context {
         Context {
             store,
             settings,
+            snapshots: None,
             started: Instant::now(),
             next_client_id: AtomicU64::new(1),
             clients: Mutex::new(HashMap::new()),
@@ -101,6 +105,12 @@ impl Context {
             shutting_down: AtomicBool::new(false),
             shutdown: watch::Sender::new(false),
         }
+    }
+
+    /// Saves snapshots with `snapshots` (for `SAVE`, `BGSAVE` and `INFO`).
+    pub fn with_snapshots(mut self, snapshots: Arc<Snapshots>) -> Self {
+        self.snapshots = Some(snapshots);
+        self
     }
 
     /// Registers a new connection on `fd`. `None` if `maxclients` are

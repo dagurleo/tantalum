@@ -56,7 +56,7 @@ use crate::table::{self, Table};
 /// Milliseconds on the store's monotonic clock. Starts at 1; 0 means "no expiry".
 pub type Millis = u64;
 
-const NO_EXPIRY: Millis = 0;
+pub const NO_EXPIRY: Millis = 0;
 
 /// Latest representable deadline.
 pub const MAX_DEADLINE: Millis = i64::MAX as u64;
@@ -350,6 +350,9 @@ struct Mem {
     with_ttl: usize,
     expired: u64,
     evicted: u64,
+    /// Changes made by commands (writes, deletes, TTL changes), so a
+    /// snapshot can tell whether anything changed since the last one.
+    writes: u64,
 }
 
 impl ShardInner {
@@ -1270,6 +1273,7 @@ impl Store {
             if existing.is_some() && live.is_none() {
                 inner.mem.expired += 1;
             }
+            inner.mem.writes += 1;
             inner.maybe_defrag(self.near_limit(), now, &self.hasher, &mut garbage);
             self.sync_usage(shard, inner, false);
             return Ok(SetOutcome {
@@ -1335,6 +1339,7 @@ impl Store {
                     if let Some((loc, header, range)) = in_place {
                         inner.segment_mut(split(loc).0).buf[range].copy_from_slice(value);
                         inner.touch(loc, header);
+                        inner.mem.writes += 1;
                     } else {
                         let (old, deadline, usage) = match &existing {
                             Some((loc, header)) => (
@@ -1387,6 +1392,7 @@ impl Store {
                             return Err(OutOfMemory);
                         };
                         garbage.extend(inner.replace(hash, old, new));
+                        inner.mem.writes += 1;
                         changed = true;
                     }
                 }
@@ -1395,6 +1401,7 @@ impl Store {
                 (Update::Delete, Some((loc, _))) => {
                     inner.unlink(hash, *loc);
                     garbage.extend(inner.kill(*loc));
+                    inner.mem.writes += 1;
                     changed = true;
                 }
                 (Update::Expire(expiry), Some((loc, header))) => {
@@ -1409,6 +1416,7 @@ impl Store {
                     } else {
                         inner.set_deadline(hash, key, *loc, header, deadline);
                     }
+                    inner.mem.writes += 1;
                     changed = true;
                 }
             }
@@ -1434,6 +1442,7 @@ impl Store {
                 let mut empty = ShardInner::default();
                 empty.mem.expired = inner.mem.expired;
                 empty.mem.evicted = inner.mem.evicted;
+                empty.mem.writes = inner.mem.writes + 1;
                 let old = std::mem::replace(inner, empty);
                 self.used.fetch_sub(flushed, Relaxed);
                 self.sync_usage(shard, inner, true);
@@ -1441,6 +1450,43 @@ impl Store {
             };
             drop(old); // frees its memory outside the lock
         }
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Calls `f` with the key, value and deadline (`NO_EXPIRY` for none) of
+    /// every live entry in shard `index`, holding its lock throughout: keep
+    /// `f` quick, such as copying into a buffer.
+    pub fn for_each_live(
+        &self,
+        index: usize,
+        now: Millis,
+        mut f: impl FnMut(&[u8], &[u8], Millis),
+    ) {
+        let inner = self.shards[index].inner.lock();
+        for seg in inner.segments.iter().flatten() {
+            for (_, header) in seg.entries() {
+                if header.is_dead() || header.is_expired(now) {
+                    continue;
+                }
+                let key = ShardInner::entry_key(&seg.buf, &header, &inner.externals);
+                let value = match &header.body {
+                    Body::Inline { value, .. } => &seg.buf[value.clone()],
+                    Body::External(i) => inner.externals[*i as usize]
+                        .as_ref()
+                        .expect("live external")
+                        .value(),
+                };
+                f(key, value, header.deadline);
+            }
+        }
+    }
+
+    /// How many changes commands have made so far (see `Mem::writes`).
+    pub fn changes(&self) -> u64 {
+        self.shards.iter().map(|s| s.inner.lock().mem.writes).sum()
     }
 
     pub fn maxmemory(&self) -> usize {

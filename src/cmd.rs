@@ -143,6 +143,9 @@ static COMMANDS: &[Command] = &[
     Command { name: "command", arity: -1, flags: &["loading", "stale"], keys: NO_KEYS, run: command },
     Command { name: "config", arity: -2, flags: &[], keys: NO_KEYS, run: config },
     Command { name: "flushall", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
+    Command { name: "save", arity: 1, flags: &["admin", "noscript"], keys: NO_KEYS, run: save },
+    Command { name: "bgsave", arity: -1, flags: &["admin", "noscript"], keys: NO_KEYS, run: bgsave },
+    Command { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: lastsave },
     Command { name: "flushdb", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
     Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: quit },
 ];
@@ -834,6 +837,51 @@ fn flush(ctx: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut V
     Reply::Written
 }
 
+const SNAPSHOTS_OFF: &[u8] = b"ERR snapshots are off: start Tantalum with --snapshot <file>";
+
+/// `SAVE`: writes a snapshot now. Like Redis' it holds up its caller (and
+/// this connection's I/O thread) until done.
+fn save(ctx: &Context, _: &mut Session, _: Millis, _: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+    match &ctx.snapshots {
+        None => resp::write_error(out, SNAPSHOTS_OFF),
+        Some(snapshots) => match snapshots.save() {
+            Ok(_) => out.extend_from_slice(resp::OK),
+            Err(e) => resp::write_error(out, format!("ERR snapshot failed: {e}").as_bytes()),
+        },
+    }
+    Reply::Written
+}
+
+/// `BGSAVE`: writes a snapshot on another thread.
+fn bgsave(ctx: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+    match &ctx.snapshots {
+        _ if args.len() > 1 => resp::write_error(out, SYNTAX_ERROR),
+        None => resp::write_error(out, SNAPSHOTS_OFF),
+        Some(snapshots) if snapshots.save_in_background() => {
+            resp::write_simple(out, b"Background saving started");
+        }
+        Some(_) => resp::write_error(out, b"ERR Background save already in progress"),
+    }
+    Reply::Written
+}
+
+/// `LASTSAVE`: the Unix time of the last successful save, or of startup.
+fn lastsave(ctx: &Context, _: &mut Session, _: Millis, _: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+    let time = match &ctx.snapshots {
+        Some(snapshots) => snapshots.status().last_save,
+        None => unix_seconds() - ctx.stats().uptime.as_secs() as i64,
+    };
+    resp::write_integer(out, time);
+    Reply::Written
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 fn ping(_: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
     match args.len() {
         1 => out.extend_from_slice(resp::PONG),
@@ -1167,7 +1215,15 @@ fn config(
             ("maxmemory", store.maxmemory().to_string()),
             ("maxmemory-policy", store.policy().name().to_string()),
             ("databases", "1".to_string()),
-            ("save", String::new()),
+            // In Redis' "seconds changes" form: save after this long if
+            // anything changed.
+            (
+                "save",
+                ctx.snapshots
+                    .as_ref()
+                    .and_then(|s| s.interval)
+                    .map_or(String::new(), |i| format!("{} 1", i.as_secs())),
+            ),
             ("appendonly", "no".to_string()),
         ];
         let matching: Vec<_> = settings
@@ -1322,13 +1378,36 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
     }
     let _ = write!(
         s,
-        "maxmemory:{}\r\nmaxmemory_policy:{}\r\n\r\n\
-         # Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
+        "maxmemory:{}\r\nmaxmemory_policy:{}\r\n\r\n",
+        stats.maxmemory,
+        stats.policy.name(),
+    );
+    // Redis' field names, so monitoring tools find them.
+    let _ = write!(s, "# Persistence\r\nloading:0\r\n");
+    match &ctx.snapshots {
+        Some(snapshots) => {
+            let status = snapshots.status();
+            let _ = write!(
+                s,
+                "snapshots:on\r\nsnapshot_file:{}\r\nrdb_changes_since_last_save:{}\r\n\
+                 rdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\n\r\n",
+                snapshots.path.display(),
+                snapshots.unsaved_changes(),
+                u8::from(snapshots.saving_in_background()),
+                status.last_save,
+                if status.last_ok { "ok" } else { "err" },
+            );
+        }
+        None => {
+            let _ = write!(s, "snapshots:off\r\n\r\n");
+        }
+    }
+    let _ = write!(
+        s,
+        "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
          keyspace_hits:{}\r\nkeyspace_misses:{}\r\n\r\n\
          # Keyspace\r\n",
-        stats.maxmemory,
-        stats.policy.name(),
         server.total_connections,
         server.total_commands,
         server.rejected_connections,

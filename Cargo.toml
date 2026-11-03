@@ -1,10 +1,11 @@
 [package]
 name = "tantalum"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 
 [dependencies]
 foldhash = "0.2.0"
+crc32fast = "1.5"
 allocator-api2 = { version = "0.2.9", default-features = false, features = ["alloc"] }
 itoa = "1.0.18"
 memchr = "2.8.3"
