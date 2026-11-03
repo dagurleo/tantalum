@@ -297,8 +297,8 @@ pub(super) fn pubsub(
 }
 
 /// `RESET`: the connection as it was when it connected: no subscriptions
-/// (nor messages waiting), RESP2, no name, and if there's a password, not
-/// authenticated.
+/// (nor messages waiting), transaction or watched keys, RESP2, no name, and
+/// if there's a password, not authenticated.
 pub(super) fn reset(
     ctx: &Context,
     session: &mut Session,
@@ -307,6 +307,8 @@ pub(super) fn reset(
     out: &mut Vec<u8>,
 ) -> Reply {
     session.end_subscriptions(true);
+    session.multi = None;
+    session.watching = None;
     session.name = None;
     session.set_resp3(false);
     session.set_authenticated(!ctx.has_password());

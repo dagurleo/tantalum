@@ -98,7 +98,10 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE channel\|pattern [...]`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `SUNSUBSCRIBE [...]` | Messages are pushes in RESP3. Subscribed in RESP2, a client may only run these, `PING`, `QUIT` and `RESET`, as in Redis. Shard channels are a namespace of their own (one server is one shard) |
 | `PUBLISH channel message`, `SPUBLISH` | Replies how many got it; a client subscribed both by channel and by pattern gets it twice. One publishing to its own channel gets the reply, then the message, as from Redis 7.2 |
 | `PUBSUB CHANNELS [pattern]\|NUMSUB [channel ...]\|NUMPAT\|SHARDCHANNELS\|SHARDNUMSUB\|HELP` | |
-| `PING [msg]`, `ECHO msg`, `SELECT 0`, `QUIT`, `RESET` | `RESET` drops subscriptions, RESP3 and the name, and with a password, authentication |
+| `MULTI`, `EXEC`, `DISCARD` | `EXEC` runs the queued commands with the whole store to itself, so no other client's command runs in between, as in Redis. A command refused while queueing (unknown, wrong arity, `SAVE`) makes `EXEC` refuse them all; errors while running are among its replies. Blocking commands inside reply at once, as if timed out |
+| `WATCH key [key ...]`, `UNWATCH` | `EXEC` replies nil if a watched key changed meanwhile: written, deleted, expired or evicted (by anyone, the watcher too), as in Redis 7.2 |
+| `TIME` | |
+| `PING [msg]`, `ECHO msg`, `SELECT 0`, `QUIT`, `RESET` | `RESET` drops subscriptions, a transaction, watched keys, RESP3 and the name, and with a password, authentication |
 
 Anything else gets `-ERR unknown command ...` and the connection stays open.
 With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
@@ -202,6 +205,20 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   `ZREVRANGE 0 9 WITHSCORES` ~1 µs, `ZREM` ~1.6 µs. Scores reply exactly
   as Redis 7.2 prints them: shortest digits, laid out as JavaScript's
   `Number.prototype.toString` (plain from 1e-6 up to 1e21).
+- **Transactions** (`src/transaction.rs`, `src/shard_lock.rs`): `EXEC`
+  locks every shard, in shard order like everything that locks two, and
+  runs the queued commands as they always run; nothing else touches the
+  store meanwhile, as with Redis' single thread. That works because a
+  shard's lock lets the thread holding every shard for a transaction take
+  it again: outside transactions, taking a lock costs one read more, of a
+  counter only transactions write (the speed guard saw no difference). A
+  `WATCH` registers the client on the key in its shard; every write,
+  removal, expiry and eviction there marks the key's watchers, which costs
+  writes one check of a field in cache while nothing is watched. `EXEC`
+  checks the mark holding every shard, so no change slips in between. 101
+  write commands, no-ops included (`SET NX` of an existing key, `LREM` of
+  nothing, `LTRIM` keeping all), change a watched key exactly when they do
+  in Redis 7.2.4.
 - **Pub/sub** (`src/pubsub.rs`): channels map to their subscribers in 64
   shards, so publishers on different threads rarely meet, and patterns are
   a list each `PUBLISH` matches, as in Redis, skipped while there are none.
@@ -687,8 +704,12 @@ hit rates share the seeding flaw described above.
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
 - An append-only log (snapshots only), replication,
-  ACL users, Lua, `MULTI`/`EXEC`, streams, `COPY`, `RANDOMKEY`, `OBJECT`,
+  ACL users, Lua, streams, `COPY`, `RANDOMKEY`, `OBJECT`,
   `DUMP`/`RESTORE`.
+- **Transaction gaps**: Redis refuses a write command with `-OOM` while
+  queueing when memory is over `maxmemory`; Tantalum queues it and the
+  error is among `EXEC`'s replies. Queued commands aren't counted as client
+  memory.
 - **Pub/sub gaps**: no keyspace notifications, no `CLIENT LIST` (or its
   flags), and the output limit is fixed at Redis' defaults. The registry's
   own memory (channel names and their subscriber tables) isn't in

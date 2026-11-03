@@ -54,6 +54,7 @@ use crate::entry::KeyValue;
 use crate::pages;
 pub use crate::segment::Kind;
 use crate::segment::{self, Body, Header, MAX_USAGE, Payload, Segment};
+use crate::shard_lock::{self, ShardLock};
 use crate::table::{self, Table};
 
 /// Milliseconds on the store's monotonic clock. Starts at 1; 0 means "no expiry".
@@ -526,7 +527,7 @@ enum Compaction {
 // threads hammering neighboring shards don't false-share.
 #[repr(align(128))]
 struct Shard {
-    inner: Mutex<ShardInner>,
+    inner: ShardLock<ShardInner>,
     /// Copies of the shard's footprint and TTL key count, readable without the
     /// lock, used to steer eviction toward shards with the most to give.
     footprint: AtomicUsize,
@@ -563,6 +564,16 @@ struct ShardInner {
     sweep_cursor: usize,
     /// Clients blocked on keys of this shard, by key, first come first.
     waiting: HashMap<Box<[u8]>, VecDeque<Arc<Waiter>>, foldhash::fast::RandomState>,
+    /// Clients watching keys of this shard (`WATCH`), by key.
+    watched: HashMap<Box<[u8]>, Vec<Watcher>, foldhash::fast::RandomState>,
+}
+
+/// A client watching a key: its flag is set when the key changes.
+struct Watcher {
+    flag: Arc<AtomicBool>,
+    /// The key had expired already when it was watched, so its removal
+    /// isn't a change (as in Redis).
+    expired: bool,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,6 +605,25 @@ impl ShardInner {
 
     fn segment_mut(&mut self, id: usize) -> &mut Segment {
         self.segments[id].as_mut().expect("live segment")
+    }
+
+    /// After `key` changed (written, removed, expired or evicted): marks
+    /// the clients watching it. An expiry isn't a change to those that found
+    /// it expired already.
+    #[inline]
+    fn changed(&self, key: &[u8], by_expiry: bool) {
+        if !self.watched.is_empty() {
+            self.mark_watchers(key, by_expiry);
+        }
+    }
+
+    #[cold]
+    fn mark_watchers(&self, key: &[u8], by_expiry: bool) {
+        for watcher in self.watched.get(key).into_iter().flatten() {
+            if !(by_expiry && watcher.expired) {
+                watcher.flag.store(true, Relaxed);
+            }
+        }
     }
 
     /// Key bytes of the entry described by `header` in `buf`.
@@ -644,6 +674,7 @@ impl ShardInner {
         if let Some((loc, header)) = &existing
             && header.is_expired(now)
         {
+            self.changed(key, true);
             self.unlink(hash, *loc);
             garbage.extend(self.kill(*loc));
             self.mem.expired += 1;
@@ -1071,6 +1102,10 @@ impl ShardInner {
                 }
                 // Out of segment ids (practically unreachable): drop it instead.
             }
+            self.changed(
+                Self::entry_key(&seg.buf, &header, &self.externals, &self.objects),
+                expired,
+            );
             let unlinked = self.unlink(hash, old);
             debug_assert!(unlinked, "live entry without a slot");
             if let Body::External(index) = header.body {
@@ -1217,6 +1252,7 @@ impl ShardInner {
                 }
                 if header.deadline <= now {
                     let key = Self::entry_key(&seg.buf, &header, &self.externals, &self.objects);
+                    self.changed(key, true);
                     due.push((offset, slot_hash(hasher, key)));
                 } else if next == NO_EXPIRY || header.deadline < next {
                     next = header.deadline;
@@ -1383,7 +1419,7 @@ impl Store {
         Store {
             shards: (0..n)
                 .map(|_| Shard {
-                    inner: Mutex::new(ShardInner::default()),
+                    inner: ShardLock::new(ShardInner::default()),
                     footprint: AtomicUsize::new(0),
                     with_ttl: AtomicUsize::new(0),
                     table_base: AtomicUsize::new(0),
@@ -1571,6 +1607,7 @@ impl Store {
                 inner.touch(loc, &header);
                 return f(Some(inner.value_ref(loc, &header)));
             }
+            inner.changed(key, true);
             inner.unlink(hash, loc);
             expired = inner.kill(loc);
             inner.mem.expired += 1;
@@ -1770,6 +1807,7 @@ impl Store {
                 inner.mem.expired += 1;
             }
             inner.mem.writes += 1;
+            inner.changed(key, false);
             inner.maybe_defrag(self.near_limit(), now, &self.hasher, &mut garbage);
             self.sync_usage(shard, inner, false);
             return Ok(SetOutcome {
@@ -2006,12 +2044,14 @@ impl Store {
                 // `with_entry` already counted its new size.
                 inner.touch(*loc, header);
                 inner.mem.writes += 1;
+                inner.changed(key, false);
                 return Ok(true);
             }
             (Update::Delete, Some((loc, _))) => {
                 inner.unlink(hash, *loc);
                 garbage.extend(inner.kill(*loc));
                 inner.mem.writes += 1;
+                inner.changed(key, false);
                 return Ok(true);
             }
             (Update::Expire(expiry), Some((loc, header))) => {
@@ -2027,6 +2067,7 @@ impl Store {
                     inner.set_deadline(hash, key, *loc, header, deadline);
                 }
                 inner.mem.writes += 1;
+                inner.changed(key, false);
                 return Ok(true);
             }
         };
@@ -2047,6 +2088,7 @@ impl Store {
         };
         garbage.extend(inner.replace(hash, old, new));
         inner.mem.writes += 1;
+        inner.changed(key, false);
         Ok(true)
     }
 
@@ -2072,6 +2114,7 @@ impl Store {
             inner.segment_mut(split(*loc).0).buf[range.clone()].copy_from_slice(value);
             inner.touch(*loc, header);
             inner.mem.writes += 1;
+            inner.changed(key, false);
             return Ok(false);
         }
         let (old, deadline, usage) = match existing {
@@ -2111,6 +2154,7 @@ impl Store {
         };
         garbage.extend(inner.replace(hash, old, new));
         inner.mem.writes += 1;
+        inner.changed(key, false);
         Ok(true)
     }
 
@@ -2128,6 +2172,13 @@ impl Store {
                 empty.mem.evicted = inner.mem.evicted;
                 empty.mem.writes = inner.mem.writes + 1;
                 empty.waiting = std::mem::take(&mut inner.waiting);
+                // Watched keys that existed change.
+                for key in inner.watched.keys() {
+                    if inner.lookup(slot_hash(&self.hasher, key), key).is_some() {
+                        inner.mark_watchers(key, false);
+                    }
+                }
+                empty.watched = std::mem::take(&mut inner.watched);
                 let old = std::mem::replace(inner, empty);
                 self.used.fetch_sub(flushed, Relaxed);
                 self.sync_usage(shard, inner, true);
@@ -2211,6 +2262,48 @@ impl Store {
         .flatten()
     }
 
+    /// `WATCH`: sets `flag` when `key` changes from now on. Returns whether
+    /// the key had expired already.
+    pub(crate) fn watch(&self, key: Key<'_>, flag: &Arc<AtomicBool>, now: Millis) -> bool {
+        let (hash, index) = self.locate(key.hash);
+        let mut inner = self.shards[index].inner.lock();
+        let expired = inner
+            .lookup(hash, key.bytes)
+            .is_some_and(|(_, header)| header.is_expired(now));
+        inner
+            .watched
+            .entry(key.bytes.into())
+            .or_default()
+            .push(Watcher {
+                flag: flag.clone(),
+                expired,
+            });
+        expired
+    }
+
+    pub(crate) fn unwatch(&self, key: Key<'_>, flag: &Arc<AtomicBool>) {
+        let (_, index) = self.locate(key.hash);
+        let mut inner = self.shards[index].inner.lock();
+        if let Some(watchers) = inner.watched.get_mut(key.bytes) {
+            watchers.retain(|w| !Arc::ptr_eq(&w.flag, flag));
+            if watchers.is_empty() {
+                inner.watched.remove(key.bytes);
+                if inner.watched.is_empty() {
+                    inner.watched = HashMap::default();
+                }
+            }
+        }
+    }
+
+    /// Whether `key` is there but expired by `now` (not removed yet).
+    pub(crate) fn has_expired(&self, key: Key<'_>, now: Millis) -> bool {
+        let (hash, index) = self.locate(key.hash);
+        let inner = self.shards[index].inner.lock();
+        inner
+            .lookup(hash, key.bytes)
+            .is_some_and(|(_, header)| header.is_expired(now))
+    }
+
     /// Counts clients blocking (`delta` 1) or done (-1), for `INFO`.
     pub(crate) fn count_blocked(&self, delta: i64) {
         self.ready.blocked.fetch_add(delta, Relaxed);
@@ -2219,6 +2312,13 @@ impl Store {
     /// Clients blocked right now.
     pub fn blocked_clients(&self) -> usize {
         self.ready.blocked.load(Relaxed).max(0) as usize
+    }
+
+    /// Runs `f` with every shard locked by this thread, so that nothing
+    /// else touches the store meanwhile while `f` uses it as always: `EXEC`.
+    pub(crate) fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _holding = shard_lock::hold_all(self.shards.iter().map(|s| &s.inner));
+        f()
     }
 
     pub fn shard_count(&self) -> usize {
@@ -2310,6 +2410,7 @@ impl Store {
                 return Ok(Renamed::NoSuchKey);
             };
             if header.is_expired(now) {
+                src.changed(from.bytes, true);
                 src.unlink(from_hash, loc);
                 garbage.extend(src.kill(loc));
                 src.mem.expired += 1;
@@ -2395,6 +2496,7 @@ impl Store {
                 target.mem.expired += 1;
             }
             target.mem.writes += 1;
+            target.changed(to.bytes, false);
             // Like Redis, as if deleted and added again: clients blocked on
             // the destination may be served.
             if !target.waiting.is_empty() {
@@ -2407,6 +2509,7 @@ impl Store {
                 garbage.extend(src.kill(loc));
             }
             src.mem.writes += 1;
+            src.changed(from.bytes, false);
             let eager = self.near_limit();
             src.maybe_defrag(eager, now, &self.hasher, &mut garbage);
             self.sync_usage(&self.shards[a], src, false);

@@ -42,11 +42,14 @@ pub(crate) enum Attempt {
     /// It replied: with data, or an error.
     Done,
     /// Every key was empty, and nothing was written: wait on the arguments
-    /// `keys` for data of `kind`, for `timeout` (`None`: forever).
+    /// `keys` for data of `kind`, for `timeout` (`None`: forever). In a
+    /// transaction it replies nil at once instead: a null array, or with
+    /// `nil_bulk`, a null bulk string (as Redis' BLMOVE does).
     Wait {
         keys: Range<usize>,
         timeout: Option<Duration>,
         kind: Kind,
+        nil_bulk: bool,
     },
 }
 
@@ -180,6 +183,9 @@ impl Waiter {
             authenticated: true,
             unrestricted: true,
             pubsub: None,
+            multi: None,
+            watching: None,
+            deny_blocking: false,
             name: None,
             resp3: self.resp3,
             commands: 0,
@@ -230,10 +236,20 @@ pub(crate) fn block(
         keys,
         timeout,
         kind,
+        nil_bulk,
     } = attempt(ctx, session, now, args, out)
     else {
         return Reply::Written;
     };
+    if session.deny_blocking {
+        // In EXEC, which can't wait: as if timed out.
+        out.extend_from_slice(match (session.resp3, nil_bulk) {
+            (true, _) => resp::NULL,
+            (false, true) => resp::NULL_BULK,
+            (false, false) => b"*-1\r\n",
+        });
+        return Reply::Written;
+    }
     let mut buf = Vec::new();
     let mut ranges = Vec::with_capacity(args.len());
     for i in 0..args.len() {

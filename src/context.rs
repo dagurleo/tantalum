@@ -14,6 +14,7 @@ use crate::pubsub::{PubSub, Subscriber, Subscriptions};
 use crate::resp;
 use crate::snapshot::Snapshots;
 use crate::store::Store;
+use crate::transaction::{Queue, Watching};
 
 /// Settings that apply to connections rather than the store.
 #[derive(Debug, Clone)]
@@ -270,6 +271,9 @@ impl Client<'_> {
             authenticated,
             unrestricted: authenticated,
             pubsub: None,
+            multi: None,
+            watching: None,
+            deny_blocking: false,
             name: None,
             resp3: false,
             commands: 0,
@@ -308,11 +312,17 @@ impl Drop for Client<'_> {
 pub struct Session {
     pub(crate) id: u64,
     pub(crate) authenticated: bool,
-    /// Authenticated and not subscribed: commands take the fast path and
-    /// skip the checks below it. Kept by the setters.
+    /// Authenticated, not subscribed and not in `MULTI`: commands take the
+    /// fast path and skip the checks below it. Kept by [`Session::refresh`].
     pub(crate) unrestricted: bool,
     /// What the client is subscribed to, if anything.
     pub(crate) pubsub: Option<Box<Subscriptions>>,
+    /// The commands queued since `MULTI`.
+    pub(crate) multi: Option<Box<Queue>>,
+    /// The keys `WATCH`ed for the next `EXEC`.
+    pub(crate) watching: Option<Box<Watching>>,
+    /// Set while `EXEC` runs: blocking commands reply at once instead.
+    pub(crate) deny_blocking: bool,
     /// Set by `CLIENT SETNAME` or `HELLO ... SETNAME`.
     pub(crate) name: Option<Box<[u8]>>,
     /// Whether the client switched to RESP3 with `HELLO 3`.
@@ -344,7 +354,12 @@ impl Session {
 
     pub(crate) fn set_authenticated(&mut self, authenticated: bool) {
         self.authenticated = authenticated;
-        self.unrestricted = authenticated && self.pubsub.is_none();
+        self.refresh();
+    }
+
+    /// Recomputes `unrestricted` after what it depends on changed.
+    pub(crate) fn refresh(&mut self) {
+        self.unrestricted = self.authenticated && self.pubsub.is_none() && self.multi.is_none();
     }
 
     pub(crate) fn set_resp3(&mut self, resp3: bool) {
@@ -356,7 +371,7 @@ impl Session {
 
     /// Its subscriptions, made on its first subscribe.
     pub(crate) fn subscriptions(&mut self, pubsub: &Arc<PubSub>) -> &mut Subscriptions {
-        self.unrestricted = false;
+        self.unrestricted = false; // (as `refresh` would make it)
         let (id, resp3) = (self.id, self.resp3);
         self.pubsub
             .get_or_insert_with(|| Box::new(Subscriptions::new(pubsub, id, resp3)))
@@ -367,8 +382,13 @@ impl Session {
     pub(crate) fn end_subscriptions(&mut self, force: bool) {
         if force || self.pubsub.as_ref().is_some_and(|s| s.is_empty()) {
             self.pubsub = None;
-            self.unrestricted = self.authenticated;
+            self.refresh();
         }
+    }
+
+    /// Whether the client is in `MULTI`, queueing commands.
+    pub fn in_transaction(&self) -> bool {
+        self.multi.is_some()
     }
 
     /// Whether the client is subscribed to anything.

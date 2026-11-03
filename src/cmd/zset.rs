@@ -1068,6 +1068,7 @@ fn mpop(
         keys,
         timeout,
         kind: Kind::ZSet,
+        nil_bulk: false,
     }
 }
 
@@ -1114,6 +1115,7 @@ fn blocking_pop(
         keys,
         timeout,
         kind: Kind::ZSet,
+        nil_bulk: false,
     }
 }
 
