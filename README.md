@@ -30,6 +30,20 @@ To deploy, `deploy/Dockerfile` builds a small image with just the binary
 command. It listens on `::` (IPv4 and IPv6); set a password, and outside a
 private network add `--tls-port` with a certificate.
 
+A Railway setup that keeps data and serves both the private network and the
+internet: a volume at `/data`, `TANTALUM_REQUIREPASS`, the certificate and
+key as `TLS_CERT` and `TLS_KEY` variables, a TCP proxy to port 6380, a
+drain time of 15 s (so the final snapshot has time), and the start command
+
+```sh
+/bin/sh -c "printenv TLS_CERT > /tmp/cert.pem && printenv TLS_KEY > /tmp/key.pem && chmod 600 /tmp/key.pem && exec tantalum --bind :: --port 6379 --tls-port 6380 --tls-cert-file /tmp/cert.pem --tls-key-file /tmp/key.pem --maxmemory 256mb --maxmemory-policy noeviction --snapshot /data/tantalum.snapshot"
+```
+
+Services on the private network use `redis://default:<password>@<service>.railway.internal:6379`
+(with ioredis, add `?family=0` for IPv6); outside clients use
+`rediss://` to the proxy, pinning the certificate (a self-signed one whose
+names include the proxy's hostname works, and no CA has to renew it).
+
 ## Commands
 
 Replies match Redis 7 byte for byte, errors included, as far as the tests
