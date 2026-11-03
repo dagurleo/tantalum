@@ -159,6 +159,7 @@ fn limited(maxmemory: usize, policy: EvictionPolicy) -> Store {
         shards: 16,
         maxmemory,
         policy,
+        ..Config::default()
     })
 }
 
@@ -533,6 +534,7 @@ fn eviction_never_returns_wrong_values() {
         shards: 4,
         maxmemory: 300_000,
         policy: EvictionPolicy::AllKeysLru,
+        ..Config::default()
     });
     let mut model: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
@@ -738,6 +740,7 @@ fn concurrent_writers_respect_the_limit() {
         shards: 64,
         maxmemory: limit,
         policy: EvictionPolicy::AllKeysLru,
+        ..Config::default()
     }));
     let threads: Vec<_> = (0..8u32)
         .map(|t| {

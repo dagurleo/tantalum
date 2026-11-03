@@ -528,6 +528,7 @@ mod tests {
             shards: 1,
             maxmemory: 64 * 1024,
             policy: crate::store::EvictionPolicy::NoEviction,
+            ..Config::default()
         });
         let loaded = load(&t, &path).unwrap().unwrap();
         assert!(loaded.keys > 0 && loaded.dropped > 0, "{loaded:?}");

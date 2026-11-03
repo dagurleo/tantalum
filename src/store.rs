@@ -158,6 +158,12 @@ pub struct Config {
     /// Limit on accounted memory in bytes; 0 means unlimited.
     pub maxmemory: usize,
     pub policy: EvictionPolicy,
+    /// Hash keys with a fixed seed instead of a random one, so a benchmark
+    /// lays its keys out the same way every run (memory per key is then
+    /// exact). Never in production: a random seed stops clients from picking
+    /// keys that collide on purpose.
+    #[doc(hidden)]
+    pub fixed_seed: bool,
 }
 
 /// A write was refused because it would exceed `maxmemory`.
@@ -276,7 +282,9 @@ fn split(loc: u32) -> (usize, usize) {
     )
 }
 
-type Hasher = foldhash::fast::RandomState;
+// The same hash as foldhash's `RandomState`, but it can also take a fixed
+// seed (`Config::fixed_seed`).
+type Hasher = foldhash::fast::SeedableRandomState;
 
 /// The low 32 bits of a key's hash; the shard index comes from the high bits.
 fn slot_hash(hasher: &Hasher, key: &[u8]) -> u32 {
@@ -957,7 +965,11 @@ impl Store {
                 })
                 .collect(),
             shard_mask: n - 1,
-            hasher: Hasher::default(),
+            hasher: if config.fixed_seed {
+                Hasher::fixed()
+            } else {
+                Hasher::random()
+            },
             epoch: Instant::now(),
             maxmemory: config.maxmemory,
             policy: config.policy,

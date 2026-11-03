@@ -195,6 +195,7 @@ fn random_commands_never_panic() {
             } else {
                 EvictionPolicy::AllKeysLru
             },
+            ..Config::default()
         });
         let ctx = Context::new(Arc::new(store), settings);
         let client = ctx.connect(-1).unwrap();

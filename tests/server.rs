@@ -542,6 +542,7 @@ async fn eviction_over_the_wire() {
         shards: 16,
         maxmemory: 1_000_000,
         policy: EvictionPolicy::AllKeysLru,
+        ..Config::default()
     })
     .await;
     let mut c = connect(addr).await;
@@ -584,6 +585,7 @@ async fn noeviction_replies_oom() {
         shards: 4,
         maxmemory: 100_000,
         policy: EvictionPolicy::NoEviction,
+        ..Config::default()
     })
     .await;
     let mut c = connect(addr).await;

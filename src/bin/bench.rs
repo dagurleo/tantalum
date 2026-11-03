@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use tantalum::context::{Context, Settings};
 use tantalum::server::{self, Batch};
-use tantalum::store::Store;
+use tantalum::store::{Config, Store};
 
 /// Deterministic xorshift, so every run asks for the same keys.
 struct Rng(u64);
@@ -73,7 +73,13 @@ fn main() {
         }
     }
 
-    let store = Arc::new(Store::new(256));
+    // A fixed hash seed lays the keys out the same way every run, so memory
+    // per key compares exactly between builds.
+    let store = Arc::new(Store::with_config(Config {
+        shards: 256,
+        fixed_seed: true,
+        ..Config::default()
+    }));
     let ctx = Context::new(store.clone(), Settings::default());
     let client = ctx.connect(-1).expect("a client");
     let mut session = client.session();
