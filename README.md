@@ -134,7 +134,15 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   on every request. Without pipelining, where each request is tiny work between two
   syscalls, that overhead decided the race: per-thread was 19% faster and
   overtook memcached. The trade-off: a few very busy connections can't be
-  rebalanced across threads.
+  rebalanced across threads. A connection that ran a single command lets the
+  thread's other ready connections read and run theirs before it sends its
+  reply, so the replies go out together, as Redis sends them just before it
+  waits for more. Each reply had cost a wakeup of its client, which took the
+  kernel more time than the request itself: batching them gained 6.6% at 1
+  thread and 4.9% at 2 (EC2), and made the epoll loop the fastest server
+  there. At 8 threads (30 clients each) it gained nothing and p99 rose from
+  0.36 to 0.40 ms. Pipelined batches send at once: they already carry many
+  replies, and deferring them measured 0.7–2% slower at 4–8 threads.
 - **io_uring** (`--io uring`, the default where the kernel and container
   allow it): per-thread loops on [monoio](https://github.com/bytedance/monoio).
   On a 32-core EPYC it beat the epoll loop at every thread count (+17–25%
@@ -586,15 +594,17 @@ Redis 104, Dragonfly 123, memcached 131, KeyDB 136, Garnet 297.
 
 - Tantalum on io_uring is the fastest at every thread count: +21–24% over the
   next server without pipelining, +36% (1 thread) to +81% pipelined.
-- Tantalum on epoll, the mode on hosts that block io_uring (Railway), trails
-  without pipelining at 1 and 2 threads: 91k against Valkey's 95k, 183k against
-  Dragonfly's 188k. It leads from 4 threads, and pipelined everywhere. A
-  profile at 1 thread: Tantalum and Valkey make the same syscalls (0.95
-  receives and sends per command) and Tantalum's own code takes less CPU (15%
-  of samples against 20%), but waking the client on each reply costs it more
-  in the kernel (15% against 10%). Valkey sends all of a loop's replies
-  together before it waits again (`beforeSleep`); Tantalum sends each as it's
-  ready. That's the lead to follow.
+- Tantalum 0.16.0 on epoll, the mode on hosts that block io_uring (Railway),
+  trailed without pipelining at 1 and 2 threads (table above): 91k against
+  Valkey's 95k, 183k against Dragonfly's 188k. A profile at 1 thread: the same
+  syscalls as Valkey (0.95 receives and sends per command) and less CPU in
+  its own code (15% of samples against 20%), but waking the client on each
+  reply cost it more in the kernel (15% against 10%); Valkey sends a loop's
+  replies together. 0.16.1 does too (see the per-thread design note): in the
+  same rounds as the others, 1 thread did **99k** against Dragonfly's 97k,
+  Valkey's 97k and memcached's 94k, and 2 threads **195k** against
+  memcached's 185k (Valkey 106k, Dragonfly 111k). From 4 threads on, and
+  pipelined, it was already ahead.
 - Per core, a cloud VM does about half the M1 VM's work (syscalls cost more),
   so compare these with each other, not with the tables below.
 - Pipelined at 8 threads Tantalum used 7.8 of 8 cores with memtier near its
