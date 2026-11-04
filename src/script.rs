@@ -208,6 +208,13 @@ impl Scripting {
         };
         // Redis' `scriptPrepareForRun`: a script with a shebang declares
         // whether it writes.
+        if !flags.compat
+            && !flags.no_writes
+            && let Some(aof) = ctx.aof().filter(|aof| aof.failing())
+        {
+            resp::write_error(out, aof.failure().as_bytes());
+            return;
+        }
         if !flags.compat && !flags.no_writes && read_only {
             resp::write_error(
                 out,

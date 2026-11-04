@@ -124,9 +124,13 @@ pub(super) fn exec(
         for i in 0..queue.len() {
             let args = queue.command(i);
             let command = find_command(args.get(0)).expect("checked when queued");
+            let start = out.len();
             match (command.run)(ctx, session, now, &args, out) {
                 Reply::Bulk(value) => resp::write_bulk(out, value.as_bytes()),
                 Reply::Written | Reply::Close | Reply::Block(_) => {}
+            }
+            if command.writes() {
+                crate::aof::record(command.name, &args, &out[start..]);
             }
         }
         session.deny_blocking = false;

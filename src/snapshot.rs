@@ -124,6 +124,33 @@ fn tmp_path(path: &Path) -> PathBuf {
 }
 
 fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
+    let now = store.now();
+    // Store-clock deadlines become Unix times by the wall clock's offset.
+    let offset = unix_ms() - now as i64;
+    write_file(store, tmp, now, |deadline| deadline as i64 + offset, true)
+}
+
+/// Writes the append-only log's base: the store as it is at `now`, which no
+/// write may change meanwhile (`aof.rs` holds the write turn), with
+/// deadlines as the store clock's Unix times (see [`load_base`]). Not
+/// synced: the caller does that, after letting writes go on.
+pub(crate) fn write_base(store: &Store, now: crate::store::Millis, tmp: &Path) -> io::Result<u64> {
+    write_file(
+        store,
+        tmp,
+        now,
+        |deadline| store.deadline_to_unix_ms(now, deadline),
+        false,
+    )
+}
+
+fn write_file(
+    store: &Store,
+    tmp: &Path,
+    now: crate::store::Millis,
+    unix: impl Fn(crate::store::Millis) -> i64,
+    sync: bool,
+) -> io::Result<u64> {
     let file = File::create(tmp)?;
     let mut out = Checksummed {
         inner: BufWriter::with_capacity(1 << 20, file),
@@ -133,9 +160,6 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
     // with the header's at the end.
     let mut magic = MAGIC_V1.to_vec();
     out.inner.write_all(&magic)?;
-    let now = store.now();
-    // Store-clock deadlines become Unix times by this offset.
-    let offset = unix_ms() - now as i64;
     let mut keys = 0u64;
     let mut buf = Vec::new();
     for shard in 0..store.shard_count() {
@@ -150,7 +174,7 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
             buf.extend_from_slice(value);
             let expires = match deadline {
                 NO_EXPIRY => 0,
-                deadline => (deadline as i64 + offset).max(1) as u64,
+                deadline => unix(deadline).max(1) as u64,
             };
             put_varint(&mut buf, expires);
             keys += 1;
@@ -169,7 +193,9 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
     crc.update(&magic);
     crc.combine(&out.crc);
     file.write_all(&crc.finalize().to_le_bytes())?;
-    file.sync_all()?;
+    if sync {
+        file.sync_all()?;
+    }
     Ok(keys)
 }
 
@@ -187,6 +213,26 @@ pub struct Loaded {
 /// The checksum is verified before anything is loaded, so a damaged file
 /// loads nothing.
 pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
+    load_file(store, path, None)
+}
+
+/// Loads the append-only log's base, written at store-clock time `time`
+/// ([`write_base`]): as of then, so keys whose TTL has run out since are
+/// kept (the log's commands, run at their own times, may still use them;
+/// they expire after).
+pub(crate) fn load_base(
+    store: &Store,
+    path: &Path,
+    time: crate::store::Millis,
+) -> io::Result<Option<Loaded>> {
+    load_file(store, path, Some(time))
+}
+
+fn load_file(
+    store: &Store,
+    path: &Path,
+    base_time: Option<crate::store::Millis>,
+) -> io::Result<Option<Loaded>> {
     let file = match File::open(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         file => file?,
@@ -211,8 +257,10 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
         }
         _ => return Err(invalid("not a Tantalum snapshot")),
     };
-    let now = store.now();
-    let unix_now = unix_ms();
+    let (now, unix_now) = match base_time {
+        Some(time) => (time, store.deadline_to_unix_ms(time, time)),
+        None => (store.now(), unix_ms()),
+    };
     let mut loaded = Loaded::default();
     let (mut key, mut value) = (Vec::new(), Vec::new());
     let mut records = 0u64;

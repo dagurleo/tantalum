@@ -172,6 +172,10 @@ pub struct Config {
     /// place of the real one, so time-based IDs are the same every run.
     #[doc(hidden)]
     pub unix_base: Option<u64>,
+    /// Run the store clock on Unix milliseconds rather than from 1, so
+    /// commands can be run again at the times they first ran at (the
+    /// append-only log replays its commands so: see `aof.rs`).
+    pub unix_clock: bool,
 }
 
 /// A write was refused because it would exceed `maxmemory`.
@@ -1106,10 +1110,13 @@ impl ShardInner {
                 }
                 // Out of segment ids (practically unreachable): drop it instead.
             }
-            self.changed(
-                Self::entry_key(&seg.buf, &header, &self.externals, &self.objects),
-                expired,
-            );
+            let key = Self::entry_key(&seg.buf, &header, &self.externals, &self.objects);
+            if !expired {
+                // Running the log's commands again doesn't evict the same
+                // keys: it says which went.
+                crate::aof::evicted(key);
+            }
+            self.changed(key, expired);
             let unlinked = self.unlink(hash, old);
             debug_assert!(unlinked, "live entry without a slot");
             if let Body::External(index) = header.body {
@@ -1369,8 +1376,13 @@ pub struct Store {
     shard_mask: usize,
     hasher: Hasher,
     epoch: Instant,
+    /// The store clock at `epoch`: 1, or the Unix time then.
+    clock_start: u64,
     /// Unix time in milliseconds at store-clock time 0.
     unix_base: u64,
+    /// Loading data (replaying the append-only log): writes aren't held to
+    /// `maxmemory`, as the evictions they made are in the log.
+    loading: AtomicBool,
     maxmemory: usize,
     policy: EvictionPolicy,
     /// Sum of all shards' flushed footprints.
@@ -1453,6 +1465,9 @@ impl Store {
     }
 
     pub fn with_config(config: Config) -> Self {
+        let unix_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         let n = match config.shards {
             // Plenty for spreading locks across threads. More shards would
             // mean smaller tables, and tables under ~18 KB can't be mapped
@@ -1488,13 +1503,18 @@ impl Store {
                 Hasher::random()
             },
             epoch: Instant::now(),
-            // `now()` starts at 1.
-            unix_base: config.unix_base.unwrap_or_else(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as u64)
-                    .saturating_sub(1)
-            }),
+            // `now()` starts at 1, or at the Unix time.
+            clock_start: if config.unix_clock {
+                unix_now.max(1)
+            } else {
+                1
+            },
+            unix_base: match config.unix_base {
+                Some(base) => base,
+                None if config.unix_clock => 0,
+                None => unix_now.saturating_sub(1),
+            },
+            loading: AtomicBool::new(false),
             maxmemory: config.maxmemory,
             policy: config.policy,
             used: AtomicI64::new(0),
@@ -1506,7 +1526,12 @@ impl Store {
 
     /// Current time on the store clock.
     pub fn now(&self) -> Millis {
-        self.epoch.elapsed().as_millis() as Millis + 1
+        self.epoch.elapsed().as_millis() as Millis + self.clock_start
+    }
+
+    /// While loading, writes aren't held to `maxmemory` (see `loading`).
+    pub(crate) fn set_loading(&self, loading: bool) {
+        self.loading.store(loading, Relaxed);
     }
 
     /// Unix time in milliseconds at store-clock time `now`, for `XADD`'s
@@ -1516,15 +1541,13 @@ impl Store {
         self.unix_base.saturating_add(now)
     }
 
-    /// Converts a Unix timestamp in milliseconds to a store-clock deadline.
-    /// Timestamps in the past map to `now`, which is already expired.
+    /// Converts a Unix timestamp in milliseconds to a store-clock deadline,
+    /// by the clock's Unix time (as `XADD` reads it), so a command run again
+    /// at the time it first ran gets the same deadline. Timestamps in the
+    /// past map to `now`, which is already expired.
     pub fn deadline_from_unix_ms(&self, now: Millis, unix_ms: i64) -> Millis {
-        let unix_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        now.saturating_add_signed(unix_ms.saturating_sub(unix_now).max(0))
-            .min(MAX_DEADLINE)
+        let deadline = unix_ms.saturating_sub(self.unix_base as i64);
+        (deadline.max(now as i64) as Millis).min(MAX_DEADLINE)
     }
 
     /// Accounted memory in bytes (approximate; see module docs), connection
@@ -1833,7 +1856,7 @@ impl Store {
                 // itself is what this write adds (a new segment's untouched
                 // capacity is free).
                 let needed = external_size + entry_len;
-                if self.used_memory() + needed > self.maxmemory {
+                if self.used_memory() + needed > self.maxmemory && !self.loading.load(Relaxed) {
                     drop(guard);
                     attempts += 1;
                     if !self.make_room(index, hash, needed, now) {
@@ -1992,6 +2015,7 @@ impl Store {
         let incoming = incoming + 64;
         self.maxmemory == 0
             || self.used_memory() + incoming <= self.maxmemory
+            || self.loading.load(Relaxed)
             || self.make_room(home, seed, incoming, now)
     }
 
@@ -2207,7 +2231,11 @@ impl Store {
             }
             None => segment::encoded_len(&Payload::Inline { key, value }, deadline),
         };
-        if may_evict && self.maxmemory != 0 && self.used_memory() + needed > self.maxmemory {
+        if may_evict
+            && self.maxmemory != 0
+            && self.used_memory() + needed > self.maxmemory
+            && !self.loading.load(Relaxed)
+        {
             return Err(Retry::NeedRoom(needed));
         }
         let payload = match external {
@@ -2706,12 +2734,8 @@ impl Store {
     }
 
     /// A deadline on the store clock as a Unix timestamp in milliseconds.
-    pub fn deadline_to_unix_ms(&self, now: Millis, deadline: Millis) -> i64 {
-        let unix_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        unix_now.saturating_add(deadline as i64 - now as i64)
+    pub fn deadline_to_unix_ms(&self, _now: Millis, deadline: Millis) -> i64 {
+        (self.unix_base as i64).saturating_add(deadline as i64)
     }
 
     /// Evicts until `incoming` more bytes fit under `maxmemory`. Holds at most

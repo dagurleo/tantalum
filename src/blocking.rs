@@ -229,6 +229,18 @@ impl Waiter {
         &reply[usize::try_from(sent).unwrap_or(0)..]
     }
 
+    /// Logs its command, served with `reply`, if the append-only log is on
+    /// (run again, it finds the data it was served).
+    fn log(&self, reply: &[u8]) {
+        if !crate::aof::logging() {
+            return;
+        }
+        let args = Args::new(&self.buf, &self.ranges);
+        if let Some(command) = crate::cmd::find_write_command(args.get(0)) {
+            crate::aof::record(command, &args, reply);
+        }
+    }
+
     fn serve(&self, reply: Vec<u8>) {
         *self.reply.lock() = reply;
         self.state.store(SERVED, Ordering::Release);
@@ -370,6 +382,7 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
                 let mut out = Vec::new();
                 match claimed.waiter.run_again(ctx, now, &mut out) {
                     Attempt::Done => {
+                        claimed.waiter.log(&out);
                         let rest = claimed.waiter.send_now(&out).to_vec();
                         claimed.serve(rest);
                         break true;
