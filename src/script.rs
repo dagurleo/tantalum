@@ -158,6 +158,9 @@ pub(crate) struct Scripting {
     /// Scripts run natively, and calls a native one sent back to Lua.
     natives: AtomicU64,
     fallbacks: AtomicU64,
+    /// Which native scripts are loaded (by `bullmq::find`'s number), so
+    /// `EVALSHA` can run them without the interpreter's lock.
+    natives_loaded: AtomicU8,
 }
 
 impl Scripting {
@@ -171,6 +174,7 @@ impl Scripting {
         &self,
         ctx: &Context,
         caller: &Session,
+        try_native: bool,
         now: Millis,
         args: &Args<'_>,
         numkeys: usize,
@@ -195,7 +199,10 @@ impl Scripting {
                 return;
             }
             None => match engine.create(args.get(1), &name) {
-                Ok(flags) => flags,
+                Ok(flags) => {
+                    self.loaded(&name);
+                    flags
+                }
                 Err(e) => return resp::write_error(out, &e),
             },
         };
@@ -210,27 +217,26 @@ impl Scripting {
         }
         let read_only = read_only || (!flags.compat && flags.no_writes);
         // BullMQ's hottest scripts natively, unless one sends this call
-        // back to Lua (having written nothing).
-        if ctx.settings.native_scripts
+        // back to Lua (having written nothing). Holding every shard here.
+        if try_native
+            && ctx.settings.native_scripts
             && !read_only
-            && let Some(native) = bullmq::find(&name)
+            && let Some((_, native)) = bullmq::find(&name)
         {
             let keys = (3..3 + numkeys).map(|i| args.get(i)).collect();
             let argv = (3 + numkeys..args.len()).map(|i| args.get(i)).collect();
             let start = out.len();
-            let mut call = bullmq::Call::new(ctx, now, &name, keys, argv, out);
-            let outcome = native(&mut call);
-            ctx.publish(&mut call.session);
-            match outcome {
-                bullmq::Outcome::Done => {
-                    self.natives.fetch_add(1, Relaxed);
-                    return;
-                }
-                bullmq::Outcome::Lua => {
-                    self.fallbacks.fetch_add(1, Relaxed);
-                    out.truncate(start);
-                }
+            let shards = ctx.store.script_shards(&[]);
+            let mut call = bullmq::Call::new(ctx, now, &name, keys, argv, out, shards);
+            if let bullmq::Outcome::Done = native(&mut call) {
+                ctx.publish(&mut call.session);
+                self.natives.fetch_add(1, Relaxed);
+                return;
             }
+            // (Not `Retry`, holding every shard.)
+            drop(call);
+            self.fallbacks.fetch_add(1, Relaxed);
+            out.truncate(start);
         }
         let keys = (3..3 + numkeys).map(|i| args.get(i));
         let argv = (3 + numkeys..args.len()).map(|i| args.get(i));
@@ -259,6 +265,65 @@ impl Scripting {
         }
     }
 
+    /// `EVALSHA` of a native script (see `bullmq`), holding only the
+    /// shards it uses: those it asks for, taken in order (when one it asks
+    /// for later can't be taken without waiting, it starts over holding
+    /// them all from the start). False if it isn't one, isn't loaded, or
+    /// went back to Lua (having written nothing): then `eval` runs it.
+    pub(crate) fn run_native(
+        &self,
+        ctx: &Context,
+        now: Millis,
+        args: &Args<'_>,
+        numkeys: usize,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        let mut name = [0; 40];
+        name.copy_from_slice(args.get(1));
+        name.make_ascii_lowercase();
+        let Some((index, native)) = bullmq::find(&name) else {
+            return false;
+        };
+        if self.natives_loaded.load(Relaxed) & (1 << index) == 0 {
+            return false;
+        }
+        let mut wanted: Vec<usize> = Vec::new();
+        loop {
+            let start = out.len();
+            let keys = (3..3 + numkeys).map(|i| args.get(i)).collect();
+            let argv = (3 + numkeys..args.len()).map(|i| args.get(i)).collect();
+            let shards = ctx.store.script_shards(&wanted);
+            let mut call = bullmq::Call::new(ctx, now, &name, keys, argv, out, shards);
+            match native(&mut call) {
+                bullmq::Outcome::Done => {
+                    // The reads it made count; those of a try it gave up
+                    // on, or of one Lua then makes again, don't.
+                    ctx.publish(&mut call.session);
+                    self.natives.fetch_add(1, Relaxed);
+                    return true;
+                }
+                bullmq::Outcome::Lua => {
+                    drop(call);
+                    self.fallbacks.fetch_add(1, Relaxed);
+                    out.truncate(start);
+                    return false;
+                }
+                bullmq::Outcome::Retry => {
+                    wanted = call.shards.wanted().to_vec();
+                    drop(call); // lets go of what it held
+                    out.truncate(start);
+                }
+            }
+        }
+    }
+
+    /// Notes that the script `name` is loaded, if it's a native one.
+    fn loaded(&self, name: &[u8; 40]) {
+        if let Some((index, _)) = bullmq::find(name) {
+            self.natives_loaded.fetch_or(1 << index, Relaxed);
+        }
+    }
+
     /// Scripts run natively, and calls a native one sent back to Lua.
     pub(crate) fn native_stats(&self) -> (u64, u64) {
         (self.natives.load(Relaxed), self.fallbacks.load(Relaxed))
@@ -274,6 +339,7 @@ impl Scripting {
         {
             return resp::write_error(out, &e);
         }
+        self.loaded(&name);
         resp::write_bulk(out, &name);
     }
 
@@ -292,7 +358,10 @@ impl Scripting {
     /// `SCRIPT FLUSH`: forgets every script, with a fresh interpreter, as
     /// Redis does.
     pub(crate) fn flush(&self) {
-        let old = self.engine.lock().take();
+        let mut engine = self.engine.lock();
+        self.natives_loaded.store(0, Relaxed);
+        let old = engine.take();
+        drop(engine);
         drop(old);
     }
 

@@ -47,7 +47,8 @@ pub(super) fn evalsha_ro(
 }
 
 /// Checks the arguments in Redis' order, then runs the script holding
-/// every shard, so nothing else runs meanwhile.
+/// every shard (a native one, the shards it uses), so nothing else touches
+/// them meanwhile.
 fn run(
     ctx: &Context,
     session: &mut Session,
@@ -76,10 +77,22 @@ fn run(
         resp::write_error(out, b"ERR Number of keys can't be negative");
         return Reply::Written;
     }
+    // BullMQ's scripts natively, holding only the shards they use (but
+    // not inside EXEC, which holds every one already).
+    let native =
+        sha && !read_only && ctx.settings.native_scripts && !crate::shard_lock::holding_all();
+    if native
+        && ctx
+            .scripting
+            .run_native(ctx, now, args, numkeys as usize, out)
+    {
+        return Reply::Written;
+    }
     ctx.store.exclusive(|| {
         ctx.scripting.eval(
             ctx,
             session,
+            !native,
             now,
             args,
             numkeys as usize,

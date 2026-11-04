@@ -924,3 +924,328 @@ fn a_steady_queue_runs_natively() {
     assert!(native > 1_000, "native runs: {native}");
     assert_eq!(lua, 0, "calls sent back to Lua");
 }
+
+/// One queue's keys, in addStandardJob's, moveToActive's or
+/// moveToFinished's order.
+fn queue_keys(queue: &str, names: &[&str]) -> Vec<Vec<u8>> {
+    names
+        .iter()
+        .map(|n| format!("bull:{queue}:{n}").into_bytes())
+        .collect()
+}
+
+/// Native scripts on many threads at once, holding only their shards,
+/// with Lua scripts and transactions (which hold every shard) and plain
+/// commands on the same keys meanwhile: nothing deadlocks, and every job
+/// added is taken and finished exactly once.
+fn threads_share_queues(config: Config, evicting: bool) {
+    let ctx: &'static Context = Box::leak(Box::new(Context::new(
+        Arc::new(Store::with_config(config)),
+        Settings::default(),
+    )));
+    let mut session = ctx.connect(-1).unwrap().session();
+    for name in ["addStandardJob-9", "moveToActive-11", "moveToFinished-14"] {
+        common::execute(ctx, &mut session, 1, &[b"SCRIPT", b"LOAD", &script(name)]);
+    }
+    const THREADS: u64 = 8;
+    const STEPS: u64 = 1500;
+    let queues = ["t0", "t1", "t2"];
+    let finished = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let added = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            for _ in 0..1200 {
+                if done.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            eprintln!("threads still running after 120 s: a deadlock?");
+            std::process::abort();
+        })
+    };
+    let work = |t: u64, ctx: &'static Context| {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ ((t + 1) * 0x1000_0001));
+        let mut session = ctx.connect(-1).unwrap().session();
+        let (add, take, finish) = (
+            sha("addStandardJob-9"),
+            sha("moveToActive-11"),
+            sha("moveToFinished-14"),
+        );
+        let mut held: Vec<(String, Vec<u8>)> = Vec::new();
+        let run = |session: &mut Session, args: &[&[u8]]| {
+            common::execute(ctx, session, ctx.store.now(), args)
+        };
+        let token = format!("tok-{t}");
+        for step in 0..STEPS {
+            let queue = queues[rng.below(queues.len() as u64) as usize];
+            let prefix = format!("bull:{queue}:");
+            let now = (1_780_000_000_000 + step).to_string();
+            match rng.below(10) {
+                0..=3 => {
+                    let keys = queue_keys(
+                        queue,
+                        &[
+                            "wait",
+                            "paused",
+                            "meta",
+                            "id",
+                            "completed",
+                            "delayed",
+                            "active",
+                            "events",
+                            "marker",
+                        ],
+                    );
+                    let args = M::Arr(vec![s(&prefix), s(""), s("job"), M::Int(1)]).bytes();
+                    let opts = M::Map(vec![("attempts", M::Int(1))]).bytes();
+                    let mut call: Vec<&[u8]> = vec![b"EVALSHA", &add, b"9"];
+                    call.extend(keys.iter().map(Vec::as_slice));
+                    call.extend([&args[..], b"{}", &opts]);
+                    let reply = run(&mut session, &call);
+                    assert!(
+                        reply.starts_with(b"$"),
+                        "add: {}",
+                        String::from_utf8_lossy(&reply)
+                    );
+                    added.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                4..=6 => {
+                    let keys = queue_keys(
+                        queue,
+                        &[
+                            "wait",
+                            "active",
+                            "prioritized",
+                            "events",
+                            "stalled",
+                            "limiter",
+                            "delayed",
+                            "paused",
+                            "meta",
+                            "pc",
+                            "marker",
+                        ],
+                    );
+                    let opts = M::Map(vec![
+                        ("token", s(&token)),
+                        ("lockDuration", M::Int(30_000)),
+                        ("name", M::Nil),
+                        ("limiter", M::Nil),
+                    ])
+                    .bytes();
+                    let mut call: Vec<&[u8]> = vec![b"EVALSHA", &take, b"11"];
+                    call.extend(keys.iter().map(Vec::as_slice));
+                    call.extend([prefix.as_bytes(), now.as_bytes(), &opts]);
+                    let reply = run(&mut session, &call);
+                    if let common::Value::Array(items) = common::parse(&reply)
+                        && let Some(common::Value::Bulk(id)) = items.get(1)
+                    {
+                        held.push((queue.to_string(), id.clone()));
+                    }
+                }
+                7 | 8 if !held.is_empty() => {
+                    let (queue, id) = held.swap_remove(rng.below(held.len() as u64) as usize);
+                    let prefix = format!("bull:{queue}:");
+                    let mut keys = queue_keys(
+                        &queue,
+                        &[
+                            "wait",
+                            "active",
+                            "prioritized",
+                            "events",
+                            "stalled",
+                            "limiter",
+                            "delayed",
+                            "paused",
+                            "meta",
+                            "pc",
+                            "completed",
+                        ],
+                    );
+                    keys.push([prefix.as_bytes(), &id].concat());
+                    keys.extend(queue_keys(&queue, &["metrics:completed", "marker"]));
+                    let opts = M::Map(vec![
+                        ("token", s(&token)),
+                        ("keepJobs", M::Map(vec![("count", M::Int(0))])),
+                        ("lockDuration", M::Int(30_000)),
+                        ("attempts", M::Int(1)),
+                        ("maxMetricsSize", s("")),
+                        ("name", M::Nil),
+                        ("limiter", M::Nil),
+                    ])
+                    .bytes();
+                    // Fetching the next job too, now and then.
+                    let fetch: &[u8] = if rng.chance(50) { b"1" } else { b"0" };
+                    let mut call: Vec<&[u8]> = vec![b"EVALSHA", &finish, b"14"];
+                    call.extend(keys.iter().map(Vec::as_slice));
+                    call.extend([
+                        &id[..],
+                        now.as_bytes(),
+                        b"returnvalue",
+                        b"\"ok\"",
+                        b"completed",
+                        fetch,
+                        prefix.as_bytes(),
+                        &opts,
+                    ]);
+                    let reply = run(&mut session, &call);
+                    match common::parse(&reply) {
+                        common::Value::Int(0) => {}
+                        common::Value::Array(items) => {
+                            if let Some(common::Value::Bulk(next)) = items.get(1) {
+                                held.push((queue.clone(), next.clone()));
+                            }
+                        }
+                        // Evicted keys (the job's lock, say): BullMQ's codes
+                        // for what's missing.
+                        common::Value::Int(_) if evicting => {}
+                        _ => panic!("finish: {}", String::from_utf8_lossy(&reply)),
+                    }
+                    finished.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                7 | 8 => {}
+                _ => match rng.below(3) {
+                    // A Lua script reading the queue: every shard.
+                    0 => {
+                        let wait = format!("bull:{queue}:wait");
+                        let reply = run(
+                            &mut session,
+                            &[
+                                b"EVAL",
+                                b"return redis.call('LLEN', KEYS[1])",
+                                b"1",
+                                wait.as_bytes(),
+                            ],
+                        );
+                        assert!(reply.starts_with(b":"));
+                    }
+                    // A transaction, every shard too.
+                    1 => {
+                        let meta = format!("bull:{queue}:meta");
+                        run(&mut session, &[b"MULTI"]);
+                        run(
+                            &mut session,
+                            &[b"HGET", meta.as_bytes(), b"opts.maxLenEvents"],
+                        );
+                        run(&mut session, &[b"INCR", format!("tx:{t}").as_bytes()]);
+                        let reply = run(&mut session, &[b"EXEC"]);
+                        assert!(
+                            reply.starts_with(b"*2"),
+                            "{}",
+                            String::from_utf8_lossy(&reply)
+                        );
+                    }
+                    // Plain commands on the queue's keys.
+                    _ => {
+                        let events = format!("bull:{queue}:events");
+                        run(&mut session, &[b"XLEN", events.as_bytes()]);
+                        let value = if evicting {
+                            vec![b'v'; 4096]
+                        } else {
+                            b"v".to_vec()
+                        };
+                        let key = format!("k:{t}:{step}");
+                        run(&mut session, &[b"SET", key.as_bytes(), &value]);
+                    }
+                },
+            }
+        }
+        held
+    };
+    let mut left: Vec<(String, Vec<u8>)> = Vec::new();
+    std::thread::scope(|scope| {
+        let work = &work;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| scope.spawn(move || work(t, ctx)))
+            .collect();
+        for h in handles {
+            left.extend(h.join().expect("a thread panicked"));
+        }
+    });
+    done.store(true, std::sync::atomic::Ordering::Release);
+    watchdog.join().unwrap();
+    let (native, lua) = ctx.scripting_stats();
+    if evicting {
+        // Any key can go, the queues' too: only that it evicted, and that
+        // the native scripts ran meanwhile.
+        let info = String::from_utf8(common::execute(ctx, &mut session, 1, &[b"INFO"])).unwrap();
+        let evicted: u64 = info
+            .lines()
+            .find_map(|l| l.strip_prefix("evicted_keys:"))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap();
+        assert!(evicted > 100, "evicted {evicted}");
+        assert!(native > 1000, "native runs: {native}, back to Lua: {lua}");
+        return;
+    }
+    // Jobs still held, and jobs still waiting: each exactly once.
+    let mut ids = std::collections::HashSet::new();
+    for (queue, id) in &left {
+        assert!(
+            ids.insert((queue.clone(), id.clone())),
+            "{queue} {id:?} held twice"
+        );
+    }
+    let mut waiting = 0;
+    for queue in queues {
+        for list in ["wait", "active"] {
+            let key = format!("bull:{queue}:{list}");
+            let items = common::parse(&common::execute(
+                ctx,
+                &mut session,
+                1,
+                &[b"LRANGE", key.as_bytes(), b"0", b"-1"],
+            ))
+            .bulks();
+            for id in items {
+                if list == "wait" {
+                    waiting += 1;
+                    assert!(
+                        ids.insert((queue.to_string(), id.clone())),
+                        "{queue} {id:?} waiting and held"
+                    );
+                }
+            }
+        }
+    }
+    let added = added.load(std::sync::atomic::Ordering::Relaxed);
+    let finished = finished.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        finished + left.len() as u64 + waiting,
+        added,
+        "every job finished, held or waiting"
+    );
+    assert!(
+        native >= added + finished,
+        "native runs: {native}, back to Lua: {lua}"
+    );
+}
+
+#[test]
+fn threads_share_queues_holding_only_their_shards() {
+    threads_share_queues(
+        Config {
+            shards: 64,
+            ..Config::default()
+        },
+        false,
+    );
+}
+
+/// The same, near a memory limit: writes evict, and a native script's
+/// thread may only try the shards it doesn't hold.
+#[test]
+fn native_scripts_evict_without_waiting() {
+    threads_share_queues(
+        Config {
+            shards: 64,
+            maxmemory: 2 << 20,
+            policy: tantalum::store::EvictionPolicy::AllKeysLru,
+            ..Config::default()
+        },
+        true,
+    );
+}

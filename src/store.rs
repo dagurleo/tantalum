@@ -1382,6 +1382,55 @@ pub struct Store {
     ready: Ready,
 }
 
+/// The shards a native script holds while it runs (`Store::script_shards`).
+pub(crate) struct ScriptShards<'a>(Shards<'a>);
+
+enum Shards<'a> {
+    /// This thread holds every shard already.
+    All,
+    Some {
+        store: &'a Store,
+        held: shard_lock::Partial<'a, ShardInner>,
+        /// Every shard asked for, held or not.
+        wanted: Vec<usize>,
+    },
+}
+
+impl ScriptShards<'_> {
+    /// Holds the shards of `keys` too. False if one couldn't be taken
+    /// without waiting for it while holding others: the script must start
+    /// over (it can't have written yet) holding [`wanted`](Self::wanted).
+    pub(crate) fn hold(&mut self, keys: &[&[u8]]) -> bool {
+        let Shards::Some {
+            store,
+            held,
+            wanted,
+        } = &mut self.0
+        else {
+            return true;
+        };
+        let mut ok = true;
+        for key in keys {
+            let (_, index) = store.locate(store.key(key).hash);
+            if !wanted.contains(&index) {
+                wanted.push(index);
+            }
+            if ok && !held.take(index, &store.shards[index].inner) {
+                ok = false;
+            }
+        }
+        ok
+    }
+
+    /// Every shard asked for.
+    pub(crate) fn wanted(&self) -> &[usize] {
+        match &self.0 {
+            Shards::All => &[],
+            Shards::Some { wanted, .. } => wanted,
+        }
+    }
+}
+
 /// Keys created while clients were blocked on them, to serve those
 /// clients (see `blocking.rs`). On its own cache line: commands read
 /// `pending` after running.
@@ -2353,13 +2402,35 @@ impl Store {
         self.ready.blocked.load(Relaxed).max(0) as usize
     }
 
+    /// The shards a native script runs holding: every one if this thread
+    /// holds them already (`EXEC`), else none yet but those in `start`,
+    /// taken in order. The script asks for the rest ([`ScriptShards::hold`])
+    /// before it uses their keys.
+    pub(crate) fn script_shards(&self, start: &[usize]) -> ScriptShards<'_> {
+        if shard_lock::holding_all() {
+            return ScriptShards(Shards::All);
+        }
+        let mut held = shard_lock::Partial::new();
+        let mut wanted = start.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        for &i in &wanted {
+            // Ascending, so each is waited for.
+            held.take(i, &self.shards[i].inner);
+        }
+        ScriptShards(Shards::Some {
+            store: self,
+            held,
+            wanted,
+        })
+    }
+
     /// Runs `f` with every shard locked by this thread, so that nothing
     /// else touches the store meanwhile while `f` uses it as always: `EXEC`
     /// and scripts.
     pub(crate) fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
-        // Holding them already (a script run by `EXEC`): `hold_all` takes
-        // them in order, so whoever holds the first holds them all.
-        if self.shards[0].inner.held_here() {
+        // Holding them already (a script run by `EXEC`).
+        if shard_lock::holding_all() {
             return f();
         }
         let _holding = shard_lock::hold_all(self.shards.iter().map(|s| &s.inner));
@@ -2696,21 +2767,30 @@ impl Store {
             };
             let shard = &self.shards[index];
             let mut garbage = Vec::new();
-            let (reclaimed, released) = {
-                let mut guard = shard.inner.lock();
-                let inner = &mut *guard;
-                let before = inner.footprint();
-                let reclaimed = inner.evict_segment(
-                    volatile_only,
-                    sweep.is_some(),
-                    now,
-                    &self.hasher,
-                    &mut garbage,
-                );
-                inner.shrink_if_sparse();
-                let after = inner.footprint();
-                self.sync_usage(shard, inner, true);
-                (reclaimed, before.saturating_sub(after))
+            // A native script's thread holds only its own shards: it takes
+            // others only if they're free, so as never to wait while holding.
+            let guard = if shard_lock::holding_some() {
+                shard.inner.try_lock_here()
+            } else {
+                Some(shard.inner.lock())
+            };
+            let (reclaimed, released) = match guard {
+                Some(mut guard) => {
+                    let inner = &mut *guard;
+                    let before = inner.footprint();
+                    let reclaimed = inner.evict_segment(
+                        volatile_only,
+                        sweep.is_some(),
+                        now,
+                        &self.hasher,
+                        &mut garbage,
+                    );
+                    inner.shrink_if_sparse();
+                    let after = inner.footprint();
+                    self.sync_usage(shard, inner, true);
+                    (reclaimed, before.saturating_sub(after))
+                }
+                None => (0, 0),
             };
             drop(garbage); // frees values outside the lock
             // Survivors can land in a freshly allocated segment, so a visit
