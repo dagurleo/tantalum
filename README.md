@@ -5,7 +5,7 @@ and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
 lists, sorted sets, streams, blocking commands, pub/sub, transactions and
 Lua scripts (enough to run [BullMQ](https://bullmq.io), whose jobs cost
-the server less than half the CPU they cost Redis), and `SCAN`, `KEYS`
+the server about a third of the CPU they cost Redis), and `SCAN`, `KEYS`
 and `RENAME`, with TTLs, eviction, a password, TLS and optional snapshots
 to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
@@ -161,7 +161,15 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   became 2–3% faster with ~20% lower p99 (see below). Docker's and Railway's
   default seccomp profiles block io_uring. monoio's epoll fallback was 17–22%
   slower than the tokio loop, so where io_uring is unavailable Tantalum runs
-  per-thread instead (and says so if `--io uring` was asked for).
+  per-thread instead (and says so if `--io uring` was asked for). A read
+  completes as soon as anything arrives, where an epoll thread reads what
+  has gathered by the time it gets to the socket: BullMQ's streams of
+  pipelined commands came in 2 at a time against 20, each batch's reply
+  waking the client, 18% more server time per job. So before running a
+  batch, a connection lets the thread's others run and takes what came
+  meanwhile with one non-blocking `recv`; for clients that send in bursts
+  or one command at a time nothing does, and after a miss it tries only
+  every 2, 4, ... 256 batches until it gets something.
 - **Parser** (`src/resp.rs`): zero-copy and restartable. Arguments are ranges
   into the read buffer, so a command split across TCP reads costs nothing extra.
   Binary safe. Same limits as Redis (512 MB bulk, 64 KB inline, 1 GB query buffer).
@@ -773,17 +781,17 @@ Dragonfly in an earlier run: `bench/bullmq/results-agent37.txt`):
 
 | One server core | Add, jobs/s | Server µs per job | Process, jobs/s | Server µs per job |
 |---|---|---|---|---|
-| **Tantalum 0.18.2, native scripts** | **52.9k** | **7.0** | **64.4k** | **13.9** |
-| Tantalum 0.18.1 (adding on Lua) | 40.8k | 12.7 | 61.9k | 14.4 |
-| Tantalum 0.18.2, io_uring | 49.6k | 8.5 | 54.9k | 16.5 |
-| Redis 8.10.3 | 38.0k | 14.8 | 30.3k | 32.2 |
+| **Tantalum 0.18.3, io_uring** | **60.5k** | **4.4** | **71.7k** | **11.7** |
+| **Tantalum 0.18.3, epoll** | **61.2k** | **4.5** | **72.1k** | **11.9** |
+| Tantalum 0.18.2 (scripts holding every shard) | 53.3k | 6.9 | 63.9k | 13.6 |
+| Redis 8.10.3 | 37.6k | 14.6 | 30.7k | 32.0 |
 
-A job, added and processed, costs the server 20.9 µs, Redis 47.0. With the
-native scripts the server used 0.37 of its core adding and 0.89 processing
-(the clients limit the rate), Redis 0.98 in both. Every one of a run's
-script calls stayed native (`INFO`: `native_script_fallbacks:0`). With all
-three on Lua (`--native-scripts no`, an earlier run), processing cost 26.7
-µs per job.
+A job, added and processed, costs the server 16.1 µs (io_uring) or 16.4
+(epoll), Redis 46.6. Tantalum's server used 0.85 of its core processing
+(the clients limit the rate) and less adding, Redis 0.98 in both. Every
+one of a run's script calls stayed native (`INFO`:
+`native_script_fallbacks:0`). With all three scripts on Lua
+(`--native-scripts no`, an earlier run), processing cost 26.7 µs per job.
 
 ### Earlier results
 

@@ -109,3 +109,30 @@ round 3 tantalum-uring   add   35089 jobs/s   16.8 us/job | process   22859 jobs
 # add round 3 redis            add   38307 jobs/s   14.5 us/job | process   31314 jobs/s   31.3 us/job, server 0.98 cores
 # add round 3 tantalum         add   52909 jobs/s    6.8 us/job | process   62958 jobs/s   13.9 us/job, server 0.88 cores
 # add round 3 tantalum-b       add   40842 jobs/s   12.7 us/job | process   62847 jobs/s   14.2 us/job, server 0.89 cores
+
+# 0.18.3: native scripts hold only their shards, and io_uring reads what came meanwhile before a batch. Same VM,
+# 2026-11-04, tantalum-b is 0.18.2. 100,000 jobs, medians of 3 rounds:
+#                         add jobs/s  us/job   process jobs/s  us/job
+#   tantalum (io_uring)       60,494     4.4           71,681    11.7
+#   tantalum (epoll)          61,156     4.5           72,136    11.9
+#   tantalum-b (io_uring)     49,212     8.5           54,904    16.1
+#   tantalum-b (epoll)        53,328     6.9           63,914    13.6
+#   redis                     37,554    14.6           30,733    32.0
+# Before (0.18.2), a perf profile of the 1-thread server: taking and releasing all 256 shard locks per script was 40%
+# of its time adding and 19% processing; on io_uring, reads came 2 commands at a time against epoll's 20 (183,039
+# ring operations and 61,013 io_uring_enter calls for 188,665 script calls, against 9,150 sends for 185,572 on epoll).
+# 0.18.3 round 1 tantalum-uring   add   60494 jobs/s    4.4 us/job | process   72616 jobs/s   11.7 us/job, server 0.85 cores
+# 0.18.3 round 1 tantalum-b-uring add   49087 jobs/s    8.5 us/job | process   54904 jobs/s   16.1 us/job, server 0.88 cores
+# 0.18.3 round 1 tantalum         add   61156 jobs/s    4.5 us/job | process   72840 jobs/s   11.8 us/job, server 0.86 cores
+# 0.18.3 round 1 tantalum-b       add   52945 jobs/s    7.0 us/job | process   66022 jobs/s   13.6 us/job, server 0.90 cores
+# 0.18.3 round 1 redis            add   37554 jobs/s   15.1 us/job | process   30720 jobs/s   32.0 us/job, server 0.98 cores
+# 0.18.3 round 2 tantalum-b-uring add   49212 jobs/s    8.6 us/job | process   52943 jobs/s   16.4 us/job, server 0.87 cores
+# 0.18.3 round 2 tantalum         add   61168 jobs/s    4.5 us/job | process   72136 jobs/s   11.9 us/job, server 0.86 cores
+# 0.18.3 round 2 tantalum-b       add   53328 jobs/s    6.9 us/job | process   63914 jobs/s   13.6 us/job, server 0.87 cores
+# 0.18.3 round 2 redis            add   38066 jobs/s   14.6 us/job | process   31026 jobs/s   31.8 us/job, server 0.99 cores
+# 0.18.3 round 2 tantalum-uring   add   59769 jobs/s    4.6 us/job | process   71136 jobs/s   11.9 us/job, server 0.85 cores
+# 0.18.3 round 3 tantalum         add   60732 jobs/s    4.6 us/job | process   71733 jobs/s   11.9 us/job, server 0.85 cores
+# 0.18.3 round 3 tantalum-b       add   53658 jobs/s    6.9 us/job | process   63872 jobs/s   13.6 us/job, server 0.87 cores
+# 0.18.3 round 3 redis            add   37536 jobs/s   14.6 us/job | process   30733 jobs/s   32.0 us/job, server 0.98 cores
+# 0.18.3 round 3 tantalum-uring   add   61162 jobs/s    4.4 us/job | process   71681 jobs/s   11.7 us/job, server 0.84 cores
+# 0.18.3 round 3 tantalum-b-uring add   49937 jobs/s    8.4 us/job | process   55760 jobs/s   16.1 us/job, server 0.90 cores
