@@ -4,8 +4,8 @@ A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
 lists, sorted sets, streams, blocking commands, pub/sub, transactions and
-Lua scripts (enough to run [BullMQ](https://bullmq.io), which processes jobs
-twice as fast as on Redis per core), and `SCAN`, `KEYS`
+Lua scripts (enough to run [BullMQ](https://bullmq.io), whose jobs cost
+the server less than half the CPU they cost Redis), and `SCAN`, `KEYS`
 and `RENAME`, with TTLs, eviction, a password, TLS and optional snapshots
 to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
@@ -267,20 +267,28 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   One difference on purpose: Redis 7.2.4 crashes on an
   error table without `err` (`error({})`); Tantalum replies Redis 8's
   `ERR unknown error`.
-- **Native BullMQ scripts** (`src/bullmq.rs`): BullMQ's two hottest
-  scripts, `moveToActive` (a worker takes a job) and `moveToFinished` (it
-  completes or fails one, and takes the next), run as Rust when `EVALSHA`
-  or `EVAL` gets their exact text (BullMQ 6.5.4's, recognised by SHA-1;
-  `--native-scripts no` turns this off). They do what the Lua does, with the
-  same commands in the same order, so keys, replies, stream events and
-  errors come out the same; they only skip the interpreter. First they read
-  what decides the path, and anything they don't cover (rate limits,
-  `keepJobs` by age or count, metrics, parents and dependencies, due delayed
-  jobs, legacy markers, other versions' scripts) goes to the Lua with nothing
-  written. `tests/bullmq.rs` runs random workloads (with state nudged toward
-  every branch: paused, concurrency, priorities, lost and stolen locks) on two
-  stores, natives on and off, comparing every reply and every key; on a queue
-  run as apps run it, every call stays native.
+- **Native BullMQ scripts** (`src/bullmq.rs`): BullMQ's three hottest
+  scripts, `addStandardJob` (a job is added), `moveToActive` (a worker takes
+  one) and `moveToFinished` (it completes or fails one, and takes the next),
+  run as Rust when `EVALSHA` or `EVAL` gets their exact text (BullMQ
+  6.5.4's, recognised by SHA-1; `--native-scripts no` turns this off). They
+  do what the Lua does, with the same commands in the same order, so keys,
+  replies, stream events and errors come out the same; they only skip the
+  interpreter. First they read what decides the path, and anything they
+  don't cover (rate limits, `keepJobs` by age or count, metrics, parents and
+  dependencies, deduplication, due delayed jobs, legacy markers, other
+  versions' scripts) goes to the Lua with nothing written. A job stores its
+  options as the script's `cjson.encode` writes them, whose key order is the
+  order Lua 5.1's table holds them in: `src/bullmq/json.rs` lays the keys out
+  as `ltable.c` does (Redis' string hash, collisions, nil-valued keys, the
+  table growing), so the JSON is the same byte for byte; tables with keys
+  other than strings go to Lua. `tests/bullmq.rs` runs random workloads (with
+  state nudged toward every branch: paused, concurrency, priorities, lost
+  and stolen locks, custom and repeated ids) on two stores, natives on and
+  off, comparing every reply and every key, and adds 4,000 jobs with random
+  options (colliding and repeated keys, nils, nesting, escapes, floats),
+  checking each runs natively exactly when it should; on a queue run as apps
+  run it, every call stays native.
 - **Pub/sub** (`src/pubsub.rs`): channels map to their subscribers in 64
   shards, so publishers on different threads rarely meet, and patterns are
   a list each `PUBLISH` matches, as in Redis, skipped while there are none.
@@ -752,15 +760,17 @@ Dragonfly in an earlier run: `bench/bullmq/results-agent37.txt`):
 
 | One server core | Add, jobs/s | Server µs per job | Process, jobs/s | Server µs per job |
 |---|---|---|---|---|
-| **Tantalum, native scripts** | **40.5k** | **12.9** | **65.1k** | **13.7** |
-| Tantalum, `--native-scripts no` | 41.4k | 12.6 | 36.2k | 26.7 |
-| Tantalum, io_uring, native | 38.9k | 14.0 | 55.0k | 16.2 |
-| Redis 8.10.3 | 38.1k | 14.5 | 31.0k | 31.5 |
+| **Tantalum 0.18.2, native scripts** | **52.9k** | **7.0** | **64.4k** | **13.9** |
+| Tantalum 0.18.1 (adding on Lua) | 40.8k | 12.7 | 61.9k | 14.4 |
+| Tantalum 0.18.2, io_uring | 49.6k | 8.5 | 54.9k | 16.5 |
+| Redis 8.10.3 | 38.0k | 14.8 | 30.3k | 32.2 |
 
-Processing with the native scripts, the server used 0.89 of its core (the
-clients limit the rate); the others used 0.97–0.98. Every one of a run's
-script calls stayed native (`INFO`: `native_script_fallbacks:0`). Adding
-jobs still runs BullMQ's Lua.
+A job, added and processed, costs the server 20.9 µs, Redis 47.0. With the
+native scripts the server used 0.37 of its core adding and 0.89 processing
+(the clients limit the rate), Redis 0.98 in both. Every one of a run's
+script calls stayed native (`INFO`: `native_script_fallbacks:0`). With all
+three on Lua (`--native-scripts no`, an earlier run), processing cost 26.7
+µs per job.
 
 ### Earlier results
 
