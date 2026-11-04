@@ -50,6 +50,10 @@ for round in $(seq 1 "$ROUNDS"); do
     taskset -c "$SERVER_CPUS" bash -c "exec $(server_cmd "$s")" >"/tmp/$s.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do redis-cli -p $PORT ping >/dev/null 2>&1 && break; sleep 0.05; done
+    if ! kill -0 $pid 2>/dev/null; then
+      echo "round $round $s failed to start: $(tail -1 "/tmp/$s.log")"
+      continue
+    fi
     c0=$(cpu $pid)
     added=$(taskset -c "$CLIENT_CPUS" node $JS add $PORT "$JOBS" 2>&1)
     c1=$(cpu $pid)
@@ -75,5 +79,8 @@ for round in $(seq 1 "$ROUNDS"); do
       }'
     kill -9 $pid 2>/dev/null
     wait $pid 2>/dev/null
+    # An io_uring server's listening socket closes after the process is
+    # gone (the kernel tears its ring down later): wait for the port.
+    while (exec 3<>/dev/tcp/127.0.0.1/$PORT) 2>/dev/null; do sleep 0.05; done
   done
 done

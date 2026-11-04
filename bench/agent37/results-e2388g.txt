@@ -98,3 +98,10 @@ round 4 tantalum-uring   P16  ops  3031782 p50 1.255 p99 1.479 cpu 0.99 ops/core
 #   (the writer now sends the woken client's reply, one send(2), before its own).
 #   8 pairs (node saturated): round trips/s about equal or higher (epoll 42.0k vs 41.8k, io_uring 41.2k vs 35.6k
 #   medians), RPUSH p50 higher on epoll (150 vs 72 us) since node now handles the woken reply first.
+
+# 0.18.3 against 0.18.2 (native scripts holding their shards; io_uring reading what came meanwhile, backing off for
+# clients that send in bursts), saturate.sh, 1 server thread, 4 rounds, ops/s median / best round:
+#   epoll P1  -1.1% / +1.3%   P16 -0.3% / -0.1%     io_uring P1 +0.5% / -0.5%   P16 -1.4% / -0.4%
+# (With the read-more retried every 64 batches at most instead of 256: io_uring P1 -2.2% / -3.5%; tried every batch:
+# P1 -9.1%, P16 -6.4%.)
+

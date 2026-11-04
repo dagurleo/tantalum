@@ -621,6 +621,34 @@ async fn wait_blocked_uring(
     }
 }
 
+/// Batches to go before trying [`read_more_now`] again, at most.
+const MAX_READ_MORE_BACKOFF: u32 = 256;
+
+/// Reads what the socket holds right now into `buf`'s spare room (one read,
+/// so a client that floods it can't grow the buffer here), without
+/// waiting. True if it got anything.
+fn read_more_now(fd: std::os::fd::RawFd, buf: &mut Vec<u8>) -> bool {
+    if buf.capacity() - buf.len() < 4096 {
+        buf.reserve(URING_READ_BUFFER);
+    }
+    let spare = buf.capacity() - buf.len();
+    // SAFETY: writes at most `spare` bytes into the vector's spare room.
+    let n = unsafe {
+        libc::recv(
+            fd,
+            buf.as_mut_ptr().add(buf.len()).cast(),
+            spare,
+            libc::MSG_DONTWAIT,
+        )
+    };
+    if n <= 0 {
+        return false;
+    }
+    // SAFETY: `recv` wrote `n` bytes there.
+    unsafe { buf.set_len(buf.len() + n as usize) };
+    true
+}
+
 /// The connection loop of `handle_connection`, on monoio's owned-buffer I/O.
 /// Large values are copied into the reply buffer rather than written with a
 /// separate `writev`. `mailbox` is its thread's, for blocking commands.
@@ -655,6 +683,8 @@ async fn handle_uring(
     let mut rbuf: Vec<u8> = Vec::with_capacity(URING_READ_BUFFER);
     let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
+    // For reading more before a batch runs (see below).
+    let (mut backoff, mut skip) = (0u32, 0u32);
     loop {
         if let Some(subscriber) = session.subscriber() {
             let subscriber = subscriber.clone();
@@ -679,6 +709,25 @@ async fn handle_uring(
         rbuf = slice.into_inner();
         if result? == 0 {
             return Ok(());
+        }
+        // A read here completes as soon as anything comes, where an epoll
+        // thread reads what has gathered by the time it gets to the socket:
+        // BullMQ's streams of pipelined commands came in about 2 at a time,
+        // against 20, each batch costing a send that wakes the client. So
+        // let the thread's other ready connections run, then take what
+        // came meanwhile. For clients that send in bursts (or one at a
+        // time) nothing does: after a miss, this backs off, trying again
+        // only every 2, 4, ... 256 batches until it gets something.
+        if skip == 0 {
+            yield_to_others().await;
+            if read_more_now(socket.as_raw_fd(), &mut rbuf) {
+                backoff = 0;
+            } else {
+                backoff = (backoff * 2).clamp(1, MAX_READ_MORE_BACKOFF);
+                skip = backoff;
+            }
+        } else {
+            skip -= 1;
         }
         if wbuf.capacity() == 0 {
             wbuf.reserve(WRITE_RESERVE);
