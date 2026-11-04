@@ -849,9 +849,13 @@ Medians of 3 rotated rounds, 2026-11-04 (`bench/docker/aof.sh`; raw output:
 | Redis 8.10.3, AOF off | 272k | 1.51M | 282k | 1.72M |
 
 The log costs Tantalum 3–7% of its SETs one at a time and 30% pipelined
-(Redis' AOF: 26% and 53%), and 1–8% of a 1:10 mix (Redis 4–17%), so with
-both logs on Tantalum on io_uring does 1.4–1.9× Redis' work per core. SET
-p99 at P16 with the log on: 6.8 ms on io_uring, Redis 18.9. A rewrite
+(Redis' AOF: 26% and 53%), and 1–8% of a 1:10 mix (Redis 4–17%). With
+both logs on, Tantalum does 1.25–1.9× Redis' work per core on io_uring
+(SET 1.43× and 1.73×, the mix 1.25× and 1.89×, one at a time and
+pipelined) and 1.0–1.6× on epoll, as on hosts that block io_uring like
+Railway (SET 1.20× and 1.56×, the mix 1.00× and 1.64×): one request at a
+time, mostly reads, is a tie there. SET p99 at P16 with the log on: 6.8 ms
+on io_uring, 7.6 on epoll, Redis 18.9. A rewrite
 (`BGREWRITEAOF`) of those 1M keys took 0.07–0.10 s, and the longest a SET
 waited meanwhile was 32–34 ms (p99.9 0.12–0.17 ms); Redis' forked rewrite
 took 0.2–1.1 s, with SETs waiting at most 5–9 ms but p99.9 3.1 ms. With the
