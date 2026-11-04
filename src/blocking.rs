@@ -189,6 +189,7 @@ impl Waiter {
             multi: None,
             watching: None,
             deny_blocking: false,
+            in_script: false,
             name: None,
             resp3: self.resp3,
             commands: 0,

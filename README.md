@@ -3,8 +3,10 @@
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
-lists, sorted sets, and `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS and
-optional snapshots to disk. The point: be a faster drop-in for the "Redis as
+lists, sorted sets, streams, blocking commands, pub/sub, transactions and
+Lua scripts (enough to run [BullMQ](https://bullmq.io)), and `SCAN`, `KEYS`
+and `RENAME`, with TTLs, eviction, a password, TLS and optional snapshots
+to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
 Named after the metal of tantalum capacitors, known for packing the most into
@@ -64,7 +66,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `HSET key field value [field value ...]`, `HSETNX`, `HMSET` | Hashes keep their fields in the order they were added (as Redis does for small hashes) and keep the key's TTL |
 | `HGET key field`, `HMGET key field [field ...]`, `HGETALL`, `HKEYS`, `HVALS` | `HGETALL` is a map in RESP3 |
 | `HDEL key field [field ...]`, `HEXISTS`, `HLEN`, `HSTRLEN`, `HINCRBY key field n` | `HDEL` of the last field deletes the key |
-| `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0 (as Redis does for small hashes). Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
+| `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0, as Redis does for a hash it keeps as a listpack; `COUNT` fields at a time for one it would keep as a hash table (over 128 fields, or a field or value over 64 bytes), as Redis pages those. Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
 | `SADD key member [member ...]`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SMEMBERS` | Small sets reply in Redis' order: integers sorted, others in the order added. `SMEMBERS` is a set in RESP3 |
 | `SPOP key [count]`, `SRANDMEMBER key [count]` | Random members; a negative `SRANDMEMBER` count may repeat them. A count covering the whole set gives it in Redis' order |
 | `SMOVE source destination member` | Atomic: holds both keys' shards |
@@ -95,6 +97,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `AUTH [username] password` | With `--requirepass` (or `TANTALUM_REQUIREPASS`). One user, `default`, as in Redis without ACLs |
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | RESP3 too: redis-py 8 won't connect without it. For these commands it only changes nulls, maps (`HELLO`, `CONFIG GET`, `HGETALL`), sets (`COMMAND` flags) and `INFO` (verbatim text) |
 | `CLIENT SETNAME\|GETNAME\|ID\|SETINFO` | What client libraries send on connect |
+| `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and subscriptions) reads as 0, `N` or `NULL` |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
 | `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
@@ -104,6 +107,8 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `MULTI`, `EXEC`, `DISCARD` | `EXEC` runs the queued commands with the whole store to itself, so no other client's command runs in between, as in Redis. A command refused while queueing (unknown, wrong arity, `SAVE`) makes `EXEC` refuse them all; errors while running are among its replies. Blocking commands inside reply at once, as if timed out |
 | `WATCH key [key ...]`, `UNWATCH` | `EXEC` replies nil if a watched key changed meanwhile: written, deleted, expired or evicted (by anyone, the watcher too), as in Redis 7.2 |
 | `TIME` | |
+| `EVAL script numkeys [key ...] [arg ...]`, `EVALSHA sha1 ...`, `EVAL_RO`, `EVALSHA_RO` | Lua scripts on Redis 7.2.4's own Lua and libraries (`cjson`, `cmsgpack`, `struct`, `bit`), with its sandbox and `redis` API (`call`, `pcall`, `error_reply`, `status_reply`, `sha1hex`, `log`, `setresp`, ...). A script runs with the whole store to itself, as in Redis. Replies, conversions and errors (with `script: <sha1>, on @user_script:<line>.`) as Redis 7.2.4's; `#!lua flags=no-writes` and the `_RO` forms refuse writes |
+| `SCRIPT LOAD\|EXISTS\|FLUSH\|KILL\|HELP` | `KILL` stops a busy script that hasn't written, from a connection on another thread. `SCRIPT DEBUG NO` only: no Lua debugger |
 | `PING [msg]`, `ECHO msg`, `SELECT 0`, `QUIT`, `RESET` | `RESET` drops subscriptions, a transaction, watched keys, RESP3 and the name, and with a password, authentication |
 
 Anything else gets `-ERR unknown command ...` and the connection stays open.
@@ -243,6 +248,24 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   write commands, no-ops included (`SET NX` of an existing key, `LREM` of
   nothing, `LTRIM` keeping all), change a watched key exactly when they do
   in Redis 7.2.4.
+- **Scripts** (`src/script.rs`, `src/cmd/eval.rs`) run on Redis 7.2.4's own
+  Lua, built from `vendor/` by `build.rs`: Lua 5.1 with Redis' patches
+  (read-only tables among them) and the libraries scripts get, set up the
+  way Redis sets them up, with the same globals allow list, `redis` API and
+  error handler. So scripts see the same sandbox, fail with the same
+  messages, and get the same `math.random` sequences. One interpreter
+  serves every connection, made on the first script: a server that runs
+  none only carries the code (the binary is ~200 KB bigger). A script runs
+  holding every shard, as `EXEC` does (and inside `EXEC`, takes them
+  again); its `redis.call`s run through the command table in a session of
+  their own (RESP2 unless the script asks for RESP3; blocking commands
+  answer at once), and replies become Lua values, and its result a reply,
+  by Redis' rules. 312 commands' replies match Redis 7.2.4 in both
+  protocols (`tests/scripting.rs`), and BullMQ 6.5.4's own test suite
+  passes against it: all 1,111 tests (3 more are skipped in BullMQ's code).
+  One difference on purpose: Redis 7.2.4 crashes on an
+  error table without `err` (`error({})`); Tantalum replies Redis 8's
+  `ERR unknown error`.
 - **Pub/sub** (`src/pubsub.rs`): channels map to their subscribers in 64
   shards, so publishers on different threads rarely meet, and patterns are
   a list each `PUBLISH` matches, as in Redis, skipped while there are none.
@@ -739,31 +762,45 @@ hit rates share the seeding flaw described above.
   commands on that shard wait out, and a whole scan reads each table up to
   1024 times.
 - **Multi-key set commands read one key at a time** (`SINTER`, `SUNION`,
-  `SDIFF`, `ZUNION`, `ZINTER`, `ZDIFF` and their stores), as `MSET` writes
-  one at a time; `SMOVE`, `LMOVE` and `RENAME` are atomic.
-- **Blocking commands are list and sorted set ones**: no `XREAD BLOCK`
-  (no streams), `WAIT`, `CLIENT UNBLOCK`, or `b` flag in a client list.
+  `SDIFF`, `ZUNION`, `ZINTER`, `ZDIFF` and their stores), as `MGET` reads
+  and `MSET` writes one at a time, so a transaction or script can run
+  between two of their keys; `SMOVE`, `LMOVE` and `RENAME` are atomic.
+- **Blocking gaps**: no `WAIT`, `CLIENT UNBLOCK`, or `b` flag in a client
+  list.
 - **Writes to a small collection decode it whole**: a list, set or sorted
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
 - An append-only log (snapshots only), replication,
-  ACL users, Lua, `COPY`, `RANDOMKEY`, `OBJECT`,
+  ACL users, `COPY`, `RANDOMKEY`, `OBJECT`, `INCRBYFLOAT`,
   `DUMP`/`RESTORE`.
+- **Scripting gaps**: no `FUNCTION`/`FCALL` or Lua debugger (`SCRIPT DEBUG
+  YES`). While a script runs, other clients wait, where Redis replies
+  `-BUSY` after 5 s; `SCRIPT KILL` has to come from a connection on another
+  thread (so not with `--threads 1`), and with `--io shared` it may wait
+  behind the busy script on its runtime thread. The shebang flags `allow-oom`,
+  `allow-stale`, `no-cluster` and `allow-cross-slot-keys` are accepted with
+  nothing to relax: there's no check before a script runs that memory is
+  under `maxmemory` (a write over it fails inside the script instead). No
+  `used_memory_lua` or `number_of_cached_scripts` in `INFO`.
 - **Stream gaps**: no consumer groups (`XGROUP`, `XREADGROUP`, `XACK`,
   `XPENDING`, `XCLAIM`, `XAUTOCLAIM`), `XINFO` or `XSETID`.
 - **Transaction gaps**: Redis refuses a write command with `-OOM` while
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client
   memory.
-- **Pub/sub gaps**: no keyspace notifications, no `CLIENT LIST` (or its
-  flags), and the output limit is fixed at Redis' defaults. The registry's
+- **Pub/sub gaps**: no keyspace notifications, `CLIENT LIST` knows only
+  the caller's subscriptions, and the output limit is fixed at Redis'
+  defaults. The registry's
   own memory (channel names and their subscriber tables) isn't in
   `used_memory`; subscribers' unsent messages are. `PUBSUB CHANNELS` and multiple patterns' messages come in
   an order of Tantalum's own (Redis' depends on its random hash seed).
 - LFU and random eviction policies, `CONFIG SET` at runtime.
 
 ## Development
+
+Building needs a C compiler as well as Rust: `build.rs` compiles the Lua in
+`vendor/` (see `vendor/README.md`).
 
 ```sh
 cargo test                     # unit + end-to-end tests

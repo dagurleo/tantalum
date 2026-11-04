@@ -1763,6 +1763,10 @@ mod random_commands {
         b"WATCH",
         b"UNWATCH",
         b"TIME",
+        b"EVAL",
+        b"EVALSHA",
+        b"EVAL_RO",
+        b"SCRIPT",
         b"XADD",
         b"XLEN",
         b"XRANGE",
@@ -1790,6 +1794,19 @@ mod random_commands {
         b"k1",
         b"k2",
         b"counter",
+        b"return 1",
+        b"return redis.call('get', KEYS[1])",
+        b"redis.call('set', KEYS[1], 'v') return redis.pcall('incr', KEYS[1])",
+        b"return {1, 'a', false, {ok='x'}, {err='E'}, {double=1.5}, {map={a=1}}}",
+        b"error('x')",
+        b"return redis.call('blpop', KEYS[1], 0)",
+        b"redis.setresp(3) return redis.call('hgetall', KEYS[1])",
+        b"return cjson.encode({ARGV[1], cmsgpack.unpack(cmsgpack.pack({1, 2}))})",
+        b"LOAD",
+        b"EXISTS",
+        b"FLUSH",
+        b"KILL",
+        b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db",
         b"",
         b"0",
         b"1",
@@ -1883,7 +1900,7 @@ mod random_commands {
     /// few keys: random arguments rarely line those up.
     fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
         const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
-        let choice = rng.below(25);
+        let choice = rng.below(27);
         let mut key = || rng.pick(KEYS).to_vec();
         let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
         let mut args = match choice {
@@ -1932,6 +1949,16 @@ mod random_commands {
             .concat(),
             22 => [vec![b"XTRIM".to_vec(), key()], words(&["MAXLEN", "1"])].concat(),
             23 => [vec![b"XDEL".to_vec(), key()], words(&["0-1"])].concat(),
+            24 => [
+                words(&["EVAL", "redis.call('rpush', KEYS[1], ARGV[1]) return redis.call('publish', KEYS[2], ARGV[1])", "2"]),
+                vec![key(), key(), b"x".to_vec()],
+            ]
+            .concat(),
+            25 => [
+                words(&["EVAL", "redis.call('xadd', KEYS[1], '*', 'f', 'v') return redis.call('zadd', KEYS[2], 1, ARGV[1])", "2"]),
+                vec![key(), key(), b"m".to_vec()],
+            ]
+            .concat(),
             _ => vec![b"DEL".to_vec(), key()],
         };
         // The blocking ones take a timeout last, except the *MPOPs: first.

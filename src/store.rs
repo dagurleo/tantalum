@@ -2334,8 +2334,14 @@ impl Store {
     }
 
     /// Runs `f` with every shard locked by this thread, so that nothing
-    /// else touches the store meanwhile while `f` uses it as always: `EXEC`.
+    /// else touches the store meanwhile while `f` uses it as always: `EXEC`
+    /// and scripts.
     pub(crate) fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        // Holding them already (a script run by `EXEC`): `hold_all` takes
+        // them in order, so whoever holds the first holds them all.
+        if self.shards[0].inner.held_here() {
+            return f();
+        }
         let _holding = shard_lock::hold_all(self.shards.iter().map(|s| &s.inner));
         f()
     }

@@ -11,6 +11,7 @@ mod list;
 mod pages;
 pub mod pubsub;
 pub mod resp;
+mod script;
 mod segment;
 pub mod server;
 mod set;

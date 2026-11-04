@@ -476,6 +476,15 @@ impl Subscriptions {
         }
     }
 
+    /// How many of one kind, for `CLIENT LIST`.
+    pub(crate) fn count_of(&self, to: To) -> usize {
+        match to {
+            To::Channels => self.channels.len(),
+            To::Patterns => self.patterns.len(),
+            To::ShardChannels => self.shard_channels.len(),
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.channels.is_empty() && self.patterns.is_empty() && self.shard_channels.is_empty()
     }

@@ -1,0 +1,88 @@
+# Agent37 VM (https://www.agent37.com), 2026-11-04: type "vm", template agent37-ubuntu, 4 vCPU / 16 GB / 40 GB,
+# region us; Intel Xeon E-2388G @ 3.20GHz (4 vCPUs of it), Linux 7.0.0-38-generic, io_uring enabled, Docker 29.
+# ~$0.054/h running (4 vCPU is Agent37's largest shape), its disk alone when stopped. The bench image and both
+# builds were made on the VM; saturate.sh with 1 server thread on CPU 0 and memtier on CPUs 1-3 (3 threads x 80
+# clients), 4 rotated rounds, 1M keys x 32 B, 1:10 SET:GET.
+#
+# Null A/B (0.16.1 against itself), to see the noise, median / best round, ops/s:
+#   epoll P1  +0.1% / +1.5%   P16 +0.7% / +0.9%     io_uring P1 +0.1% / +0.6%   P16 +0.9% / +0.8%
+#   rounds paired: -1.4..+1.5% (epoll P1), -1.2..+3.5% (io_uring P1): about EC2's noise.
+# Lua scripting (0.17.0, tantalum) against 0.16.1 (tantalum-b), median / best round:
+#   epoll P1  -0.0% / +1.0%   P16 -0.7% / +0.2%     io_uring P1 -0.5% / +0.7%   P16 +0.4% / -0.1%
+#   (one old io_uring P16 round dipped to 2.62M against 2.99-3.06M.)
+# Per core this host does ~3x EC2 c7a's (epoll P1 ~280k, P16 ~2.5M; io_uring P1 ~350k, P16 ~3.0M), so compare
+# builds within a run, not with bench/aws.
+### null: main vs main
+# tantalum         RSS after the fill   69076 kB
+# tantalum-b       RSS after the fill   69024 kB
+# tantalum-uring   RSS after the fill   69528 kB
+# tantalum-b-uring RSS after the fill   69384 kB
+round 1 tantalum         P1   ops   284404 p50 0.839 p99 0.959 cpu 0.90 ops/core   315591
+round 1 tantalum         P16  ops  2513325 p50 1.527 p99 1.751 cpu 0.99 ops/core  2533337
+round 1 tantalum-b       P1   ops   280269 p50 0.855 p99 0.975 cpu 0.90 ops/core   310463
+round 1 tantalum-b       P16  ops  2497506 p50 1.535 p99 1.767 cpu 0.99 ops/core  2522039
+round 1 tantalum-uring   P1   ops   351243 p50 0.679 p99 0.807 cpu 0.99 ops/core   353966
+round 1 tantalum-uring   P16  ops  2992988 p50 1.279 p99 1.487 cpu 0.99 ops/core  3022620
+round 1 tantalum-b-uring P1   ops   353957 p50 0.671 p99 0.791 cpu 0.90 ops/core   392828
+round 1 tantalum-b-uring P16  ops  2992661 p50 1.279 p99 1.527 cpu 0.99 ops/core  3019520
+round 2 tantalum-b       P1   ops   274236 p50 0.871 p99 1.023 cpu 0.90 ops/core   304008
+round 2 tantalum-b       P16  ops  2467469 p50 1.551 p99 1.815 cpu 0.90 ops/core  2739892
+round 2 tantalum-uring   P1   ops   345577 p50 0.679 p99 1.055 cpu 0.99 ops/core   348749
+round 2 tantalum-uring   P16  ops  3054398 p50 1.247 p99 1.631 cpu 0.90 ops/core  3394017
+round 2 tantalum-b-uring P1   ops   349858 p50 0.671 p99 0.863 cpu 0.99 ops/core   352617
+round 2 tantalum-b-uring P16  ops  3040284 p50 1.255 p99 1.487 cpu 0.99 ops/core  3067215
+round 2 tantalum         P1   ops   275362 p50 0.871 p99 1.023 cpu 0.90 ops/core   305280
+round 2 tantalum         P16  ops  2524438 p50 1.519 p99 1.751 cpu 0.99 ops/core  2548651
+round 3 tantalum-uring   P1   ops   342063 p50 0.687 p99 0.855 cpu 0.99 ops/core   344710
+round 3 tantalum-uring   P16  ops  3045719 p50 1.255 p99 1.479 cpu 0.90 ops/core  3380916
+round 3 tantalum-b-uring P1   ops   346170 p50 0.679 p99 0.831 cpu 0.99 ops/core   349377
+round 3 tantalum-b-uring P16  ops  3033361 p50 1.255 p99 1.463 cpu 0.99 ops/core  3056891
+round 3 tantalum         P1   ops   271165 p50 0.887 p99 1.031 cpu 0.99 ops/core   273240
+round 3 tantalum         P16  ops  2510320 p50 1.527 p99 1.775 cpu 0.90 ops/core  2786061
+round 3 tantalum-b       P1   ops   274972 p50 0.871 p99 1.055 cpu 0.90 ops/core   304930
+round 3 tantalum-b       P16  ops  2506837 p50 1.519 p99 1.791 cpu 0.99 ops/core  2531092
+round 4 tantalum-b-uring P1   ops   343828 p50 0.687 p99 0.871 cpu 0.99 ops/core   346510
+round 4 tantalum-b-uring P16  ops  3012670 p50 1.263 p99 1.591 cpu 0.99 ops/core  3042358
+round 4 tantalum         P1   ops   279390 p50 0.855 p99 0.999 cpu 0.90 ops/core   310069
+round 4 tantalum         P16  ops  2554898 p50 1.503 p99 1.735 cpu 0.99 ops/core  2578819
+round 4 tantalum-b       P1   ops   279440 p50 0.855 p99 1.015 cpu 0.99 ops/core   281904
+round 4 tantalum-b       P16  ops  2531658 p50 1.511 p99 1.727 cpu 0.90 ops/core  2804261
+round 4 tantalum-uring   P1   ops   355936 p50 0.663 p99 0.823 cpu 0.99 ops/core   359209
+round 4 tantalum-uring   P16  ops  3063323 p50 1.247 p99 1.543 cpu 0.99 ops/core  3090521
+### lua vs main
+# tantalum         RSS after the fill   69140 kB
+# tantalum-b       RSS after the fill   69176 kB
+# tantalum-uring   RSS after the fill   69448 kB
+# tantalum-b-uring RSS after the fill   69476 kB
+round 1 tantalum         P1   ops   280220 p50 0.855 p99 0.967 cpu 0.99 ops/core   282294
+round 1 tantalum         P16  ops  2530682 p50 1.519 p99 1.751 cpu 0.99 ops/core  2551271
+round 1 tantalum-b       P1   ops   280927 p50 0.855 p99 0.975 cpu 0.99 ops/core   283146
+round 1 tantalum-b       P16  ops  2520539 p50 1.519 p99 1.743 cpu 0.90 ops/core  2792138
+round 1 tantalum-uring   P1   ops   359612 p50 0.663 p99 0.807 cpu 0.99 ops/core   362650
+round 1 tantalum-uring   P16  ops  3028007 p50 1.263 p99 1.527 cpu 0.90 ops/core  3360691
+round 1 tantalum-b-uring P1   ops   357131 p50 0.663 p99 0.799 cpu 0.90 ops/core   396052
+round 1 tantalum-b-uring P16  ops  3019060 p50 1.263 p99 1.471 cpu 0.99 ops/core  3050536
+round 2 tantalum-b       P1   ops   281099 p50 0.847 p99 0.999 cpu 0.99 ops/core   283588
+round 2 tantalum-b       P16  ops  2525133 p50 1.519 p99 1.743 cpu 0.99 ops/core  2547691
+round 2 tantalum-uring   P1   ops   350316 p50 0.671 p99 0.831 cpu 0.99 ops/core   353070
+round 2 tantalum-uring   P16  ops  3052567 p50 1.255 p99 1.487 cpu 0.99 ops/core  3080125
+round 2 tantalum-b-uring P1   ops   352845 p50 0.671 p99 0.839 cpu 0.99 ops/core   355895
+round 2 tantalum-b-uring P16  ops  2619305 p50 1.279 p99 3.263 cpu 0.98 ops/core  2670713
+round 2 tantalum         P1   ops   270902 p50 0.847 p99 1.479 cpu 0.99 ops/core   273335
+round 2 tantalum         P16  ops  2509538 p50 1.519 p99 1.863 cpu 0.99 ops/core  2531794
+round 3 tantalum-uring   P1   ops   348648 p50 0.679 p99 0.887 cpu 0.90 ops/core   386552
+round 3 tantalum-uring   P16  ops  2989030 p50 1.279 p99 1.527 cpu 0.99 ops/core  3014297
+round 3 tantalum-b-uring P1   ops   345373 p50 0.687 p99 0.863 cpu 0.99 ops/core   348353
+round 3 tantalum-b-uring P16  ops  3015736 p50 1.263 p99 1.479 cpu 0.90 ops/core  3346942
+round 3 tantalum         P1   ops   275853 p50 0.863 p99 1.023 cpu 0.90 ops/core   305649
+round 3 tantalum         P16  ops  2490698 p50 1.535 p99 1.799 cpu 0.99 ops/core  2513994
+round 3 tantalum-b       P1   ops   275277 p50 0.871 p99 1.015 cpu 0.99 ops/core   277434
+round 3 tantalum-b       P16  ops  2501255 p50 1.535 p99 1.751 cpu 0.99 ops/core  2526367
+round 4 tantalum-b-uring P1   ops   349500 p50 0.671 p99 0.855 cpu 0.99 ops/core   352590
+round 4 tantalum-b-uring P16  ops  3056940 p50 1.247 p99 1.559 cpu 0.90 ops/core  3389245
+round 4 tantalum         P1   ops   283811 p50 0.839 p99 1.007 cpu 0.99 ops/core   286507
+round 4 tantalum         P16  ops  2476387 p50 1.543 p99 1.807 cpu 0.99 ops/core  2500849
+round 4 tantalum-b       P1   ops   271856 p50 0.879 p99 1.063 cpu 0.99 ops/core   273985
+round 4 tantalum-b       P16  ops  2515508 p50 1.519 p99 1.743 cpu 0.99 ops/core  2538126
+round 4 tantalum-uring   P1   ops   338946 p50 0.695 p99 0.863 cpu 0.99 ops/core   341589
+round 4 tantalum-uring   P16  ops  3031782 p50 1.255 p99 1.479 cpu 0.99 ops/core  3058693
