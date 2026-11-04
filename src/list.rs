@@ -461,15 +461,21 @@ impl BigList {
     /// Removes and returns element `i`.
     pub fn remove(&mut self, i: usize) -> Option<Vec<u8>> {
         let (c, at) = self.locate(i)?;
+        let chunk = &self.chunks[c];
+        let element = chunk.bytes[element_at(&chunk.bytes, chunk.span(at).start).0].to_vec();
+        self.drop_at(c, at);
+        Some(element)
+    }
+
+    /// Removes element `at` of chunk `c`.
+    fn drop_at(&mut self, c: usize, at: usize) {
         let chunk = &mut self.chunks[c];
         let range = chunk.span(at);
-        let element = chunk.bytes[element_at(&chunk.bytes, range.start).0].to_vec();
         self.bytes -= range.len();
         chunk.bytes.drain(range);
         chunk.count -= 1;
         self.len -= 1;
         self.tidy(c);
-        Some(element)
     }
 
     /// Keeps elements `start..end` only (`start <= end <= len`).
@@ -482,32 +488,45 @@ impl BigList {
     }
 
     /// Removes up to `count` elements equal to `value` (all if 0), from
-    /// the head, or from the tail if `from_tail`. Returns how many.
+    /// the head, or from the tail if `from_tail`. Returns how many. A few
+    /// go from their chunks in place (a job queue's `LREM active -1 id`
+    /// finds its one from the tail and stops); many, by rebuilding once.
     pub fn remove_matching(&mut self, value: &[u8], count: usize, from_tail: bool) -> usize {
-        let mut positions: Vec<usize> = self
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| *e == value)
-            .map(|(i, _)| i)
-            .collect();
-        if from_tail {
-            positions.reverse();
-        }
-        if count > 0 {
-            positions.truncate(count);
-        }
+        let limit = if count == 0 { usize::MAX } else { count };
+        let last = self.len.wrapping_sub(1);
+        let mut positions: Vec<usize> = if from_tail {
+            self.iter_rev()
+                .enumerate()
+                .filter(|(_, e)| *e == value)
+                .map(|(j, _)| last - j)
+                .take(limit)
+                .collect()
+        } else {
+            self.iter()
+                .enumerate()
+                .filter(|(_, e)| *e == value)
+                .map(|(i, _)| i)
+                .take(limit)
+                .collect()
+        };
         let removed = positions.len();
-        if removed == 0 {
-            return 0;
-        }
-        let gone: std::collections::HashSet<usize> = positions.into_iter().collect();
-        let mut kept = BigList::default();
-        for (i, element) in self.iter().enumerate() {
-            if !gone.contains(&i) {
-                kept.push_back(element);
+        positions.sort_unstable();
+        if removed <= 8 {
+            // From the highest, so the others keep their positions.
+            for &i in positions.iter().rev() {
+                let (c, at) = self.locate(i).expect("a position found above");
+                self.drop_at(c, at);
             }
+        } else {
+            let mut gone = positions.iter().peekable();
+            let mut kept = BigList::default();
+            for (i, element) in self.iter().enumerate() {
+                if gone.next_if_eq(&&i).is_none() {
+                    kept.push_back(element);
+                }
+            }
+            *self = kept;
         }
-        *self = kept;
         removed
     }
 
@@ -742,6 +761,52 @@ mod tests {
         }
     }
 
+    /// Removing matches: a few in place, many by rebuilding, against a
+    /// `Vec`, from either end, across chunks.
+    #[test]
+    fn removes_matches_in_place_or_by_rebuilding() {
+        for (n, count, from_tail) in [
+            (40, 0, false),
+            (40, 0, true),
+            (40, 3, true),
+            (40, 9, false),
+            (3000, 1, true),
+            (3000, 0, false),
+            (3000, 20, true),
+            (3000, 500, false),
+        ] {
+            let elements: Vec<Vec<u8>> = (0..n)
+                .map(|i| format!("e{}-{}", i % 3, "x".repeat(i % 7)).into_bytes())
+                .collect();
+            let mut list = BigList::default();
+            elements.iter().for_each(|e| list.push_back(e));
+            let target = b"e1-";
+            let mut model = elements.clone();
+            let mut positions: Vec<usize> = (0..n).filter(|&i| model[i] == target).collect();
+            if from_tail {
+                positions.reverse();
+            }
+            if count > 0 {
+                positions.truncate(count);
+            }
+            positions.sort_unstable();
+            for &i in positions.iter().rev() {
+                model.remove(i);
+            }
+            assert_eq!(
+                list.remove_matching(target, count, from_tail),
+                positions.len(),
+                "{n} {count} {from_tail}"
+            );
+            assert_eq!(all(&list), model, "{n} {count} {from_tail}");
+            assert_eq!(list.len(), model.len());
+            assert_eq!(
+                list.chunks.iter().map(|c| c.bytes.len()).sum::<usize>(),
+                list.bytes
+            );
+        }
+    }
+
     /// Against a `VecDeque`, through every operation, with chunks splitting
     /// and merging.
     #[test]
@@ -759,6 +824,8 @@ mod tests {
             let len = model.len() as u64;
             let element = match next(20) {
                 0 => vec![b'x'; 3_000 + next(10_000) as usize],
+                // Repeats, so removals can match many.
+                1..=4 => format!("e{}", next(3)).into_bytes(),
                 _ => format!("e{}", next(50)).into_bytes(),
             };
             match next(12) {
@@ -797,9 +864,11 @@ mod tests {
                     model = model.into_iter().skip(start).take(end - start).collect();
                 }
                 11 => {
-                    let count = next(3) as usize;
+                    let count = [0, 1, 2, 3, 12][next(5) as usize];
                     let from_tail = next(2) == 0;
-                    let value = format!("e{}", next(50)).into_bytes();
+                    // Sometimes a common value, so many go at once.
+                    let values = if next(4) == 0 { 3 } else { 50 };
+                    let value = format!("e{}", next(values)).into_bytes();
                     let expected = {
                         let mut positions: Vec<usize> =
                             (0..model.len()).filter(|&i| model[i] == value).collect();

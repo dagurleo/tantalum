@@ -343,8 +343,10 @@ impl Engine {
     fn new() -> Engine {
         // SAFETY: a fresh state, set up by Lua's API.
         unsafe {
-            let l = lua::luaL_newstate();
+            // As `luaL_newstate`, but allocating as the server does.
+            let l = lua::lua_newstate(allocate, std::ptr::null_mut());
             assert!(!l.is_null(), "out of memory for Lua");
+            lua::lua_atpanic(l, unprotected_error);
             // luaRegisterRedisAPI: while libraries load, the globals take
             // only what's on the allow lists.
             lua::lua_pushvalue(l, lua::LUA_GLOBALSINDEX);
@@ -496,6 +498,52 @@ impl Engine {
             lua::lua_pop(l, 1);
         }
     }
+}
+
+/// Lua's allocator: the server's (mimalloc), as Redis gives its Lua
+/// jemalloc, rather than the C library's `malloc`, which took ~17% of a
+/// busy BullMQ server's time. Lua passes each block's size back when it
+/// frees or resizes it.
+unsafe extern "C" fn allocate(
+    _: *mut c_void,
+    ptr: *mut c_void,
+    old: usize,
+    new: usize,
+) -> *mut c_void {
+    use std::alloc::{Layout, alloc, dealloc, realloc};
+    // What `malloc` guarantees, which Lua's doubles and pointers need.
+    const ALIGN: usize = 16;
+    // SAFETY: Lua passes `ptr` with the size it was allocated or resized
+    // to, and sizes are far below `isize::MAX`.
+    unsafe {
+        if new == 0 {
+            if !ptr.is_null() {
+                dealloc(ptr.cast(), Layout::from_size_align_unchecked(old, ALIGN));
+            }
+            std::ptr::null_mut()
+        } else if ptr.is_null() {
+            alloc(Layout::from_size_align_unchecked(new, ALIGN)).cast()
+        } else {
+            realloc(
+                ptr.cast(),
+                Layout::from_size_align_unchecked(old, ALIGN),
+                new,
+            )
+            .cast()
+        }
+    }
+}
+
+/// An error outside any protected call, which can't happen here: as Lua's
+/// own handler, says so (Lua then exits).
+unsafe extern "C-unwind" fn unprotected_error(l: *mut lua_State) -> c_int {
+    // SAFETY: the error is on the stack.
+    let message = unsafe { to_c_bytes(l, -1) };
+    eprintln!(
+        "PANIC: unprotected error in call to Lua API ({})",
+        String::from_utf8_lossy(message)
+    );
+    0
 }
 
 /// `f_<sha1>`, NUL-terminated: where a script's function is kept.
