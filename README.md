@@ -263,9 +263,7 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   answer at once), and replies become Lua values, and its result a reply,
   by Redis' rules. 311 commands' replies match Redis 7.2.4 in both
   protocols (`tests/scripting.rs`), and BullMQ 6.5.4's own test suite
-  passes against it: all 1,111 tests (3 more are skipped in BullMQ's code),
-  one of them only with `--threads 1` (see "Not there yet": the order of a
-  woken client's reply).
+  passes against it: all 1,111 tests (3 more are skipped in BullMQ's code).
   One difference on purpose: Redis 7.2.4 crashes on an
   error table without `err` (`error({})`); Tantalum replies Redis 8's
   `ERR unknown error`.
@@ -305,8 +303,18 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   after that command (before its client's next one, as in Redis 7.2) the
   waiting commands run again, oldest first, while the key has data of their
   kind. Run again, a command can also fail: if one of `BLPOP a b`'s keys
-  became a string, it gets `WRONGTYPE`, as in Redis. Its reply goes to the
-  waiting connection, which is woken to send it. The connection meanwhile
+  became a string, it gets `WRONGTYPE`, as in Redis. The writer sends that
+  reply right there, on the waiting client's socket, without blocking, so the
+  woken client hears before the writer does, as from Redis, though its
+  connection may be on another thread. BullMQ counts on it: a queue's waiting
+  worker takes a new job before the code that added it can start another.
+  (What the socket won't take at once, and replies to TLS and subscribed
+  clients, go to the waiting connection, which is woken to send them, so
+  for those the order isn't kept across threads.) The writer's reply waits
+  for that one `send`, ~3.5 µs over loopback (a write that wakes many
+  clients at once sends to each in turn on its own thread, as Redis does),
+  while the woken client hears as much sooner; a cost agreed for Redis'
+  order. The connection meanwhile
   watches its timeout and the socket: a client that leaves stops waiting at
   once and takes nothing, and commands it pipelines after the blocking one
   wait their turn. monoio can't wake a task from another thread without
@@ -804,14 +812,7 @@ hit rates share the seeding flaw described above.
   and `MSET` writes one at a time, so a transaction or script can run
   between two of their keys; `SMOVE`, `LMOVE` and `RENAME` are atomic.
 - **Blocking gaps**: no `WAIT`, `CLIENT UNBLOCK`, or `b` flag in a client
-  list. With more than one thread, a client a write wakes from `BLPOP`,
-  `BZPOPMIN` and the rest can get its reply after the writer gets its own
-  (the woken connection is on another thread, which the writer only signals).
-  Redis sends the woken client's reply first, and BullMQ's test "does not
-  process a job that is being processed when a new queue starts" relies on
-  that: a worker waiting on the queue takes a new job before the code that
-  added it can start a second worker. Against Tantalum the second worker
-  wins about half the time (every time it passes with `--threads 1`).
+  list.
 - **Writes to a small collection decode it whole**: a list, set or sorted
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its

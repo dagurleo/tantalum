@@ -651,6 +651,7 @@ async fn handle_uring(
     }
     let store = &*ctx.store;
     let mut session = client.session();
+    session.socket = socket.as_raw_fd();
     let mut rbuf: Vec<u8> = Vec::with_capacity(URING_READ_BUFFER);
     let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
@@ -792,10 +793,21 @@ trait Stream: AsyncRead + AsyncWrite + Unpin {
     fn poll_read_ready(&self, _: &mut std::task::Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
+
+    /// The socket, if bytes written to it go to the client as they are
+    /// (not TLS): for a write that serves this connection while it's
+    /// blocked to send the reply on. -1 for none.
+    fn plain_socket(&self) -> std::os::fd::RawFd {
+        -1
+    }
 }
 
 impl Stream for TcpStream {
     const WAIT_FOR_DATA: bool = true;
+
+    fn plain_socket(&self) -> std::os::fd::RawFd {
+        self.as_raw_fd()
+    }
 
     // Not `readable()`, which queues each wait on a locked list: through
     // `poll_read_ready` it takes the reader's own waker slot, as reads do.
@@ -865,6 +877,7 @@ async fn serve_stream(
 ) -> io::Result<()> {
     let store = &*ctx.store;
     let mut session = client.session();
+    session.socket = socket.plain_socket();
     // Vecs rather than a BytesMut: after a big request, a BytesMut keeps the
     // whole allocation but reports only its unused tail as capacity, so the
     // shrinking below (and the memory accounting) would miss it. Both are

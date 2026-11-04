@@ -404,7 +404,7 @@ async fn many_producers_and_consumers() {
                             let mine = format!("mine{i}");
                             let r = c.call(&["BLMOVE", "q1", &mine, "LEFT", "RIGHT", "1"]).await;
                             if r.starts_with('$') {
-                                c.call(&["LPOP", &mine]).await;
+                                assert_eq!(c.call(&["LPOP", &mine]).await, r);
                             }
                             r
                         }
@@ -412,6 +412,10 @@ async fn many_producers_and_consumers() {
                     if reply == "*-1\r\n" {
                         return got;
                     }
+                    // (An internal error here once came with an item lost:
+                    // a writer that gave a waiter back served it an error
+                    // after another writer had claimed it.)
+                    assert!(reply.contains("item"), "consumer {i} got {reply:?}");
                     got.extend(
                         reply
                             .split("\r\n")
@@ -427,7 +431,8 @@ async fn many_producers_and_consumers() {
                 let mut c = Client::connect(addr).await;
                 for n in 0..PER_PRODUCER {
                     let key = if n % 2 == 0 { "q1" } else { "q2" };
-                    c.call(&["RPUSH", key, &format!("item{p}-{n}")]).await;
+                    let r = c.call(&["RPUSH", key, &format!("item{p}-{n}")]).await;
+                    assert!(r.starts_with(':'), "RPUSH replied {r:?}");
                     if n % 50 == 0 {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
@@ -443,8 +448,15 @@ async fn many_producers_and_consumers() {
                 assert!(seen.insert(item.clone()), "{item} twice ({mode:?})");
             }
         }
-        assert_eq!(seen.len(), PRODUCERS * PER_PRODUCER, "{mode:?}");
         let mut admin = Client::connect(addr).await;
+        if seen.len() != PRODUCERS * PER_PRODUCER {
+            let keys = admin.call(&["KEYS", "*"]).await;
+            panic!(
+                "{mode:?}: {} of {} items reached consumers; keys left: {keys:?}",
+                seen.len(),
+                PRODUCERS * PER_PRODUCER
+            );
+        }
         assert_eq!(admin.call(&["DBSIZE"]).await, ":0\r\n");
         blocked(&ctx, 0).await;
     }
@@ -519,5 +531,57 @@ async fn no_wakeup_is_lost_to_a_race() {
         assert_eq!(seen.len(), ITEMS, "{mode:?}");
         assert_eq!(producer.call(&["DBSIZE"]).await, ":0\r\n");
         blocked(&ctx, 0).await;
+    }
+}
+
+/// Whether `client`'s socket holds unread bytes right now, without waiting.
+fn has_bytes_now(client: &Client) -> bool {
+    if !client.stream.buffer().is_empty() {
+        return true;
+    }
+    let mut byte = [std::mem::MaybeUninit::<u8>::uninit()];
+    socket2::SockRef::from(client.stream.get_ref())
+        .peek(&mut byte)
+        .is_ok_and(|n| n > 0)
+}
+
+/// As from Redis, a client a write wakes gets its reply before the writer
+/// gets the write's (BullMQ's waiting workers count on it), with the two
+/// connections on different threads, and when the write is a script's or
+/// a transaction's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_woken_client_hears_before_the_writer() {
+    for mode in MODES {
+        let (addr, ctx) = start(mode).await;
+        // Connections are dealt to the two threads in turn.
+        let mut waiter = Client::connect(addr).await;
+        let mut writer = Client::connect(addr).await;
+        for round in 0..60 {
+            waiter.send(&["BLPOP", "q", "0"]).await;
+            blocked(&ctx, 1).await;
+            match round % 3 {
+                0 => assert_eq!(writer.call(&["RPUSH", "q", "x"]).await, ":1\r\n"),
+                1 => assert_eq!(
+                    writer
+                        .call(&["EVAL", "return redis.call('rpush', KEYS[1], 'x')", "1", "q"])
+                        .await,
+                    ":1\r\n"
+                ),
+                _ => {
+                    writer.send(&["MULTI"]).await;
+                    writer.send(&["RPUSH", "q", "x"]).await;
+                    writer.send(&["EXEC"]).await;
+                    for expected in ["+OK\r\n", "+QUEUED\r\n", "*1\r\n:1\r\n"] {
+                        assert_eq!(writer.reply().await, expected);
+                    }
+                }
+            }
+            assert!(has_bytes_now(&waiter), "{mode:?}, round {round}");
+            assert_eq!(waiter.reply().await, pop("q", "x"));
+            // The reply can come before its connection is done with the
+            // wait (the writer sent it), so the next BLPOP must not be
+            // taken as blocked by this one's count.
+            blocked(&ctx, 0).await;
+        }
     }
 }
