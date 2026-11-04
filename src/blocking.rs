@@ -10,8 +10,11 @@
 //! - A write that creates one of those keys queues it as ready. After that
 //!   command, [`serve_ready`] runs the waiting commands again, oldest first,
 //!   while the key has data of their kind: as Redis 7.2 does, right after
-//!   the command that added it and before that client's next one. Each reply
-//!   goes into its waiter, whose connection is woken to send it.
+//!   the command that added it and before that client's next one. The
+//!   writer sends each reply itself, on the waiter's socket, before its own
+//!   reply goes out (so the woken client hears first, as from Redis); what
+//!   it can't send there goes into the waiter, whose connection is woken to
+//!   send it.
 //! - The connection waits for that, for its timeout, or for the client to
 //!   go away. Commands the client pipelines meanwhile wait their turn.
 //!
@@ -24,6 +27,7 @@
 //! some, and commands check one flag for ready keys.
 
 use std::ops::Range;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::Poll;
@@ -90,7 +94,10 @@ pub struct Waiter {
     attempt: Try,
     client: u64,
     resp3: bool,
-    /// Its reply, once served.
+    /// Its connection's socket, for the writer to send the reply on (-1:
+    /// none, or one only its connection may write to: TLS, a subscriber).
+    socket: RawFd,
+    /// Its reply once served, or what the writer couldn't send of it.
     reply: Mutex<Vec<u8>>,
     /// Wakes its connection while it waits.
     waker: Mutex<Option<Wake>>,
@@ -195,9 +202,31 @@ impl Waiter {
             commands: 0,
             hits: 0,
             misses: 0,
+            socket: -1,
         };
         let args = Args::new(&self.buf, &self.ranges);
         (self.attempt)(ctx, &mut session, now, &args, out)
+    }
+
+    /// For the writer that claimed it, which holds the connection (and so
+    /// its socket) until it serves it: sends what of `reply` its socket
+    /// takes at once, returning the rest. The woken client then hears before
+    /// the writer does, as from Redis: the connection, on another thread,
+    /// would send after the writer had. (BullMQ's waiting workers count on
+    /// it.)
+    fn send_now<'r>(&self, reply: &'r [u8]) -> &'r [u8] {
+        if self.socket < 0 {
+            return reply;
+        }
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::MSG_DONTWAIT;
+        // SAFETY: the socket is open while its waiter is claimed (its
+        // connection waits for the claim before it drops it), and `reply`
+        // is valid for its length.
+        let sent = unsafe { libc::send(self.socket, reply.as_ptr().cast(), reply.len(), flags) };
+        &reply[usize::try_from(sent).unwrap_or(0)..]
     }
 
     fn serve(&self, reply: Vec<u8>) {
@@ -212,15 +241,31 @@ impl Waiter {
 
 /// A claimed waiter, served when dropped if its command didn't finish
 /// (it panicked), so its connection isn't left waiting on it forever.
-struct Claimed(Arc<Waiter>);
+/// Only while this claim holds it: once served, or given back to waiting,
+/// another writer may claim it, and that claim is its own.
+struct Claimed {
+    waiter: Arc<Waiter>,
+    holds: bool,
+}
+
+impl Claimed {
+    fn serve(&mut self, reply: Vec<u8>) {
+        self.holds = false;
+        self.waiter.serve(reply);
+    }
+
+    /// [`Waiter::unclaim`]; once it's waiting again, this claim lets go.
+    fn unclaim(&mut self) -> bool {
+        let unclaimed = self.waiter.unclaim();
+        self.holds = !unclaimed;
+        unclaimed
+    }
+}
 
 impl Drop for Claimed {
     fn drop(&mut self) {
-        if matches!(
-            self.0.state.load(Ordering::Acquire),
-            SERVING | SERVING_AGAIN
-        ) {
-            self.0
+        if self.holds {
+            self.waiter
                 .serve(b"-ERR internal error, closing the connection\r\n".to_vec());
         }
     }
@@ -274,6 +319,12 @@ pub(crate) fn block(
         attempt,
         client: session.id,
         resp3: session.resp3,
+        // A subscriber's connection writes messages while it waits.
+        socket: if session.pubsub.is_none() {
+            session.socket
+        } else {
+            -1
+        },
         reply: Mutex::new(Vec::new()),
         waker: Mutex::new(None),
     });
@@ -311,25 +362,29 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
         // doesn't mean the next won't.
         let mut tried = Vec::new();
         while let Some(waiter) = store.claim_waiter(key, now, &tried) {
-            let claimed = Claimed(waiter);
+            let mut claimed = Claimed {
+                waiter,
+                holds: true,
+            };
             let served = loop {
                 let mut out = Vec::new();
-                match claimed.0.run_again(ctx, now, &mut out) {
+                match claimed.waiter.run_again(ctx, now, &mut out) {
                     Attempt::Done => {
-                        claimed.0.serve(out);
+                        let rest = claimed.waiter.send_now(&out).to_vec();
+                        claimed.serve(rest);
                         break true;
                     }
                     // Another client took the data first.
                     Attempt::Wait { .. } => {
-                        if claimed.0.unclaim() {
+                        if claimed.unclaim() {
                             break false;
                         }
                     }
                 }
             };
             if !served {
-                if claimed.0.kind() == Kind::Stream {
-                    tried.push(claimed.0.clone());
+                if claimed.waiter.kind() == Kind::Stream {
+                    tried.push(claimed.waiter.clone());
                     continue;
                 }
                 break; // the key is empty again
@@ -445,9 +500,37 @@ mod tests {
             attempt: |_, _, _, _, _| Attempt::Done,
             client: 1,
             resp3: false,
+            socket: -1,
             reply: Mutex::new(Vec::new()),
             waker: Mutex::new(None),
         }
+    }
+
+    /// A writer gives a waiter back (its data was taken), and another
+    /// claims it before the first's guard goes: the guard leaves the second
+    /// claim alone. (It used to serve an internal error over it, and the
+    /// data the second writer then popped was lost.)
+    #[test]
+    fn a_claim_given_back_is_not_served_by_its_guard() {
+        let w = Arc::new(waiter());
+        assert!(w.arm());
+        assert!(w.claim());
+        let mut first = Claimed {
+            waiter: w.clone(),
+            holds: true,
+        };
+        assert!(first.unclaim());
+        assert!(w.claim(), "a second writer claims it");
+        drop(first);
+        assert_eq!(w.state.load(Ordering::Acquire), SERVING);
+        assert!(w.reply.lock().is_empty());
+        // And a claim that panics mid-run is still served an error.
+        drop(Claimed {
+            waiter: w.clone(),
+            holds: true,
+        });
+        assert_eq!(w.state.load(Ordering::Acquire), SERVED);
+        assert!(w.reply.lock().starts_with(b"-ERR internal error"));
     }
 
     #[test]

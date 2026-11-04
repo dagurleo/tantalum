@@ -86,3 +86,15 @@ round 4 tantalum-b       P1   ops   271856 p50 0.879 p99 1.063 cpu 0.99 ops/core
 round 4 tantalum-b       P16  ops  2515508 p50 1.519 p99 1.743 cpu 0.99 ops/core  2538126
 round 4 tantalum-uring   P1   ops   338946 p50 0.695 p99 0.863 cpu 0.99 ops/core   341589
 round 4 tantalum-uring   P16  ops  3031782 p50 1.255 p99 1.479 cpu 0.99 ops/core  3058693
+
+# 0.18.1 (blocked clients' replies sent by the writer, on their sockets) against 0.18.0, same VM, 2026-11-04.
+# saturate.sh, 1 server thread, 4 rotated rounds, ops/s median / best round:
+#   epoll P1  -1.1% / +0.0%   P16 +0.1% / +0.6%     io_uring P1 -1.0% / -0.0%   P16 -1.1% / -0.9%
+#   (inside the null A/B's spread above; one 0.18.1 io_uring P1 round dipped to 296k against 349-360k.)
+# BullMQ (bench/bullmq/run.sh, 100,000 jobs, 2 rounds), process jobs/s: epoll 64.8k vs 63.5k, io_uring 56.9k vs 55.2k.
+# BLPOP/RPUSH ping-pong (one producer and one consumer connection per pair, each on its own list; server
+# --threads 2 on CPUs 0-1, node 20 + ioredis on 2-3), the case the change touches, alternating runs:
+#   1 pair, epoll:   round trips/s 23.1k (0.18.1) vs 22.8k (0.18.0); RPUSH reply p50 27.4 vs 23.9 us, p99 ~40 both
+#   (the writer now sends the woken client's reply, one send(2), before its own).
+#   8 pairs (node saturated): round trips/s about equal or higher (epoll 42.0k vs 41.8k, io_uring 41.2k vs 35.6k
+#   medians), RPUSH p50 higher on epoll (150 vs 72 us) since node now handles the woken reply first.

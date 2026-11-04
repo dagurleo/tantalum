@@ -344,6 +344,7 @@ impl Client<'_> {
             commands: 0,
             hits: 0,
             misses: 0,
+            socket: -1,
         }
     }
 
@@ -481,6 +482,9 @@ pub struct Session {
     pub(crate) commands: u64,
     pub(crate) hits: u64,
     pub(crate) misses: u64,
+    /// Its connection's plain TCP socket, for a write that serves it while
+    /// it's blocked to send the reply on (see `blocking`); -1 for none.
+    pub(crate) socket: RawFd,
 }
 
 impl Session {
@@ -502,6 +506,7 @@ impl Session {
             commands: 0,
             hits: 0,
             misses: 0,
+            socket: -1,
         }
     }
 
