@@ -1,4 +1,9 @@
-# Tantalum
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/readme-banner-dark.svg">
+    <img alt="Tantalum" src="assets/brand/readme-banner-light.svg" width="640">
+  </picture>
+</h1>
 
 A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
