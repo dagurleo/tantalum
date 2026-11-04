@@ -260,7 +260,7 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   again); its `redis.call`s run through the command table in a session of
   their own (RESP2 unless the script asks for RESP3; blocking commands
   answer at once), and replies become Lua values, and its result a reply,
-  by Redis' rules. 312 commands' replies match Redis 7.2.4 in both
+  by Redis' rules. 311 commands' replies match Redis 7.2.4 in both
   protocols (`tests/scripting.rs`), and BullMQ 6.5.4's own test suite
   passes against it: all 1,111 tests (3 more are skipped in BullMQ's code).
   One difference on purpose: Redis 7.2.4 crashes on an

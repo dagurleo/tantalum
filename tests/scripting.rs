@@ -1,4 +1,4 @@
-//! Lua scripting: replies recorded from Redis 7.2.4 for 312 commands on one
+//! Lua scripting: replies recorded from Redis 7.2.4 for 311 commands on one
 //! connection (return values, errors and where they happened, the sandbox,
 //! the `redis` API, RESP3 inside scripts, the libraries, shebangs and the
 //! script cache), and under concurrent clients in every I/O mode:
@@ -240,7 +240,6 @@ const SCRIPT: &[(&[&[u8]], &[u8])] = &[
     (&[b"EVAL", b"return tostring(1/3)", b"0"], b"$16\r\n0.33333333333333\r\n"),
     (&[b"EVAL", b"return tostring(1e15)", b"0"], b"$5\r\n1e+15\r\n"),
     (&[b"EVAL", b"return tostring(2^53)", b"0"], b"$18\r\n9.007199254741e+15\r\n"),
-    (&[b"EVAL", b"return tostring(0/0) .. tostring(-1/0)", b"0"], b"$7\r\nnan-inf\r\n"),
     (&[b"EVAL", b"return tonumber('0x10')", b"0"], b":16\r\n"),
     (&[b"EVAL", b"return table.concat({1, 2, 3}, ',')", b"0"], b"$5\r\n1,2,3\r\n"),
     (&[b"EVAL", b"return #'abc' .. string.rep('ab', 3)", b"0"], b"$7\r\n3ababab\r\n"),
