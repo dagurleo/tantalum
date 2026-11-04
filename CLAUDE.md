@@ -51,5 +51,7 @@ come before any feature.
 3. For I/O changes, the end-to-end A/B.
 4. The README matches: commands table, design notes, "Not there yet".
 
-CI then runs the tests on Linux and macOS, two minutes of fuzzing and the
-deploy-image check. Railway deploys `main` to production only after CI passes.
+CI then runs the tests on Linux, two minutes of fuzzing and the
+deploy-image check (macOS is off while the repository is private, so the
+`cargo test` above, on a Mac, covers it). Railway deploys `main` to
+production only after CI passes.
