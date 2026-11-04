@@ -82,6 +82,8 @@ pub struct Context {
     pub settings: Settings,
     /// Set when the server saves snapshots (`--snapshot`).
     pub snapshots: Option<Arc<Snapshots>>,
+    /// The append-only log (`--aof`), once it's taking writes.
+    aof: std::sync::OnceLock<Arc<crate::aof::Aof>>,
     /// Who is subscribed to what.
     pub pubsub: Arc<PubSub>,
     /// Lua scripts and their interpreter, made on the first one.
@@ -110,6 +112,7 @@ impl Context {
             store,
             settings,
             snapshots: None,
+            aof: std::sync::OnceLock::new(),
             started: Instant::now(),
             next_client_id: AtomicU64::new(1),
             clients: Mutex::new(HashMap::new()),
@@ -120,6 +123,16 @@ impl Context {
             shutting_down: AtomicBool::new(false),
             shutdown: watch::Sender::new(false),
         }
+    }
+
+    /// Logs writes to `aof` from now on (see `aof::start`).
+    pub fn set_aof(&self, aof: Arc<crate::aof::Aof>) {
+        let _ = self.aof.set(aof);
+    }
+
+    /// The append-only log, if it's on.
+    pub fn aof(&self) -> Option<&Arc<crate::aof::Aof>> {
+        self.aof.get()
     }
 
     /// Saves snapshots with `snapshots` (for `SAVE`, `BGSAVE` and `INFO`).
@@ -507,6 +520,15 @@ impl Session {
             hits: 0,
             misses: 0,
             socket: -1,
+        }
+    }
+
+    /// The session the append-only log's commands run in again at startup:
+    /// as a script's (blocking commands reply at once), but not a script.
+    pub(crate) fn for_replay() -> Session {
+        Session {
+            in_script: false,
+            ..Session::for_script()
         }
     }
 

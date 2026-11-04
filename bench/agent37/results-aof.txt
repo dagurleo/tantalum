@@ -1,0 +1,129 @@
+# Agent37 VM b0lnts005b (4 vCPU Xeon E-2388G, Linux 7.0), 2026-11-04 14:24-14:44 UTC.
+# tantalum = 0.19.0 (the aof branch), tantalum-b = 0.18.3; Redis 8.10.3 from the bench image.
+# First: saturate.sh with the log off (A/B against 0.18.3). Then bench/docker/aof.sh: each server with its log off and on.
+
+### saturate: aof branch with the log off (tantalum) vs 0.18.3 (tantalum-b)
+# 7.0.0-38-generic, 4 CPUs; 1 server thread(s), memtier 3 x 80 clients;
+# 1000000 keys x 32 B, 1:10 SET:GET, 10 s per run. ops/core = ops / server cores used.
+# warning: the open-file limit is 4096, so only about 4064 of --maxclients 10000 can connect
+# tantalum         RSS after the fill   69688 kB
+# tantalum-b       RSS after the fill   69464 kB
+# tantalum-uring   RSS after the fill   70940 kB
+# tantalum-b-uring RSS after the fill   70748 kB
+round 1 tantalum         P1   ops   265253 p50 0.879 p99 1.455 cpu 0.90 ops/core   294366
+round 1 tantalum         P16  ops  2350693 p50 1.599 p99 2.527 cpu 0.90 ops/core  2610964
+round 1 tantalum-b       P1   ops   268754 p50 0.879 p99 1.279 cpu 0.90 ops/core   298071
+round 1 tantalum-b       P16  ops  2189033 p50 1.695 p99 3.183 cpu 0.99 ops/core  2206823
+round 1 tantalum-uring   P1   ops   338767 p50 0.695 p99 1.007 cpu 0.99 ops/core   342266
+round 1 tantalum-uring   P16  ops  2800321 p50 1.359 p99 1.799 cpu 0.90 ops/core  3103178
+round 1 tantalum-b-uring P1   ops   344324 p50 0.687 p99 0.831 cpu 0.99 ops/core   347340
+round 1 tantalum-b-uring P16  ops  2791101 p50 1.359 p99 2.031 cpu 0.90 ops/core  3100897
+round 2 tantalum-b       P1   ops   273280 p50 0.871 p99 1.079 cpu 0.99 ops/core   275833
+round 2 tantalum-b       P16  ops  2432558 p50 1.567 p99 2.095 cpu 0.90 ops/core  2702980
+round 2 tantalum-uring   P1   ops   332497 p50 0.703 p99 1.071 cpu 0.99 ops/core   335621
+round 2 tantalum-uring   P16  ops  2859618 p50 1.327 p99 1.791 cpu 0.99 ops/core  2885145
+round 2 tantalum-b-uring P1   ops   344168 p50 0.687 p99 0.839 cpu 0.99 ops/core   346878
+round 2 tantalum-b-uring P16  ops  2833683 p50 1.335 p99 1.967 cpu 0.99 ops/core  2865600
+round 2 tantalum         P1   ops   273556 p50 0.871 p99 1.047 cpu 0.99 ops/core   275985
+round 2 tantalum         P16  ops  2461406 p50 1.543 p99 1.951 cpu 0.90 ops/core  2729423
+round 3 tantalum-uring   P1   ops   345532 p50 0.687 p99 0.927 cpu 0.99 ops/core   348810
+round 3 tantalum-uring   P16  ops  2845365 p50 1.319 p99 2.159 cpu 0.99 ops/core  2876588
+round 3 tantalum-b-uring P1   ops   336916 p50 0.695 p99 1.063 cpu 0.99 ops/core   339884
+round 3 tantalum-b-uring P16  ops  2845618 p50 1.335 p99 1.919 cpu 0.99 ops/core  2873858
+round 3 tantalum         P1   ops   270583 p50 0.871 p99 1.271 cpu 0.99 ops/core   272973
+round 3 tantalum         P16  ops  2452801 p50 1.535 p99 2.607 cpu 0.99 ops/core  2475004
+round 3 tantalum-b       P1   ops   271228 p50 0.871 p99 1.287 cpu 0.90 ops/core   301049
+round 3 tantalum-b       P16  ops  2473799 p50 1.543 p99 1.927 cpu 0.99 ops/core  2497438
+round 4 tantalum-b-uring P1   ops   338504 p50 0.695 p99 1.007 cpu 0.90 ops/core   375792
+round 4 tantalum-b-uring P16  ops  2884737 p50 1.311 p99 1.919 cpu 0.99 ops/core  2914475
+round 4 tantalum         P1   ops   269137 p50 0.871 p99 1.215 cpu 0.99 ops/core   271498
+round 4 tantalum         P16  ops  2451040 p50 1.543 p99 2.399 cpu 0.99 ops/core  2475571
+round 4 tantalum-b       P1   ops   266052 p50 0.895 p99 1.119 cpu 0.90 ops/core   295296
+round 4 tantalum-b       P16  ops  2424847 p50 1.575 p99 1.879 cpu 0.90 ops/core  2689363
+round 4 tantalum-uring   P1   ops   336903 p50 0.703 p99 0.863 cpu 0.99 ops/core   339981
+round 4 tantalum-uring   P16  ops  2833254 p50 1.327 p99 2.127 cpu 0.99 ops/core  2862655
+### aof cost: Redis server v=8.10.3
+# 7.0.0-38-generic, 4 CPUs, Intel(R) Xeon(R) E-2388G CPU @ 3.20GHz
+# server on CPU 0, memtier 3 x 80 on 1-3; 1000000 keys x 32 B, 10 s per run
+round 1 tantalum           set-P1  ops   250292 p50 0.951 p99 1.431 cpu 1.00 ops/core   251059
+round 1 tantalum           set-P16 ops  1528976 p50 2.463 p99 3.183 cpu 0.91 ops/core  1685301
+round 1 tantalum           mix-P1  ops   274346 p50 0.863 p99 1.207 cpu 0.91 ops/core   302527
+round 1 tantalum           mix-P16 ops  2567392 p50 1.479 p99 2.383 cpu 0.91 ops/core  2831018
+round 1 tantalum-aof       set-P1  ops   234589 p50 0.991 p99 1.639 cpu 0.99 ops/core   235934
+round 1 tantalum-aof       set-P16 ops  1073325 p50 3.103 p99 7.615 cpu 0.87 ops/core  1237423
+round 1 tantalum-aof       mix-P1  ops   268325 p50 0.887 p99 1.167 cpu 1.00 ops/core   268865
+round 1 tantalum-aof       mix-P16 ops  2333623 p50 1.607 p99 2.671 cpu 0.99 ops/core  2347974
+round 1 tantalum-aof       rewrite 0.10 s (dir was 96 MB); SETs meanwhile p50 0.047 p99 0.079 p99.9 0.151 max 32.767 ms
+round 1 tantalum-uring     set-P1  ops   306962 p50 0.783 p99 0.951 cpu 1.00 ops/core   307891
+round 1 tantalum-uring     set-P16 ops  1747406 p50 2.127 p99 3.183 cpu 1.00 ops/core  1754326
+round 1 tantalum-uring     mix-P1  ops   350074 p50 0.671 p99 0.999 cpu 0.91 ops/core   385461
+round 1 tantalum-uring     mix-P16 ops  2935475 p50 1.287 p99 1.799 cpu 1.00 ops/core  2946437
+round 1 tantalum-uring-aof set-P1  ops   287187 p50 0.807 p99 1.271 cpu 0.99 ops/core   288980
+round 1 tantalum-uring-aof set-P16 ops  1207194 p50 2.783 p99 6.751 cpu 0.86 ops/core  1397660
+round 1 tantalum-uring-aof mix-P1  ops   340337 p50 0.687 p99 1.071 cpu 1.00 ops/core   341083
+round 1 tantalum-uring-aof mix-P16 ops  2698209 p50 1.367 p99 2.335 cpu 0.90 ops/core  2986187
+round 1 tantalum-uring-aof rewrite 0.07 s (dir was 54 MB); SETs meanwhile p50 0.047 p99 0.095 p99.9 0.167 max 31.615 ms
+round 1 redis              set-P1  ops   269280 p50 0.855 p99 1.719 cpu 1.00 ops/core   270331
+round 1 redis              set-P16 ops  1518535 p50 2.575 p99 3.423 cpu 1.00 ops/core  1521401
+round 1 redis              mix-P1  ops   284376 p50 0.823 p99 1.639 cpu 1.00 ops/core   284919
+round 1 redis              mix-P16 ops  1725320 p50 2.287 p99 3.039 cpu 1.00 ops/core  1730544
+round 1 redis-aof          set-P1  ops   205524 p50 0.935 p99 4.799 cpu 0.82 ops/core   249968
+round 1 redis-aof          set-P16 ops   704327 p50 4.255 p99 18.431 cpu 0.72 ops/core   984185
+round 1 redis-aof          mix-P1  ops   274961 p50 0.839 p99 1.687 cpu 1.00 ops/core   275821
+round 1 redis-aof          mix-P16 ops  1480075 p50 2.511 p99 6.559 cpu 0.86 ops/core  1717704
+round 1 redis-aof          rewrite 0.23 s (dir was 99 MB); SETs meanwhile p50 0.047 p99 0.103 p99.9 3.119 max 9.407 ms
+round 2 tantalum-aof       set-P1  ops   242940 p50 0.967 p99 1.495 cpu 0.99 ops/core   244178
+round 2 tantalum-aof       set-P16 ops  1111996 p50 3.071 p99 7.807 cpu 0.87 ops/core  1274182
+round 2 tantalum-aof       mix-P1  ops   271422 p50 0.871 p99 1.391 cpu 0.91 ops/core   299226
+round 2 tantalum-aof       mix-P16 ops  2422772 p50 1.543 p99 2.591 cpu 0.99 ops/core  2440905
+round 2 tantalum-aof       rewrite 0.09 s (dir was 69 MB); SETs meanwhile p50 0.047 p99 0.087 p99.9 0.127 max 31.871 ms
+round 2 tantalum-uring     set-P1  ops   308077 p50 0.783 p99 0.999 cpu 0.91 ops/core   339689
+round 2 tantalum-uring     set-P16 ops  1795111 p50 2.095 p99 2.655 cpu 0.91 ops/core  1980524
+round 2 tantalum-uring     mix-P1  ops   350821 p50 0.679 p99 0.807 cpu 0.91 ops/core   387238
+round 2 tantalum-uring     mix-P16 ops  2972446 p50 1.279 p99 1.631 cpu 1.00 ops/core  2982070
+round 2 tantalum-uring-aof set-P1  ops   287324 p50 0.799 p99 1.327 cpu 0.90 ops/core   318031
+round 2 tantalum-uring-aof set-P16 ops  1224027 p50 2.783 p99 6.815 cpu 0.87 ops/core  1408418
+round 2 tantalum-uring-aof mix-P1  ops   339427 p50 0.695 p99 1.047 cpu 1.00 ops/core   340412
+round 2 tantalum-uring-aof mix-P16 ops  2694156 p50 1.367 p99 2.255 cpu 0.99 ops/core  2716236
+round 2 tantalum-uring-aof rewrite 0.08 s (dir was 69 MB); SETs meanwhile p50 0.047 p99 0.087 p99.9 0.127 max 34.303 ms
+round 2 redis              set-P1  ops   273174 p50 0.855 p99 1.711 cpu 1.00 ops/core   273929
+round 2 redis              set-P16 ops  1506511 p50 2.607 p99 3.503 cpu 0.91 ops/core  1660824
+round 2 redis              mix-P1  ops   282214 p50 0.823 p99 1.655 cpu 1.00 ops/core   283418
+round 2 redis              mix-P16 ops  1719495 p50 2.287 p99 3.151 cpu 1.00 ops/core  1723126
+round 2 redis-aof          set-P1  ops   201533 p50 0.943 p99 4.927 cpu 0.87 ops/core   232329
+round 2 redis-aof          set-P16 ops   718601 p50 4.127 p99 18.943 cpu 0.72 ops/core   996218
+round 2 redis-aof          mix-P1  ops   271706 p50 0.847 p99 1.695 cpu 1.00 ops/core   272571
+round 2 redis-aof          mix-P16 ops  1420668 p50 2.575 p99 6.751 cpu 0.86 ops/core  1651586
+round 2 redis-aof          rewrite 1.08 s (dir was 47 MB); SETs meanwhile p50 0.047 p99 0.127 p99.9 3.151 max 5.151 ms
+round 2 tantalum           set-P1  ops   247061 p50 0.959 p99 1.431 cpu 0.91 ops/core   272965
+round 2 tantalum           set-P16 ops  1561193 p50 2.415 p99 3.167 cpu 0.91 ops/core  1719434
+round 2 tantalum           mix-P1  ops   273084 p50 0.863 p99 1.391 cpu 1.00 ops/core   273897
+round 2 tantalum           mix-P16 ops  2546037 p50 1.487 p99 2.399 cpu 0.91 ops/core  2809189
+round 3 tantalum-uring     set-P1  ops   315290 p50 0.759 p99 0.935 cpu 0.91 ops/core   347497
+round 3 tantalum-uring     set-P16 ops  1753902 p50 2.143 p99 3.135 cpu 1.00 ops/core  1760180
+round 3 tantalum-uring     mix-P1  ops   345945 p50 0.679 p99 1.031 cpu 1.00 ops/core   346875
+round 3 tantalum-uring     mix-P16 ops  2918212 p50 1.303 p99 1.807 cpu 0.91 ops/core  3222998
+round 3 tantalum-uring-aof set-P1  ops   286062 p50 0.807 p99 1.223 cpu 0.99 ops/core   288342
+round 3 tantalum-uring-aof set-P16 ops  1221738 p50 2.767 p99 6.943 cpu 0.95 ops/core  1279356
+round 3 tantalum-uring-aof mix-P1  ops   335949 p50 0.703 p99 1.023 cpu 1.00 ops/core   336890
+round 3 tantalum-uring-aof mix-P16 ops  2686339 p50 1.375 p99 2.191 cpu 0.90 ops/core  2970189
+round 3 tantalum-uring-aof rewrite 0.08 s (dir was 64 MB); SETs meanwhile p50 0.047 p99 0.079 p99.9 0.119 max 32.255 ms
+round 3 redis              set-P1  ops   271986 p50 0.855 p99 1.711 cpu 0.91 ops/core   299861
+round 3 redis              set-P16 ops  1447431 p50 2.687 p99 4.079 cpu 0.91 ops/core  1597593
+round 3 redis              mix-P1  ops   278750 p50 0.823 p99 1.663 cpu 1.00 ops/core   279460
+round 3 redis              mix-P16 ops  1712632 p50 2.303 p99 3.135 cpu 1.00 ops/core  1717977
+round 3 redis-aof          set-P1  ops   198819 p50 0.943 p99 4.991 cpu 0.78 ops/core   253492
+round 3 redis-aof          set-P16 ops   702800 p50 4.191 p99 20.095 cpu 0.72 ops/core   977400
+round 3 redis-aof          mix-P1  ops   269894 p50 0.847 p99 1.711 cpu 1.00 ops/core   270876
+round 3 redis-aof          mix-P16 ops  1427317 p50 2.543 p99 7.647 cpu 0.85 ops/core  1685007
+round 3 redis-aof          rewrite 1.10 s (dir was 47 MB); SETs meanwhile p50 0.047 p99 0.127 p99.9 3.135 max 6.399 ms
+round 3 tantalum           set-P1  ops   253620 p50 0.943 p99 1.191 cpu 1.00 ops/core   254165
+round 3 tantalum           set-P16 ops  1545113 p50 2.447 p99 3.119 cpu 0.91 ops/core  1702403
+round 3 tantalum           mix-P1  ops   278192 p50 0.863 p99 0.983 cpu 0.91 ops/core   306897
+round 3 tantalum           mix-P16 ops  2556474 p50 1.487 p99 1.823 cpu 1.00 ops/core  2565124
+round 3 tantalum-aof       set-P1  ops   242198 p50 0.967 p99 1.503 cpu 0.90 ops/core   268046
+round 3 tantalum-aof       set-P16 ops  1095358 p50 3.087 p99 7.455 cpu 0.87 ops/core  1259260
+round 3 tantalum-aof       mix-P1  ops   279041 p50 0.863 p99 0.999 cpu 0.91 ops/core   307629
+round 3 tantalum-aof       mix-P16 ops  2347399 p50 1.567 p99 2.735 cpu 0.90 ops/core  2598145
+round 3 tantalum-aof       rewrite 0.08 s (dir was 51 MB); SETs meanwhile p50 0.047 p99 0.087 p99.9 0.151 max 34.047 ms
+AB-DONE

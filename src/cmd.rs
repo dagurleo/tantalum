@@ -105,6 +105,11 @@ struct Command {
 }
 
 impl Command {
+    /// Whether it may change the data (Redis' `write` flag).
+    fn writes(&self) -> bool {
+        self.flags.contains(&"write")
+    }
+
     fn arity_allows(&self, len: usize) -> bool {
         let len = len as i64;
         let arity = i64::from(self.arity);
@@ -162,6 +167,7 @@ static COMMANDS: &[Command] = &[
     Command { name: "flushall", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
     Command { name: "save", arity: 1, flags: &["admin", "noscript"], keys: NO_KEYS, run: save },
     Command { name: "bgsave", arity: -1, flags: &["admin", "noscript"], keys: NO_KEYS, run: bgsave },
+    Command { name: "bgrewriteaof", arity: 1, flags: &["admin", "noscript", "no_async_loading"], keys: NO_KEYS, run: bgrewriteaof },
     Command { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: lastsave },
     Command { name: "flushdb", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
     Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: quit },
@@ -303,7 +309,7 @@ pub fn execute(
         if args.len() == 2 && name.eq_ignore_ascii_case(b"GET") {
             return get(ctx, session, now, args, out);
         }
-        if args.len() >= 3 && name.eq_ignore_ascii_case(b"SET") {
+        if args.len() >= 3 && name.eq_ignore_ascii_case(b"SET") && ctx.aof().is_none() {
             return set(ctx, session, now, args, out);
         }
     } else if let Some(subscriber) = session.subscriber()
@@ -331,12 +337,18 @@ pub fn execute(
         refuse_in_multi(session);
         return Reply::Written;
     }
+    if !session.unrestricted && !session.authenticated && !command.flags.contains(&"no_auth") {
+        resp::write_error(out, b"NOAUTH Authentication required.");
+        refuse_in_multi(session);
+        return Reply::Written;
+    }
+    if let Some(aof) = ctx.aof()
+        && aof.failing()
+        && refused_unlogged(session, aof, command, out)
+    {
+        return Reply::Written;
+    }
     if !session.unrestricted {
-        if !session.authenticated && !command.flags.contains(&"no_auth") {
-            resp::write_error(out, b"NOAUTH Authentication required.");
-            refuse_in_multi(session);
-            return Reply::Written;
-        }
         // A subscribed RESP2 client may only run the pub/sub ones, PING,
         // QUIT and RESET (but hears about an unknown subcommand first).
         if session.pubsub.is_some()
@@ -361,11 +373,110 @@ pub fn execute(
             return Reply::Written;
         }
     }
+    if let Some(aof) = ctx.aof()
+        && (command.writes() || matches!(command.name, "eval" | "evalsha" | "exec"))
+    {
+        return logged(ctx, session, aof, command, args, out);
+    }
     let reply = (command.run)(ctx, session, now, args, out);
+    if ctx.store.has_ready() {
+        serve_ready(ctx, now);
+    }
+    reply
+}
+
+/// Serves blocked clients whose keys are ready, after a command that isn't
+/// a write (a write serves them in its turn). Their commands write: with
+/// the append-only log on, they take a turn too, so they're logged, in order.
+fn serve_ready(ctx: &Context, now: Millis) {
+    match ctx.aof() {
+        Some(aof) => {
+            let turn = aof.turn(false);
+            crate::blocking::serve_ready(ctx, turn.now);
+        }
+        None => crate::blocking::serve_ready(ctx, now),
+    }
+}
+
+/// While the append-only log can't be written, Redis refuses commands that
+/// write (and `EXEC` with one queued, discarding it), and `PING`, so health
+/// checks notice: true if it refused this one, replying why.
+#[cold]
+fn refused_unlogged(
+    session: &mut Session,
+    aof: &crate::aof::Aof,
+    command: &Command,
+    out: &mut Vec<u8>,
+) -> bool {
+    match command.name {
+        "ping" => {}
+        "exec" => {
+            let Some(queue) = &session.multi else {
+                return false;
+            };
+            if !(0..queue.len()).any(|i| find_write_command(queue.command(i).get(0)).is_some()) {
+                return false;
+            }
+            session.multi = None;
+            session.watching = None;
+            session.refresh();
+            let error = format!(
+                "EXECABORT Transaction discarded because of: {}",
+                aof.failure()
+            );
+            resp::write_error(out, error.as_bytes());
+            return true;
+        }
+        _ if command.writes() => {}
+        _ => return false,
+    }
+    resp::write_error(out, aof.failure().as_bytes());
+    refuse_in_multi(session);
+    true
+}
+
+/// [`execute`] for a command that may write, with the append-only log on:
+/// in a write turn, at the time the turn comes, logging what it did (a
+/// script's or transaction's writes as a group).
+fn logged(
+    ctx: &Context,
+    session: &mut Session,
+    aof: &crate::aof::Aof,
+    command: &Command,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    // Scripts and transactions log their commands' writes, and MSET its
+    // pairs, as a group.
+    let grouped = !command.writes() || command.name == "mset";
+    let mut turn = aof.turn(grouped);
+    let now = turn.now;
+    let start = out.len();
+    let reply = (command.run)(ctx, session, now, args, out);
+    // A blocked command is logged when it's served.
+    if !grouped && !matches!(reply, Reply::Block(_)) {
+        let bulk;
+        let written = match &reply {
+            Reply::Bulk(value) => {
+                bulk = value.as_bytes();
+                bulk
+            }
+            _ => &out[start..],
+        };
+        crate::aof::record(command.name, args, written);
+    }
+    turn.end_group();
     if ctx.store.has_ready() {
         crate::blocking::serve_ready(ctx, now);
     }
     reply
+}
+
+/// The name of the write command called `name`, if it is one.
+pub(crate) fn find_write_command(name: &[u8]) -> Option<&'static str> {
+    find_command(name)
+        .filter(|command| command.writes())
+        .map(|command| command.name)
 }
 
 pub(crate) use eval::call_from_script;
@@ -651,6 +762,7 @@ fn mset(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut 
         .step_by(2)
         .map(|i| args.key_at(store, i))
         .collect();
+    let logged = ctx.aof().is_some();
     for (i, &key) in keys.iter().enumerate() {
         if keys.len() > 1 {
             store.prefetch_ahead(i, |j| keys.get(j).map(Key::hash));
@@ -662,6 +774,12 @@ fn mset(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut 
         {
             resp::write_error(out, OOM);
             return Reply::Written;
+        }
+        // Logged a pair at a time (a group: see `logged`), so evictions
+        // between pairs, and the pairs set before running out of memory,
+        // come back as they were.
+        if logged {
+            crate::aof::record_parts([&b"SET"[..], args.get(2 * i + 1), value].into_iter());
         }
     }
     out.extend_from_slice(resp::OK);
@@ -1081,6 +1199,30 @@ fn bgsave(ctx: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut 
             resp::write_simple(out, b"Background saving started");
         }
         Some(_) => resp::write_error(out, b"ERR Background save already in progress"),
+    }
+    Reply::Written
+}
+
+/// `BGREWRITEAOF`: rewrites the append-only log in the background.
+fn bgrewriteaof(
+    ctx: &Context,
+    _: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    match ctx.aof() {
+        None => resp::write_error(
+            out,
+            b"ERR the append-only log is off (start with --aof DIR)",
+        ),
+        Some(aof) if aof.rewrite_in_background() => {
+            resp::write_simple(out, b"Background append only file rewriting started");
+        }
+        Some(_) => resp::write_error(
+            out,
+            b"ERR Background append only file rewriting already in progress",
+        ),
     }
     Reply::Written
 }
@@ -1820,7 +1962,7 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
             let _ = write!(
                 s,
                 "snapshots:on\r\nsnapshot_file:{}\r\nrdb_changes_since_last_save:{}\r\n\
-                 rdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\n\r\n",
+                 rdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\n",
                 snapshots.path.display(),
                 snapshots.unsaved_changes(),
                 u8::from(snapshots.saving_in_background()),
@@ -1829,9 +1971,14 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
             );
         }
         None => {
-            let _ = write!(s, "snapshots:off\r\n\r\n");
+            let _ = write!(s, "snapshots:off\r\n");
         }
     }
+    match ctx.aof() {
+        Some(aof) => s.push_str(&aof.info()),
+        None => s.push_str("aof_enabled:0\r\n"),
+    }
+    s.push_str("\r\n");
     let _ = write!(
         s,
         "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\

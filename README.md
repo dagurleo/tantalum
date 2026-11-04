@@ -11,8 +11,8 @@ and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 lists, sorted sets, streams, blocking commands, pub/sub, transactions and
 Lua scripts (enough to run [BullMQ](https://bullmq.io), whose jobs cost
 the server about a third of the CPU they cost Redis), and `SCAN`, `KEYS`
-and `RENAME`, with TTLs, eviction, a password, TLS and optional snapshots
-to disk. The point: be a faster drop-in for the "Redis as
+and `RENAME`, with TTLs, eviction, a password, TLS, and optional snapshots
+and an append-only log on disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
 Named after the metal of tantalum capacitors, known for packing the most into
@@ -25,6 +25,7 @@ cargo run --release -- --maxmemory 2gb --maxmemory-policy allkeys-lru
 TANTALUM_REQUIREPASS=s3cret cargo run --release -- --bind 0.0.0.0   # or --requirepass
 cargo run --release -- --maxclients 2000 --timeout 300 --tcp-keepalive 60
 cargo run --release -- --snapshot data/tantalum.snapshot   # keep data across restarts
+cargo run --release -- --aof data/aof   # log every write too: a crash loses about a second
 cargo run --release -- --tls-port 6380 --tls-cert-file cert.pem --tls-key-file key.pem
 redis-cli SET greeting hello EX 60
 redis-cli GET greeting
@@ -106,7 +107,8 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and subscriptions) reads as 0, `N` or `NULL` |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
-| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
+| `BGREWRITEAOF` | With `--aof`: rewrites the log on another thread (a new base of the data as it is, and a new, empty log after it). Without `--aof` it's an error, where Redis would write a log anyway |
+| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line |
 | `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE channel\|pattern [...]`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `SUNSUBSCRIBE [...]` | Messages are pushes in RESP3. Subscribed in RESP2, a client may only run these, `PING`, `QUIT` and `RESET`, as in Redis. Shard channels are a namespace of their own (one server is one shard) |
 | `PUBLISH channel message`, `SPUBLISH` | Replies how many got it; a client subscribed both by channel and by pattern gets it twice. One publishing to its own channel gets the reply, then the message, as from Redis 7.2 |
 | `PUBSUB CHANNELS [pattern]\|NUMSUB [channel ...]\|NUMPAT\|SHARDCHANNELS\|SHARDNUMSUB\|HELP` | |
@@ -457,6 +459,36 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   checked before anything loads: a damaged snapshot stops the server rather
   than being overwritten by an empty one. A crash loses what changed since
   the last save; a deploy (SIGTERM) loses nothing.
+- **Append-only log** (`src/aof.rs`, `--aof DIR`): like Redis 7's
+  multi-part AOF, for a crash to lose about a second instead of up to a
+  minute. A manifest names a base (a snapshot, in the format above) and the
+  logs after it, which hold the write commands in RESP as they were sent,
+  each after a `TANTALUM.TIME` line with the Unix millisecond it ran at.
+  With the log on, the store's clock reads Unix time, and at startup each
+  command runs again at its own time, so TTLs, `XADD`'s IDs and what had
+  expired by then come out as they first did. Only what chance decided is
+  logged as what happened: `SPOP` as the `SREM` of what it popped, an
+  eviction as a `DEL` (the replay itself ignores `maxmemory`). Transactions
+  and scripts are logged as the writes they made, between `MULTI` and
+  `EXEC`, and so is `MSET`, as a `SET` per pair, so each comes back whole or
+  not at all; a blocked command is logged when it's served. To keep the log
+  in the order things happened, write commands take turns: each takes its
+  time when its turn comes, runs, and appends to a buffer, which a thread
+  writes to the file every 10 ms and syncs every second (`--aof-fsync no`
+  leaves syncing to the system). Reads don't take turns. When the logs
+  since the base reach `--aof-rewrite-percentage` (100) of its size and
+  `--aof-rewrite-min-size` (64 MB), or on `BGREWRITEAOF`, a rewrite starts a
+  new log (in the manifest before anything goes in it), writes the data as
+  a new base, and only then drops the old files, so whenever the server
+  stops, the manifest names files that hold all the data. At startup, a
+  record or group the server stopped in the middle of writing at the end of
+  the last log is dropped (and cut off); damage anywhere else stops the
+  server, as a damaged snapshot does. If the disk can't take a write, what
+  wasn't written stays in memory, a record written in part is taken out
+  again, and until a write works, commands that write (and `PING`) get
+  Redis' `-MISCONF Errors writing to the AOF file: ...`. With `--snapshot`
+  too, snapshots are still saved, but a log, once there, is what loads; the
+  first start with `--aof` writes what the snapshot loaded as the base.
 - **Lock hygiene**: hashing and big-value allocations happen before locking.
   Values ≤ 16 KB are copied out under the lock; larger ones are shared by
   refcount and written with `writev` after unlocking. Freed big values are
@@ -798,6 +830,34 @@ one of a run's script calls stayed native (`INFO`:
 `native_script_fallbacks:0`). With all three scripts on Lua
 (`--native-scripts no`, an earlier run), processing cost 26.7 µs per job.
 
+### Append-only log (Agent37 VM, November 2026)
+
+What `--aof` (synced every second) costs, against Redis' AOF with
+`appendfsync everysec`: memtier over 1M keys of 32 B, SET only and 1:10
+SET:GET, each server alone on one core of the E-2388G VM above (the log's
+writer thread on that core too), memtier 3 × 80 clients on the other three.
+Medians of 3 rotated rounds, 2026-11-04 (`bench/docker/aof.sh`; raw output:
+`bench/agent37/results-aof.txt`):
+
+| One server core, ops/s | SET, P1 | SET, P16 | 1:10, P1 | 1:10, P16 |
+|---|---|---|---|---|
+| **Tantalum 0.19.0, io_uring, log on** | **287k** | **1.22M** | **339k** | **2.69M** |
+| Tantalum 0.19.0, io_uring, log off | 308k | 1.75M | 350k | 2.94M |
+| **Tantalum 0.19.0, epoll, log on** | **242k** | **1.10M** | **271k** | **2.35M** |
+| Tantalum 0.19.0, epoll, log off | 250k | 1.55M | 274k | 2.56M |
+| Redis 8.10.3, AOF on | 202k | 704k | 272k | 1.43M |
+| Redis 8.10.3, AOF off | 272k | 1.51M | 282k | 1.72M |
+
+The log costs Tantalum 3–7% of its SETs one at a time and 30% pipelined
+(Redis' AOF: 26% and 53%), and 1–8% of a 1:10 mix (Redis 4–17%), so with
+both logs on Tantalum on io_uring does 1.4–1.9× Redis' work per core. SET
+p99 at P16 with the log on: 6.8 ms on io_uring, Redis 18.9. A rewrite
+(`BGREWRITEAOF`) of those 1M keys took 0.07–0.10 s, and the longest a SET
+waited meanwhile was 32–34 ms (p99.9 0.12–0.17 ms); Redis' forked rewrite
+took 0.2–1.1 s, with SETs waiting at most 5–9 ms but p99.9 3.1 ms. With the
+log off, 0.19.0 matches 0.18.3 (`saturate.sh`, medians of 4 rounds: epoll P1
+−0.1%, P16 +1.0%; io_uring P1 −1.0%, P16 0.0%).
+
 ### Earlier results
 
 v0.0.2 Linux runs (`bench/railway/results-network.txt`, `results-loopback.txt`)
@@ -853,9 +913,17 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- An append-only log (snapshots only), replication,
-  ACL users, `COPY`, `RANDOMKEY`, `OBJECT`, `INCRBYFLOAT`,
+- Replication, ACL users, `COPY`, `RANDOMKEY`, `OBJECT`, `INCRBYFLOAT`,
   `DUMP`/`RESTORE`.
+- **Append-only log gaps**: no `appendfsync always`. A rewrite writes its
+  base while writes wait (reads go on), where Redis forks: about 30 ms per
+  million small keys. The files are Tantalum's own: Redis can't load them,
+  nor Tantalum Redis'. No `CONFIG SET appendonly`, and no `aof_rewrites`,
+  `aof_delayed_fsync` and the rest of Redis' AOF counters in `INFO`. With
+  the log on, writes take turns across threads, so they don't scale with
+  `--threads` (reads do), and pipelined SETs lose 30% (see Benchmarks):
+  `SET` skips its fast path, and the log's buffer is grown anew every 10
+  ms.
 - **Scripting gaps**: no `FUNCTION`/`FCALL` or Lua debugger (`SCRIPT DEBUG
   YES`). While a script runs, other clients wait, where Redis replies
   `-BUSY` after 5 s; `SCRIPT KILL` has to come from a connection on another

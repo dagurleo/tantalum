@@ -238,9 +238,18 @@ pub(crate) fn call_from_script(
     if read_only && (write || may_replicate) {
         return Err("Write commands are not allowed from read-only scripts.");
     }
+    // The log can't be written: the write fails as a command's error would.
+    if write && let Some(aof) = ctx.aof().filter(|aof| aof.failing()) {
+        resp::write_error(out, aof.failure().as_bytes());
+        return Ok(false);
+    }
     session.commands += 1;
+    let start = out.len();
     if let Reply::Bulk(value) = (command.run)(ctx, session, now, args, out) {
         resp::write_bulk(out, value.as_bytes());
+    }
+    if write {
+        crate::aof::record(command.name, args, &out[start..]);
     }
     Ok(write)
 }

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tantalum::aof;
 use tantalum::context::{Context, Settings};
 use tantalum::server;
 use tantalum::snapshot::{self, Snapshots};
@@ -51,14 +52,25 @@ Options:
   --snapshot-interval <SECS>
                     Save this often if anything changed; 0 saves only at
                     shutdown and on SAVE or BGSAVE [default: 60]
+  --aof <DIR>       Log every write to files in DIR, synced every second,
+                    and load from them at startup (a snapshot loaded only
+                    when DIR has no log yet) [default: none, no log]
+  --aof-fsync <everysec|no>
+                    Sync the log every second, or when the system does
+                    [default: everysec]
+  --aof-rewrite-percentage <N>
+  --aof-rewrite-min-size <SIZE>
+                    Rewrite the log once it's N% of its base and at least
+                    SIZE [defaults: 100, 64mb]
   --native-scripts <yes|no>
                     Run BullMQ's hottest scripts natively, with the same
                     results as their Lua [default: yes]
   -h, --help        Print this help
 
 On SIGTERM or SIGINT, Tantalum stops accepting, lets each connection finish
-the commands it has read, waits until they've closed (at most 10 s), saves a
-snapshot if --snapshot is set, and exits. A second signal exits at once.";
+the commands it has read, waits until they've closed (at most 10 s), syncs
+the log if --aof is set, saves a snapshot if --snapshot is set, and exits.
+A second signal exits at once.";
 
 /// How long a graceful shutdown waits for connections to close.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,6 +85,7 @@ struct Config {
     settings: Settings,
     snapshot: Option<PathBuf>,
     snapshot_interval: Option<Duration>,
+    aof: Option<aof::Options>,
     tls_port: Option<u16>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -156,9 +169,16 @@ fn parse_args() -> Result<Config, String> {
         },
         snapshot: None,
         snapshot_interval: Some(Duration::from_secs(60)),
+        aof: None,
         tls_port: None,
         tls_cert: None,
         tls_key: None,
+    };
+    let mut aof_options = aof::Options {
+        dir: PathBuf::new(),
+        fsync: aof::Fsync::EverySec,
+        rewrite_percentage: 100,
+        rewrite_min_size: 64 << 20,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -202,6 +222,20 @@ fn parse_args() -> Result<Config, String> {
             "--snapshot-interval" => {
                 config.snapshot_interval = parse_secs(&value).ok_or_else(|| bad(()))?;
             }
+            "--aof" => aof_options.dir = PathBuf::from(&value),
+            "--aof-fsync" => {
+                aof_options.fsync = match value.as_str() {
+                    "everysec" => aof::Fsync::EverySec,
+                    "no" => aof::Fsync::No,
+                    _ => return Err(bad(())),
+                }
+            }
+            "--aof-rewrite-percentage" => {
+                aof_options.rewrite_percentage = value.parse().map_err(|_| bad(()))?;
+            }
+            "--aof-rewrite-min-size" => {
+                aof_options.rewrite_min_size = parse_size(&value).ok_or_else(|| bad(()))? as u64;
+            }
             "--native-scripts" => {
                 config.settings.native_scripts = match value.as_str() {
                     "yes" => true,
@@ -211,6 +245,11 @@ fn parse_args() -> Result<Config, String> {
             }
             _ => return Err(format!("unknown option: {flag}")),
         }
+    }
+    if !aof_options.dir.as_os_str().is_empty() {
+        // The log's commands run again at the times they ran at.
+        config.store.unix_clock = true;
+        config.aof = Some(aof_options);
     }
     Ok(config)
 }
@@ -251,12 +290,25 @@ fn main() -> std::io::Result<()> {
     raise_open_file_limit(config.settings.maxclients);
     let store = Arc::new(store::Store::with_config(config.store.clone()));
     let mut ctx = Context::new(store.clone(), config.settings.clone());
+    let logged = config
+        .aof
+        .as_ref()
+        .is_some_and(|options| aof::exists(&options.dir));
     if let Some(path) = &config.snapshot {
-        load_snapshot(&store, path);
+        if logged {
+            eprintln!("loading from the append-only log, not {}", path.display());
+        } else {
+            load_snapshot(&store, path);
+        }
         let snapshots = Snapshots::new(store.clone(), path.clone(), config.snapshot_interval);
         snapshots.spawn_periodic()?;
         ctx = ctx.with_snapshots(snapshots);
     }
+    if let Some(options) = &config.aof {
+        start_aof(&ctx, options.clone());
+    }
+    // After the log's commands ran again: they may still use keys that have
+    // expired since.
     let _expirer = store::spawn_expirer(&store, Duration::from_millis(100));
     let ctx = Arc::new(ctx);
     server::handle_signals(ctx.clone())?;
@@ -396,6 +448,13 @@ fn main() -> std::io::Result<()> {
         0 => eprintln!("all connections closed"),
         open => eprintln!("{open} connections still open after {SHUTDOWN_TIMEOUT:?}"),
     }
+    if let Some(aof) = ctx.aof() {
+        aof.stop();
+        match aof.flush() {
+            Ok(()) => eprintln!("synced the append-only log"),
+            Err(e) => eprintln!("error: can't sync the append-only log: {e}"),
+        }
+    }
     if let Some(snapshots) = &ctx.snapshots
         && let Ok(keys) = snapshots.save()
     {
@@ -403,6 +462,46 @@ fn main() -> std::io::Result<()> {
     }
     eprintln!("exiting");
     Ok(())
+}
+
+/// Opens the append-only log: loads it (or starts one), then logs writes.
+/// A log that can't be read stops the server, as a damaged snapshot does.
+fn start_aof(ctx: &Context, options: aof::Options) {
+    let started = Instant::now();
+    let dir = options.dir.clone();
+    match aof::start(ctx, options) {
+        Ok((log, done)) => {
+            let mut line = if done.created {
+                format!("started an append-only log in {}", dir.display())
+            } else {
+                format!(
+                    "loaded {} keys and ran {} logged commands from {} in {} ms",
+                    done.base_keys.unwrap_or(0),
+                    done.commands,
+                    dir.display(),
+                    started.elapsed().as_millis()
+                )
+            };
+            if done.truncated > 0 {
+                line += &format!(
+                    "; dropped {} bytes the server stopped in the middle of writing",
+                    done.truncated
+                );
+            }
+            if done.failed > 0 {
+                line += &format!("; {} of them failed (see above)", done.failed);
+            }
+            eprintln!("{line}");
+            ctx.set_aof(log);
+        }
+        Err(e) => {
+            eprintln!(
+                "error: can't load the append-only log in {}: {e}. Move it away to start without it.",
+                dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Loads the snapshot at `path`, if there is one. A damaged one stops the
