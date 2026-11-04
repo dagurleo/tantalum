@@ -1837,7 +1837,7 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
         "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
          rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
          keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
-         pubsubshard_channels:{}\r\n\r\n\
+         pubsubshard_channels:{}\r\nnative_scripts:{}\r\nnative_script_fallbacks:{}\r\n\r\n\
          # Keyspace\r\n",
         server.total_connections,
         server.total_commands,
@@ -1849,6 +1849,8 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
         ctx.pubsub.channel_count(false),
         ctx.pubsub.pattern_count(),
         ctx.pubsub.channel_count(true),
+        ctx.scripting_stats().0,
+        ctx.scripting_stats().1,
     );
     if stats.keys > 0 {
         let _ = write!(

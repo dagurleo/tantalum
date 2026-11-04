@@ -59,3 +59,26 @@ round 3 tantalum-uring   add   35089 jobs/s   16.8 us/job | process   22859 jobs
 # run2 round 3 redis            add   35629 jobs/s   15.3 us/job | process   27008 jobs/s   35.9 us/job, server 0.97 cores
 # run2 round 3 tantalum         add   38977 jobs/s   13.0 us/job | process   30873 jobs/s   31.4 us/job, server 0.97 cores
 # run2 round 3 tantalum-b       add   36539 jobs/s   15.1 us/job | process   28448 jobs/s   34.4 us/job, server 0.98 cores
+
+# Native moveToActive and moveToFinished (src/bullmq.rs), same VM, 2026-11-04. tantalum-lua is the same build
+# with --native-scripts no. 100,000 jobs, medians of 3 rounds:
+#                         add jobs/s  us/job   process jobs/s  us/job
+#   tantalum (epoll)          40,506    12.9           65,061    13.7   (server 0.89 cores: clients now limit)
+#   tantalum-lua (epoll)      41,351    12.6           36,193    26.7
+#   tantalum (io_uring)       38,858    14.0           55,025    16.2
+#   redis                     38,056    14.5           31,009    31.5
+# A separate 20,000-job run: native_scripts 20101, native_script_fallbacks 0 (INFO).
+# native # 7.0.0-38-generic, 4 CPUs, Intel(R) Xeon(R) E-2388G CPU @ 3.20GHz
+# native # BullMQ 6.5.4, node v20.19.2; 100000 jobs, 3 workers x 100; server on CPU 0, clients on 1-3
+# native round 1 tantalum         add   40347 jobs/s   13.0 us/job | process   66153 jobs/s   13.5 us/job, server 0.89 cores
+# native round 1 tantalum-lua     add   42003 jobs/s   12.1 us/job | process   36990 jobs/s   26.2 us/job, server 0.97 cores
+# native round 1 tantalum-uring   add   38858 jobs/s   14.0 us/job | process   54773 jobs/s   16.2 us/job, server 0.89 cores
+# native round 1 redis            add   38056 jobs/s   14.5 us/job | process   31245 jobs/s   31.4 us/job, server 0.98 cores
+# native round 2 tantalum-lua     add   40917 jobs/s   12.6 us/job | process   36077 jobs/s   26.8 us/job, server 0.97 cores
+# native round 2 tantalum-uring   add   37647 jobs/s   14.5 us/job | process   55025 jobs/s   16.4 us/job, server 0.90 cores
+# native round 2 redis            add   37724 jobs/s   14.9 us/job | process   30775 jobs/s   31.5 us/job, server 0.97 cores
+# native round 2 tantalum         add   40506 jobs/s   12.9 us/job | process   65061 jobs/s   13.7 us/job, server 0.89 cores
+# native round 3 tantalum-uring   add   39030 jobs/s   14.0 us/job | process   56190 jobs/s   16.0 us/job, server 0.90 cores
+# native round 3 redis            add   38380 jobs/s   14.4 us/job | process   31009 jobs/s   31.5 us/job, server 0.98 cores
+# native round 3 tantalum         add   41849 jobs/s   12.2 us/job | process   64593 jobs/s   13.7 us/job, server 0.88 cores
+# native round 3 tantalum-lua     add   41351 jobs/s   12.6 us/job | process   36193 jobs/s   26.7 us/job, server 0.97 cores

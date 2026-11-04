@@ -29,6 +29,8 @@ pub struct Settings {
     /// Probe connections idle this long, to find clients that vanished
     /// without closing them. `None` turns probes off.
     pub tcp_keepalive: Option<Duration>,
+    /// Whether BullMQ's hottest scripts run natively (`src/bullmq.rs`).
+    pub native_scripts: bool,
     /// Tests only: an otherwise unknown command that panics, to check that a
     /// panic closes just its own connection.
     #[doc(hidden)]
@@ -43,6 +45,7 @@ impl Default for Settings {
             maxclients: 10_000,
             timeout: None,
             tcp_keepalive: Some(Duration::from_secs(300)),
+            native_scripts: true,
             panic_command: None,
         }
     }
@@ -231,6 +234,12 @@ impl Context {
             );
         }
         out
+    }
+
+    /// BullMQ scripts run natively, and calls sent back to Lua
+    /// (`src/bullmq.rs`), for `INFO`.
+    pub fn scripting_stats(&self) -> (u64, u64) {
+        self.scripting.native_stats()
     }
 
     /// Connections open right now.

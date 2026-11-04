@@ -211,7 +211,7 @@ pub(super) fn xadd(
         .step_by(2)
         .map(|i| (args.get(i), args.get(i + 1)))
         .collect();
-    let now_ms = unix_ms();
+    let now_ms = ctx.store.unix_ms(now);
     let add = |stream: &mut BigStream| -> Result<StreamId, AddError> {
         let id = stream.next_id(parsed.id, now_ms)?;
         stream.add(id, &pairs);
