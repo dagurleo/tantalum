@@ -28,8 +28,13 @@ enum M {
     Nil,
     Bool(bool),
     Int(i64),
+    Float(f64),
     Str(String),
+    /// Raw bytes, as a msgpack string (not UTF-8 necessarily).
+    Bytes(Vec<u8>),
     Map(Vec<(&'static str, M)>),
+    /// A map with keys of any kind.
+    Obj(Vec<(M, M)>),
     Arr(Vec<M>),
 }
 
@@ -52,25 +57,47 @@ impl M {
                 out.push(0xd3);
                 out.extend_from_slice(&n.to_be_bytes());
             }
-            M::Str(s) => {
+            M::Float(f) => {
+                out.push(0xcb);
+                out.extend_from_slice(&f.to_bits().to_be_bytes());
+            }
+            M::Str(s) => M::Bytes(s.as_bytes().to_vec()).pack(out),
+            M::Bytes(s) => {
                 let len = s.len();
                 if len < 32 {
                     out.push(0xa0 | len as u8);
-                } else {
+                } else if len < 256 {
                     out.push(0xd9);
                     out.push(len as u8);
+                } else {
+                    out.push(0xda);
+                    out.extend_from_slice(&(len as u16).to_be_bytes());
                 }
-                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(s);
             }
             M::Map(entries) => {
-                out.push(0x80 | entries.len() as u8);
+                let entries = entries.iter().map(|(k, v)| (s(k), v.clone())).collect();
+                M::Obj(entries).pack(out);
+            }
+            M::Obj(entries) => {
+                if entries.len() < 16 {
+                    out.push(0x80 | entries.len() as u8);
+                } else {
+                    out.push(0xde);
+                    out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+                }
                 for (k, v) in entries {
-                    M::Str(k.to_string()).pack(out);
+                    k.pack(out);
                     v.pack(out);
                 }
             }
             M::Arr(items) => {
-                out.push(0x90 | items.len() as u8);
+                if items.len() < 16 {
+                    out.push(0x90 | items.len() as u8);
+                } else {
+                    out.push(0xdc);
+                    out.extend_from_slice(&(items.len() as u16).to_be_bytes());
+                }
                 items.iter().for_each(|i| i.pack(out));
             }
         }
@@ -100,6 +127,122 @@ impl Rng {
     fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
     }
+}
+
+/// Option names BullMQ uses, and some short ones, so keys collide in Lua's
+/// tables.
+const OPTION_NAMES: &[&str] = &[
+    "attempts",
+    "delay",
+    "priority",
+    "lifo",
+    "removeOnComplete",
+    "removeOnFail",
+    "jobId",
+    "backoff",
+    "repeat",
+    "timestamp",
+    "stackTraceLimit",
+    "keepLogs",
+    "sizeLimit",
+    "fpof",
+    "cpof",
+    "idof",
+    "rdof",
+    "tm",
+    "omc",
+    "kl",
+    "rjk",
+    "telemetry",
+    "prevMillis",
+    "type",
+    "count",
+    "age",
+    "a",
+    "b",
+    "c",
+    "ab",
+    "ba",
+    "x1",
+    "1x",
+];
+
+fn random_string(rng: &mut Rng, max: u64) -> Vec<u8> {
+    // Letters, and what cjson escapes, and UTF-8.
+    const BYTES: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCXYZ0123456789 _-:.\"/\\\n\t\x01\x7f";
+    let mut out = Vec::new();
+    for _ in 0..rng.below(max + 1) {
+        if rng.chance(5) {
+            out.extend_from_slice("é".as_bytes());
+        } else {
+            out.push(BYTES[rng.below(BYTES.len() as u64) as usize]);
+        }
+    }
+    out
+}
+
+fn random_key(rng: &mut Rng) -> Vec<u8> {
+    if rng.chance(60) {
+        OPTION_NAMES[rng.below(OPTION_NAMES.len() as u64) as usize]
+            .as_bytes()
+            .to_vec()
+    } else {
+        random_string(rng, 10)
+    }
+}
+
+fn random_value(rng: &mut Rng, depth: u32) -> M {
+    match rng.below(if depth > 2 { 8 } else { 10 }) {
+        0 => M::Nil,
+        1 => M::Bool(rng.chance(50)),
+        2 => M::Int(rng.below(100) as i64),
+        3 => M::Int(match rng.below(4) {
+            0 => -(rng.below(1000) as i64),
+            1 => rng.below(1 << 40) as i64,
+            2 => 1_780_000_000_000 + rng.below(1000) as i64,
+            _ => 1 << 53,
+        }),
+        4 => M::Float(match rng.below(7) {
+            0 => rng.below(1000) as f64 / 8.0,
+            1 => 0.1 * rng.below(100) as f64,
+            2 => 1e15 * (1 + rng.below(9)) as f64,
+            3 => -(rng.below(100) as f64) / 3.0,
+            4 => 1e-7 * rng.below(100) as f64,
+            5 => 123_456_789.123_456_79,
+            _ if rng.chance(10) => f64::NAN,
+            _ => -0.0,
+        }),
+        5..=7 => M::Bytes(random_string(rng, 12)),
+        8 => random_object(rng, depth + 1, 6),
+        _ => M::Arr(
+            (0..rng.below(6))
+                .map(|_| {
+                    if rng.chance(20) {
+                        M::Nil
+                    } else {
+                        random_value(rng, depth + 1)
+                    }
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// A map of up to `max` entries: names that collide, repeated keys, nil
+/// values, now and then a number for a key.
+fn random_object(rng: &mut Rng, depth: u32, max: u64) -> M {
+    let mut entries: Vec<(M, M)> = Vec::new();
+    for _ in 0..rng.below(max + 1) {
+        let key = if !entries.is_empty() && rng.chance(8) {
+            entries[rng.below(entries.len() as u64) as usize].0.clone()
+        } else if rng.chance(2) {
+            M::Int(rng.below(5) as i64)
+        } else {
+            M::Bytes(random_key(rng))
+        };
+        entries.push((key, random_value(rng, depth)));
+    }
+    M::Obj(entries)
 }
 
 /// Two stores, one running BullMQ's scripts natively.
@@ -255,29 +398,76 @@ struct Workload {
 
 impl Workload {
     fn add_job(&mut self, twin: &mut Twin) {
-        let custom = if self.rng.chance(10) {
-            format!("custom{}", self.rng.below(20))
+        // Custom ids, some repeated; untypically, ones whose keys are the
+        // queue's own.
+        let custom = match self.rng.below(20) {
+            0 | 1 => format!("custom{}", self.rng.below(20)),
+            2 if !self.typical => [
+                "meta", "wait", "id", "events", "active", "marker", "7", "a/b\"c",
+            ][self.rng.below(8) as usize]
+                .to_string(),
+            _ => String::new(),
+        };
+        let untypical = |rng: &mut Rng, percent: u64, value: M| {
+            if !self.typical && rng.chance(percent) {
+                value
+            } else {
+                M::Nil
+            }
+        };
+        let name = if !self.typical && self.rng.chance(5) {
+            M::Int(42)
         } else {
-            String::new()
+            s("job")
+        };
+        let parent = untypical(&mut self.rng, 3, s("bull:parent:1"));
+        let dependencies = untypical(&mut self.rng, 5, s("bull:parent:1:dependencies"));
+        let repeat_key = if self.rng.chance(5) {
+            s("repeat:abc")
+        } else {
+            M::Nil
         };
         let args = M::Arr(vec![
             s(Q),
             s(&custom),
-            s("job"),
+            name,
             M::Int(twin.now as i64),
+            parent,
+            dependencies,
             M::Nil,
-            M::Nil,
-            M::Nil,
-            M::Nil,
+            repeat_key,
             M::Nil,
             M::Nil,
         ])
         .bytes();
-        let mut opts = vec![("attempts", M::Int(1 + self.rng.below(3) as i64))];
-        if self.rng.chance(20) {
-            opts.push(("lifo", M::Bool(true)));
+        let opts = if self.typical || self.rng.chance(50) {
+            // As BullMQ's Queue.add sends them.
+            let mut opts = vec![("attempts", M::Int(1 + self.rng.below(3) as i64))];
+            if self.rng.chance(20) {
+                opts.push(("lifo", M::Bool(true)));
+            }
+            if self.rng.chance(30) {
+                opts.push((
+                    "backoff",
+                    M::Map(vec![("type", s("exponential")), ("delay", M::Int(1000))]),
+                ));
+            }
+            match self.rng.below(3) {
+                0 => opts.push(("removeOnComplete", M::Bool(true))),
+                1 => opts.push(("removeOnComplete", M::Map(vec![("count", M::Int(100))]))),
+                _ => {}
+            }
+            if self.rng.chance(20) {
+                opts.push(("delay", M::Int(0)));
+            }
+            if !self.typical && self.rng.chance(5) {
+                opts.push(("de", M::Map(vec![("id", s("dedup"))])));
+            }
+            M::Map(opts)
+        } else {
+            random_object(&mut self.rng, 0, 12)
         }
-        let opts = M::Map(opts).bytes();
+        .bytes();
         let keys: Vec<Vec<u8>> = [
             "wait",
             "paused",
@@ -590,6 +780,127 @@ fn workload(seed: u64, steps: usize, disturb_percent: u64, typical: bool) -> (u6
     }
     twin.compare();
     twin.native_runs()
+}
+
+/// Whether the native add leaves options to Lua: keys that aren't strings,
+/// numbers cjson won't write, deduplication, a delay or priority that isn't
+/// a string or number (the last value a key was given counts, as in Lua).
+fn options_for_lua(opts: &M) -> bool {
+    fn unencodable(m: &M) -> bool {
+        match m {
+            M::Float(f) => !f.is_finite(),
+            // Any key's type counts, but only the values keys end up with:
+            // cjson never sees one a later entry overwrote.
+            M::Obj(entries) => {
+                entries.iter().any(|(k, _)| !matches!(k, M::Bytes(_)))
+                    || entries.iter().enumerate().any(|(i, (k, v))| {
+                        let overwritten = entries[i + 1..].iter().any(
+                            |(later, _)| matches!((k, later), (M::Bytes(a), M::Bytes(b)) if a == b),
+                        );
+                        !overwritten && unencodable(v)
+                    })
+            }
+            M::Map(entries) => entries.iter().any(|(_, v)| unencodable(v)),
+            M::Arr(items) => items.iter().any(unencodable),
+            _ => false,
+        }
+    }
+    let M::Obj(entries) = opts else {
+        return true;
+    };
+    let get = |name: &str| {
+        entries
+            .iter()
+            .rev()
+            .find(|(k, _)| matches!(k, M::Bytes(b) if b == name.as_bytes()))
+            .map_or(M::Nil, |(_, v)| v.clone())
+    };
+    let truthy = |m: &M| !matches!(m, M::Nil | M::Bool(false));
+    let argument = |m: &M| !truthy(m) || matches!(m, M::Int(_) | M::Float(_) | M::Bytes(_));
+    unencodable(opts)
+        || truthy(&get("de"))
+        || !argument(&get("delay"))
+        || !argument(&get("priority"))
+}
+
+fn describe(m: &M) -> String {
+    match m {
+        M::Nil => "nil".into(),
+        M::Bool(b) => b.to_string(),
+        M::Int(n) => n.to_string(),
+        M::Float(f) => format!("{f:?}"),
+        M::Str(s) => format!("{s:?}"),
+        M::Bytes(b) => format!("{:?}", String::from_utf8_lossy(b)),
+        M::Map(e) => format!(
+            "{{{}}}",
+            e.iter()
+                .map(|(k, v)| format!("{k:?}: {}", describe(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        M::Obj(e) => format!(
+            "{{{}}}",
+            e.iter()
+                .map(|(k, v)| format!("{}: {}", describe(k), describe(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        M::Arr(i) => format!(
+            "[{}]",
+            i.iter().map(describe).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Job options are stored as Lua's cjson writes them, whatever their keys
+/// (colliding, repeated, set to nil, tables growing), values and nesting.
+#[test]
+fn job_options_are_stored_as_lua_writes_them() {
+    let mut twin = Twin::new();
+    let mut rng = Rng(0x243F_6A88_85A3_08D3);
+    let add = sha("addStandardJob-9");
+    let keys: Vec<Vec<u8>> = [
+        "wait",
+        "paused",
+        "meta",
+        "id",
+        "completed",
+        "delayed",
+        "active",
+        "events",
+        "marker",
+    ]
+    .iter()
+    .map(|n| k(n))
+    .collect();
+    let args = M::Arr(vec![s(Q), s(""), s("job"), M::Int(twin.now as i64)]).bytes();
+    for step in 0..4000 {
+        let options = random_object(&mut rng, 0, 40);
+        let opts = options.bytes();
+        let mut call: Vec<&[u8]> = vec![b"EVALSHA", &add, b"9"];
+        call.extend(keys.iter().map(Vec::as_slice));
+        call.extend([&args[..], b"{}", &opts]);
+        let (native_before, _) = twin.native_runs();
+        let reply = twin.run(&call);
+        let (native_after, _) = twin.native_runs();
+        // Native exactly when it should be.
+        assert_eq!(
+            native_after - native_before,
+            u64::from(!options_for_lua(&options)),
+            "step {step}: {} for {}",
+            String::from_utf8_lossy(&reply),
+            describe(&options)
+        );
+        if let common::Value::Bulk(id) = common::parse(&reply) {
+            twin.run(&[b"HGET", &[Q.as_bytes(), &id].concat(), b"opts"]);
+        }
+        if step % 200 == 0 {
+            twin.compare();
+        }
+    }
+    twin.compare();
+    let (native, lua) = twin.native_runs();
+    assert!(native > 1500, "native runs: {native}, back to Lua: {lua}");
 }
 
 #[test]

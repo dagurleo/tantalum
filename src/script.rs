@@ -49,6 +49,8 @@ unsafe extern "C" {
     fn lua_isreadonlytable(l: *mut lua_State, index: c_int) -> c_int;
     /// Shortest round-trip digits of `fp`, as Redis formats numbers.
     fn fpconv_dtoa(fp: f64, dest: *mut c_char) -> c_int;
+    /// C's `%.<precision>g` into `dest` (32 bytes), as cjson writes numbers.
+    fn fpconv_g_fmt(dest: *mut c_char, num: f64, precision: c_int) -> c_int;
 }
 
 /// Reported by `redis.REDIS_VERSION` and `redis.REDIS_VERSION_NUM`.
@@ -1185,6 +1187,15 @@ pub(crate) fn format_number(n: f64) -> Vec<u8> {
     let mut digits = [0 as c_char; 24];
     // SAFETY: writes at most 24 bytes.
     let len = unsafe { fpconv_dtoa(n, digits.as_mut_ptr()) };
+    digits[..len as usize].iter().map(|&c| c as u8).collect()
+}
+
+/// A Lua number as Lua itself writes it (`tostring(n)`, `n .. ""`) and as
+/// `cjson.encode` does: C's `%.14g`.
+pub(crate) fn lua_tostring(n: f64) -> Vec<u8> {
+    let mut digits = [0 as c_char; 32];
+    // SAFETY: writes at most 32 bytes, its buffer's size.
+    let len = unsafe { fpconv_g_fmt(digits.as_mut_ptr(), n, 14) };
     digits[..len as usize].iter().map(|&c| c as u8).collect()
 }
 

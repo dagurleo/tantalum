@@ -1,8 +1,9 @@
-//! BullMQ's hottest scripts, natively: `moveToActive` (a worker takes a
-//! job) and `moveToFinished` (it completes or fails one, and takes the
-//! next), as BullMQ 6.5.4 sends them (the exact texts, by SHA-1, are in
-//! `tests/data/bullmq`; other versions run on Lua as before). A busy queue
-//! runs them for every job, and in Lua they cost most of the server's time.
+//! BullMQ's hottest scripts, natively: `addStandardJob` (a job is added),
+//! `moveToActive` (a worker takes one) and `moveToFinished` (it completes or
+//! fails one, and takes the next), as BullMQ 6.5.4 sends them (the exact
+//! texts, by SHA-1, are in `tests/data/bullmq`; other versions run on Lua as
+//! before). A busy queue runs them for every job, and in Lua they cost most
+//! of the server's time.
 //!
 //! Each runs the commands its script runs, in the same order, through the
 //! same command code as `redis.call`, so the store ends up exactly as the
@@ -13,12 +14,14 @@
 //! runs on the same state. A command that fails once writing has begun
 //! fails as it would in Lua, with the line of its `redis.call`.
 
+mod json;
+
 use std::ops::Range;
 
 use crate::cmd::{self, Args};
 use crate::context::{Context, Session};
 use crate::resp;
-use crate::script::format_number;
+use crate::script::{format_number, lua_tostring};
 use crate::store::Millis;
 
 /// What a native script did.
@@ -34,6 +37,7 @@ pub(crate) type Native = fn(&mut Call<'_>) -> Outcome;
 /// The native version of the script with SHA-1 `sha`, if there is one.
 pub(crate) fn find(sha: &[u8; 40]) -> Option<Native> {
     match sha {
+        b"8fb5163d74bbb5a726c1d3a7db4d7e4a37be3eb3" => Some(add_standard_job),
         b"d96ca626f1ea141b44a856b312fc636d99aa9ea9" => Some(move_to_active),
         b"69666e69dd5621df59067a03de685e55a486560d" => Some(move_to_finished),
         _ => None,
@@ -237,11 +241,12 @@ enum Msg {
 }
 
 impl Msg {
-    /// Decodes one value; `None` for anything this doesn't read (Lua does:
-    /// such calls go back to it).
+    /// Decodes one value, all of `bytes`; `None` for anything this doesn't
+    /// read (Lua does: such calls go back to it).
     fn decode(bytes: &[u8]) -> Option<Msg> {
         let mut input = bytes;
-        Msg::read(&mut input, 0)
+        let value = Msg::read(&mut input, 0)?;
+        input.is_empty().then_some(value)
     }
 
     fn read(input: &mut &[u8], depth: usize) -> Option<Msg> {
@@ -352,6 +357,11 @@ impl Msg {
             _ => None,
         }
     }
+}
+
+/// Lua's truth: everything but nil and false.
+fn truthy(value: &Msg) -> bool {
+    !matches!(value, Msg::Nil | Msg::Bool(false))
 }
 
 /// `tonumber(s)` for the decimal integers BullMQ passes (timestamps):
@@ -658,6 +668,281 @@ fn prepare(
     resp::write_bulk(call.out, id);
     call.out.extend_from_slice(b":0\r\n:0\r\n");
     true
+}
+
+/// What `addStandardJob` takes from its arguments, read before anything is
+/// written; `None` for what's Lua's (a parent, deduplication, arguments of
+/// unusual types, options cjson or this can't encode).
+struct NewJob {
+    prefix: Vec<u8>,
+    /// A custom id; `None` for the queue's next.
+    id: Option<Vec<u8>>,
+    name: Vec<u8>,
+    timestamp: Vec<u8>,
+    parent_dependencies: Option<Vec<u8>>,
+    repeat_key: Option<Vec<u8>>,
+    /// The options as the job stores them: `cjson.encode(opts)`.
+    opts: Vec<u8>,
+    delay: Vec<u8>,
+    priority: Vec<u8>,
+    lifo: bool,
+}
+
+impl NewJob {
+    /// `args` is ARGV[1] unpacked, `opts` ARGV[3].
+    fn read(args: &[Msg], opts: &Msg) -> Option<NewJob> {
+        const NIL: Msg = Msg::Nil;
+        let arg = |i: usize| args.get(i - 1).unwrap_or(&NIL);
+        let Msg::Str(prefix) = arg(1) else {
+            return None;
+        };
+        let id = match arg(2) {
+            Msg::Str(id) if id.is_empty() => None,
+            Msg::Str(id) => Some(id.clone()),
+            _ => return None,
+        };
+        // A parent (its key is args[5]): Lua's.
+        if *arg(5) != Msg::Nil || !matches!(opts, Msg::Map(_)) {
+            return None;
+        }
+        let parent_dependencies = match arg(6) {
+            Msg::Nil => None,
+            Msg::Str(key) => Some(key.clone()),
+            _ => return None,
+        };
+        let repeat_key = match arg(8) {
+            m if !truthy(m) => None,
+            m => Some(m.arg()?),
+        };
+        // Deduplication and debouncing: Lua's.
+        if truthy(opts.get("de")) {
+            return None;
+        }
+        // `opts['delay'] or 0`, as a `redis.call` argument.
+        let or_zero = |m: &Msg| {
+            if truthy(m) {
+                m.arg()
+            } else {
+                Some(b"0".to_vec())
+            }
+        };
+        Some(NewJob {
+            prefix: prefix.clone(),
+            id,
+            name: arg(3).arg()?,
+            timestamp: arg(4).arg()?,
+            parent_dependencies,
+            repeat_key,
+            opts: json::encode(opts)?,
+            delay: or_zero(opts.get("delay"))?,
+            priority: or_zero(opts.get("priority"))?,
+            lifo: truthy(opts.get("lifo")),
+        })
+    }
+}
+
+/// Lines of `addStandardJob-9`'s `redis.call`s.
+mod add_lines {
+    pub(super) const INCR: u32 = 541;
+    pub(super) const HGET_MAX_EVENTS: u32 = 313;
+    pub(super) const HSET_MAX_EVENTS: u32 = 316;
+    pub(super) const HGET_PARENT: u32 = 488;
+    pub(super) const EXISTS_PARENT: u32 = 490;
+    pub(super) const XADD_DUPLICATED: u32 = 503;
+    pub(super) const HMSET_JOB: u32 = 531;
+    pub(super) const XADD_ADDED: u32 = 534;
+    pub(super) const PUSH: u32 = 72;
+    pub(super) const ZADD_MARKER: u32 = 68;
+    pub(super) const XADD_WAITING: u32 = 571;
+    pub(super) const SADD_DEPENDENCY: u32 = 575;
+}
+
+/// `addStandardJob-9` (a job neither delayed nor prioritized), for jobs
+/// without a parent or deduplication.
+fn add_standard_job(call: &mut Call<'_>) -> Outcome {
+    use add_lines as line;
+    if call.keys.len() != 9 || call.argv.len() < 3 {
+        return Outcome::Lua;
+    }
+    let (Some(args), Some(data), Some(opts)) = (call.arg(1), call.arg(2), call.arg(3)) else {
+        return Outcome::Lua;
+    };
+    let (Some(Msg::Array(args)), Some(opts)) = (Msg::decode(args), Msg::decode(opts)) else {
+        return Outcome::Lua;
+    };
+    let Some(job) = NewJob::read(&args, &opts) else {
+        return Outcome::Lua;
+    };
+    let (wait, meta, counter) = (call.key(1), call.key(3), call.key(4));
+    let (active, events, marker) = (call.key(7), call.key(8), call.key(9));
+    // The reads below are made before writing, where the script makes them
+    // after: keys that alias each other, or the job's, could change what
+    // they see by then (Lua's). A generated id is digits, as Lua writes
+    // numbers, after the prefix.
+    let used = [wait, meta, counter, active, events, marker];
+    if (1..used.len()).any(|i| used[..i].contains(&used[i])) {
+        return Outcome::Lua;
+    }
+    let aliased = match &job.id {
+        Some(id) => used.contains(&&[&job.prefix[..], id].concat()[..]),
+        None => used.iter().any(|key| {
+            key.strip_prefix(&job.prefix[..]).is_some_and(|rest| {
+                !rest.is_empty() && rest.iter().all(|c| b"0123456789e+-.".contains(c))
+            })
+        }),
+    };
+    if aliased {
+        return Outcome::Lua;
+    }
+    // Whether a job with the custom id exists already, and whether the
+    // queue is paused or at its concurrency (`isQueuePausedOrMaxed`).
+    let exists = match &job.id {
+        Some(id) => match call.call(&[b"EXISTS", &[&job.prefix[..], id].concat()]) {
+            Ok(Value::Int(n)) => n == 1,
+            _ => return Outcome::Lua,
+        },
+        None => false,
+    };
+    let paused_or_maxed = if exists {
+        false
+    } else {
+        let Ok(Value::Array(attributes)) = call.call(&[b"HMGET", meta, b"paused", b"concurrency"])
+        else {
+            return Outcome::Lua;
+        };
+        match (attributes.first(), attributes.get(1)) {
+            (Some(Value::Bulk(_)), _) => true,
+            (Some(Value::Nil), Some(Value::Nil)) => false,
+            (Some(Value::Nil), Some(Value::Bulk(limit))) => {
+                // `tonumber` of anything but plain digits: Lua's.
+                let Some(limit) = plain_number(limit) else {
+                    return Outcome::Lua;
+                };
+                let Ok(Value::Int(active)) = call.call(&[b"LLEN", active]) else {
+                    return Outcome::Lua;
+                };
+                active as f64 >= limit
+            }
+            _ => return Outcome::Lua,
+        }
+    };
+
+    // Writing, in the script's order.
+    let count = match call.write(line::INCR, &[b"INCR", counter]) {
+        Some(Value::Int(n)) => n,
+        _ => return Outcome::Done,
+    };
+    // `getOrSetMaxEvents`.
+    let max_events = match call.write(
+        line::HGET_MAX_EVENTS,
+        &[b"HGET", meta, b"opts.maxLenEvents"],
+    ) {
+        Some(Value::Bulk(n)) => n,
+        Some(_) => {
+            let set = [&b"HSET"[..], meta, b"opts.maxLenEvents", b"10000"];
+            if call.write(line::HSET_MAX_EVENTS, &set).is_none() {
+                return Outcome::Done;
+            }
+            b"10000".to_vec()
+        }
+        None => return Outcome::Done,
+    };
+    // `jobCounter .. ""`: the count as Lua writes a number.
+    let id = job.id.clone().unwrap_or_else(|| lua_tostring(count as f64));
+    let key = [&job.prefix[..], &id].concat();
+    if exists {
+        // `handleDuplicatedJob`, without a parent: an event, and its id.
+        let parent = match call.write(line::HGET_PARENT, &[b"HGET", &key, b"parentKey"]) {
+            Some(parent) => parent,
+            None => return Outcome::Done,
+        };
+        if let Value::Bulk(parent) = parent
+            && call
+                .write(line::EXISTS_PARENT, &[b"EXISTS", &parent])
+                .is_none()
+        {
+            return Outcome::Done;
+        }
+        let event: [&[u8]; 10] = [
+            b"XADD",
+            events,
+            b"MAXLEN",
+            b"~",
+            &max_events,
+            b"*",
+            b"event",
+            b"duplicated",
+            b"jobId",
+            &id,
+        ];
+        if call.write(line::XADD_DUPLICATED, &event).is_some() {
+            resp::write_bulk(call.out, &id);
+        }
+        return Outcome::Done;
+    }
+    // `storeJob`.
+    let mut fields: Vec<&[u8]> = vec![
+        b"HMSET",
+        &key,
+        b"name",
+        &job.name,
+        b"data",
+        data,
+        b"opts",
+        &job.opts,
+        b"timestamp",
+        &job.timestamp,
+        b"delay",
+        &job.delay,
+        b"priority",
+        &job.priority,
+    ];
+    if let Some(repeat_key) = &job.repeat_key {
+        fields.extend([&b"rjk"[..], repeat_key]);
+    }
+    if call.write(line::HMSET_JOB, &fields).is_none() {
+        return Outcome::Done;
+    }
+    let added: [&[u8]; 9] = [
+        b"XADD", events, b"*", b"event", b"added", b"jobId", &id, b"name", &job.name,
+    ];
+    if call.write(line::XADD_ADDED, &added).is_none() {
+        return Outcome::Done;
+    }
+    // `addJobInTargetList`, LIFO or FIFO.
+    let push: &[u8] = if job.lifo { b"RPUSH" } else { b"LPUSH" };
+    if call.write(line::PUSH, &[push, wait, &id]).is_none()
+        || (!paused_or_maxed
+            && call
+                .write(line::ZADD_MARKER, &[b"ZADD", marker, b"0", b"0"])
+                .is_none())
+    {
+        return Outcome::Done;
+    }
+    let waiting: [&[u8]; 10] = [
+        b"XADD",
+        events,
+        b"MAXLEN",
+        b"~",
+        &max_events,
+        b"*",
+        b"event",
+        b"waiting",
+        b"jobId",
+        &id,
+    ];
+    if call.write(line::XADD_WAITING, &waiting).is_none() {
+        return Outcome::Done;
+    }
+    if let Some(dependencies) = &job.parent_dependencies
+        && call
+            .write(line::SADD_DEPENDENCY, &[b"SADD", dependencies, &key])
+            .is_none()
+    {
+        return Outcome::Done;
+    }
+    resp::write_bulk(call.out, &id);
+    Outcome::Done
 }
 
 /// `moveToActive-11`.
@@ -1027,6 +1312,53 @@ mod tests {
             check(text, l.zadd_marker, "rcall(\"ZADD\", markerKey, 0, \"0\")");
             check(text, l.hgetall, "rcall(\"HGETALL\", jobKey)");
         }
+        let add = read("addStandardJob-9");
+        for (line, call) in [
+            (add_lines::INCR, "rcall(\"INCR\", KEYS[4])"),
+            (
+                add_lines::HGET_MAX_EVENTS,
+                "rcall(\"HGET\", metaKey, \"opts.maxLenEvents\")",
+            ),
+            (
+                add_lines::HSET_MAX_EVENTS,
+                "rcall(\"HSET\", metaKey, \"opts.maxLenEvents\", maxEvents)",
+            ),
+            (
+                add_lines::HGET_PARENT,
+                "rcall(\"HGET\", jobKey, \"parentKey\")",
+            ),
+            (
+                add_lines::EXISTS_PARENT,
+                "rcall(\"EXISTS\", existedParentKey) == 0",
+            ),
+            (
+                add_lines::XADD_DUPLICATED,
+                "rcall(\"XADD\", eventsKey, \"MAXLEN\"",
+            ),
+            (
+                add_lines::HMSET_JOB,
+                "rcall(\"HMSET\", jobIdKey, \"name\", name",
+            ),
+            (add_lines::XADD_ADDED, "\"event\", \"added\""),
+            (add_lines::PUSH, "rcall(pushCmd, targetKey, jobId)"),
+            (
+                add_lines::ZADD_MARKER,
+                "rcall(\"ZADD\", markerKey, 0, \"0\")",
+            ),
+            (add_lines::XADD_WAITING, "\"event\", \"waiting\","),
+            (
+                add_lines::SADD_DEPENDENCY,
+                "rcall(\"SADD\", parentDependenciesKey, jobIdKey)",
+            ),
+        ] {
+            check(&add, line, call);
+        }
+        assert!(
+            add.lines()
+                .nth(add_lines::XADD_DUPLICATED as usize)
+                .unwrap()
+                .contains("\"duplicated\"")
+        );
         for (line, call) in [
             (679, "rcall(\"DEL\", lockKey)"),
             (680, "rcall(\"SREM\", stalledKey, jobId)"),
@@ -1065,7 +1397,7 @@ mod tests {
         for (name, native) in [
             ("moveToActive-11", true),
             ("moveToFinished-14", true),
-            ("addStandardJob-9", false),
+            ("addStandardJob-9", true),
         ] {
             let path = format!(
                 "{}/tests/data/bullmq/{name}.lua",
