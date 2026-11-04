@@ -836,6 +836,21 @@ pub async fn handle_connection(
     }
 }
 
+/// Lets the thread's other ready connections run first: woken at once, this
+/// task goes to the back of the runtime's queue (and comes straight back if
+/// it's alone), without waiting on the reactor as `yield_now` does.
+async fn yield_to_others() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if std::mem::replace(&mut yielded, true) {
+            return Poll::Ready(());
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
 /// Writes `buf` and flushes: rustls may hold encrypted bytes until then (for
 /// plain TCP, flushing does nothing).
 async fn send(socket: &mut impl Stream, buf: &[u8]) -> io::Result<()> {
@@ -857,6 +872,15 @@ async fn serve_stream(
     let mut rbuf: Vec<u8> = Vec::new();
     let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
+    // On a thread of its own (`--io per-thread`), a connection that ran one
+    // command sends its reply after the thread's other ready connections have
+    // read and run theirs, much as Redis sends replies just before it waits
+    // for more. Sent together, they wake each client fewer times: one wakeup
+    // per reply cost the kernel more than reading and running the request.
+    // A pipelined batch already sends many replies per wakeup, and deferring
+    // it measured slower at 4-8 threads.
+    let defer_replies = tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::CurrentThread;
 
     loop {
         fn wait_for_data<S: Stream>(_: &S) -> bool {
@@ -909,6 +933,7 @@ async fn serve_stream(
         // One clock read per batch, like Redis' cached time per event loop tick.
         let mut now = store.now();
         let mut pos = 0;
+        let mut ran = 0;
         let mut close = false;
         // Whether a command blocked, during which more may have been read.
         let mut blocked_meanwhile = false;
@@ -918,6 +943,7 @@ async fn serve_stream(
                 batch.prefetch(i, store);
                 let args = batch.command(i, &rbuf);
                 if !args.is_empty() {
+                    ran += 1;
                     match run(ctx, &mut session, now, &args, &mut wbuf) {
                         Some(Reply::Written) => {}
                         Some(Reply::Close) | None => close = true,
@@ -977,6 +1003,9 @@ async fn serve_stream(
         }
         ctx.publish(&mut session);
         rbuf.drain(..pos);
+        if defer_replies && ran == 1 && !wbuf.is_empty() {
+            yield_to_others().await;
+        }
         // Messages that came meanwhile go with the replies.
         let subscriber = session.subscriber().cloned();
         if let Some(subscriber) = &subscriber

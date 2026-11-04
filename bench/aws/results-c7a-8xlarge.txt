@@ -547,3 +547,246 @@ round 2 garnet           P1   ops   610927 p50 0.391 p99 0.655 cpu 7.74 ops/core
 round 2 garnet           P16  ops  6454693 p50 0.583 p99 0.991 cpu 7.76 ops/core   832191
 round 2 tantalum-uring   P1   ops   960683 p50 0.247 p99 0.367 cpu 7.81 ops/core   122977
 round 2 tantalum-uring   P16  ops 10386641 p50 0.359 p99 0.559 cpu 7.77 ops/core  1337030
+
+# Reply batching on epoll (0.16.1): a per-thread connection that ran one command yields to the thread's
+# other ready connections before sending its reply. Same box, 2026-11-04, saturate.sh, paired rounds,
+# against 0.16.0 (tantalum-b). First version deferred every reply; with Valkey, Dragonfly and memcached in
+# the same rounds (4 rounds at 1 thread, 3 at 2 and 4), ops/s medians:
+#   1 thread  P1: new 99.4k, old 93.4k (+6.4%, every new round above every old), valkey 96.6k,
+#                 dragonfly 96.7k, memcached 93.9k;  P16: +2.9%, new 1.14M, valkey 0.99M
+#   2 threads P1: new 195.3k, old 185.9k (+5.1%), memcached 185.0k, dragonfly 111.1k, valkey 105.9k;
+#                 P16: +1.3%
+#   4 threads: host drift (every server ~10% slower from round 2's middle on) muddied it; rerun alone,
+#              6 rounds: P1 +0.5% (every round), P16 -0.7% (every round)
+#   8 threads, 6 rounds alone: P1 +0.2%, P16 -2.0% median / -1.9% best, p99 0.539 -> 0.655 ms
+# Pipelined batches already carry many replies per wakeup, so the final version defers only a batch of one
+# command. Final version against 0.16.0, 4 rounds alone at each thread count, median / best, paired rounds:
+#   1 thread:  P1 +6.6% / +7.2% (+6.0..+7.5%), P16 +0.4% / +0.1%;  p99 P1 2.799 -> 2.679 ms
+#   2 threads: P1 +4.9% / +5.4% (+4.8..+5.4%), P16 +0.2% / +0.1%;  p99 P1 1.423 -> 1.379 ms
+#   4 threads: P1 +0.6% / +0.8% (one round -3.2%), P16 -0.4% / -0.6%
+#   8 threads: P1 -0.6% / -0.4% (-0.9..+1.1%), P16 -0.1% / +0.6%;  p99 P1 0.359 -> 0.399 ms
+# io_uring and the shared runtime run other code (unchanged). Rows, first version with the others:
+### 1 thread(s)
+round 1 tantalum         P1   ops    99300 p50 2.415 p99 2.623 cpu 0.90 ops/core   110222
+round 1 tantalum         P16  ops  1171578 p50 3.279 p99 3.583 cpu 0.90 ops/core  1301901
+round 1 tantalum-b       P1   ops    92633 p50 2.543 p99 5.183 cpu 0.89 ops/core   104518
+round 1 tantalum-b       P16  ops  1129802 p50 3.391 p99 3.663 cpu 0.90 ops/core  1255296
+round 1 valkey           P1   ops    96155 p50 2.463 p99 2.735 cpu 0.90 ops/core   106941
+round 1 valkey           P16  ops   989430 p50 3.823 p99 7.615 cpu 0.90 ops/core  1100518
+round 1 dragonfly        P1   ops    98078 p50 2.447 p99 2.639 cpu 0.90 ops/core   108966
+round 1 dragonfly        P16  ops   530566 p50 7.231 p99 7.487 cpu 0.90 ops/core   588934
+round 1 memcached        P1   ops    97084 p50 2.463 p99 2.671 cpu 0.90 ops/core   107996
+round 1 memcached        P16  ops   650356 p50 6.015 p99 6.463 cpu 0.90 ops/core   723526
+round 2 tantalum-b       P1   ops    93082 p50 2.559 p99 2.847 cpu 0.90 ops/core   103442
+round 2 tantalum-b       P16  ops  1104133 p50 3.471 p99 3.759 cpu 0.90 ops/core  1227026
+round 2 valkey           P1   ops    96481 p50 2.447 p99 4.863 cpu 0.90 ops/core   107768
+round 2 valkey           P16  ops  1000537 p50 3.775 p99 7.519 cpu 0.90 ops/core  1114229
+round 2 dragonfly        P1   ops    91189 p50 2.559 p99 4.607 cpu 0.88 ops/core   103840
+round 2 dragonfly        P16  ops   538967 p50 7.103 p99 7.423 cpu 0.90 ops/core   598344
+round 2 memcached        P1   ops    93254 p50 2.559 p99 2.783 cpu 0.90 ops/core   103720
+round 2 memcached        P16  ops   636732 p50 6.047 p99 6.527 cpu 0.90 ops/core   709146
+round 2 tantalum         P1   ops    99499 p50 2.399 p99 2.671 cpu 0.90 ops/core   110546
+round 2 tantalum         P16  ops  1137390 p50 3.375 p99 3.695 cpu 0.90 ops/core  1265239
+round 3 valkey           P1   ops    96755 p50 2.447 p99 2.879 cpu 0.90 ops/core   107497
+round 3 valkey           P16  ops   992061 p50 3.807 p99 7.583 cpu 0.90 ops/core  1103643
+round 3 dragonfly        P1   ops    97805 p50 2.431 p99 2.863 cpu 0.90 ops/core   109103
+round 3 dragonfly        P16  ops   534985 p50 7.103 p99 7.679 cpu 0.90 ops/core   595715
+round 3 memcached        P1   ops    93590 p50 2.559 p99 2.863 cpu 0.99 ops/core    94793
+round 3 memcached        P16  ops   633372 p50 6.079 p99 6.527 cpu 0.90 ops/core   704527
+round 3 tantalum         P1   ops    98930 p50 2.415 p99 2.703 cpu 0.90 ops/core   109827
+round 3 tantalum         P16  ops  1142001 p50 3.359 p99 3.663 cpu 0.90 ops/core  1270413
+round 3 tantalum-b       P1   ops    93735 p50 2.559 p99 2.799 cpu 0.90 ops/core   104064
+round 3 tantalum-b       P16  ops  1108356 p50 3.455 p99 3.743 cpu 0.90 ops/core  1232966
+round 4 dragonfly        P1   ops    95654 p50 2.495 p99 2.703 cpu 0.90 ops/core   106401
+round 4 dragonfly        P16  ops   516939 p50 7.263 p99 13.055 cpu 0.88 ops/core   584530
+round 4 memcached        P1   ops    94173 p50 2.543 p99 2.831 cpu 0.90 ops/core   104664
+round 4 memcached        P16  ops   634085 p50 6.079 p99 6.687 cpu 0.90 ops/core   705326
+round 4 tantalum         P1   ops    99960 p50 2.383 p99 2.655 cpu 0.90 ops/core   111197
+round 4 tantalum         P16  ops  1134429 p50 3.391 p99 3.743 cpu 0.90 ops/core  1260747
+round 4 tantalum-b       P1   ops    93816 p50 2.543 p99 2.799 cpu 0.90 ops/core   104257
+round 4 tantalum-b       P16  ops  1105975 p50 3.471 p99 3.759 cpu 0.90 ops/core  1227597
+round 4 valkey           P1   ops    96660 p50 2.463 p99 2.703 cpu 0.90 ops/core   107418
+round 4 valkey           P16  ops   988101 p50 3.823 p99 7.615 cpu 0.90 ops/core  1099020
+### 2 thread(s)
+round 1 tantalum         P1   ops   196032 p50 1.223 p99 1.351 cpu 1.98 ops/core    98885
+round 1 tantalum         P16  ops  2227199 p50 1.719 p99 1.927 cpu 1.80 ops/core  1236749
+round 1 tantalum-b       P1   ops   184774 p50 1.287 p99 1.479 cpu 1.97 ops/core    93890
+round 1 tantalum-b       P16  ops  2203553 p50 1.735 p99 1.935 cpu 1.80 ops/core  1223497
+round 1 valkey           P1   ops   106045 p50 2.255 p99 2.463 cpu 1.87 ops/core    56727
+round 1 valkey           P16  ops  1299122 p50 2.959 p99 3.055 cpu 1.90 ops/core   684541
+round 1 dragonfly        P1   ops   111015 p50 1.391 p99 6.943 cpu 1.10 ops/core   100544
+round 1 dragonfly        P16  ops   680403 p50 5.247 p99 13.951 cpu 1.20 ops/core   569188
+round 1 memcached        P1   ops   190516 p50 1.263 p99 1.455 cpu 1.98 ops/core    96228
+round 1 memcached        P16  ops  1225968 p50 2.815 p99 4.895 cpu 1.77 ops/core   691360
+round 2 tantalum-b       P1   ops   186851 p50 1.279 p99 1.439 cpu 1.98 ops/core    94282
+round 2 tantalum-b       P16  ops  2187816 p50 1.751 p99 1.951 cpu 1.98 ops/core  1106156
+round 2 valkey           P1   ops   105905 p50 2.255 p99 2.463 cpu 1.86 ops/core    56899
+round 2 valkey           P16  ops  1302392 p50 2.927 p99 3.103 cpu 1.89 ops/core   690669
+round 2 dragonfly        P1   ops   111086 p50 1.391 p99 6.751 cpu 1.10 ops/core   100750
+round 2 dragonfly        P16  ops   769983 p50 4.223 p99 13.375 cpu 1.36 ops/core   566167
+round 2 memcached        P1   ops   185011 p50 1.287 p99 1.479 cpu 1.98 ops/core    93392
+round 2 memcached        P16  ops  1233064 p50 2.783 p99 4.767 cpu 1.77 ops/core   694992
+round 2 tantalum         P1   ops   195141 p50 1.231 p99 1.399 cpu 1.98 ops/core    98518
+round 2 tantalum         P16  ops  2176433 p50 1.767 p99 1.983 cpu 1.80 ops/core  1209874
+round 3 valkey           P1   ops   105366 p50 2.271 p99 2.543 cpu 1.86 ops/core    56500
+round 3 valkey           P16  ops  1305098 p50 2.943 p99 3.055 cpu 1.89 ops/core   689122
+round 3 dragonfly        P1   ops   111259 p50 1.399 p99 6.847 cpu 1.11 ops/core   100278
+round 3 dragonfly        P16  ops   772801 p50 4.223 p99 13.247 cpu 1.36 ops/core   566726
+round 3 memcached        P1   ops   184781 p50 1.287 p99 1.479 cpu 1.98 ops/core    93439
+round 3 memcached        P16  ops  1237399 p50 2.783 p99 4.735 cpu 1.78 ops/core   695948
+round 3 tantalum         P1   ops   195281 p50 1.223 p99 1.391 cpu 1.98 ops/core    98588
+round 3 tantalum         P16  ops  2215782 p50 1.735 p99 1.935 cpu 1.98 ops/core  1119668
+round 3 tantalum-b       P1   ops   185860 p50 1.287 p99 1.447 cpu 1.98 ops/core    93781
+round 3 tantalum-b       P16  ops  2186991 p50 1.751 p99 1.951 cpu 1.98 ops/core  1105561
+### 4 thread(s)
+round 1 tantalum         P1   ops   395437 p50 0.607 p99 0.743 cpu 3.97 ops/core    99646
+round 1 tantalum         P16  ops  4383700 p50 0.871 p99 1.063 cpu 3.94 ops/core  1111283
+round 1 tantalum-b       P1   ops   394375 p50 0.607 p99 0.767 cpu 3.95 ops/core    99755
+round 1 tantalum-b       P16  ops  4426654 p50 0.863 p99 1.047 cpu 3.94 ops/core  1122109
+round 1 valkey           P1   ops   299099 p50 0.775 p99 2.255 cpu 3.84 ops/core    77836
+round 1 valkey           P16  ops  3082813 p50 1.239 p99 1.415 cpu 3.98 ops/core   773933
+round 1 dragonfly        P1   ops   267836 p50 0.583 p99 5.343 cpu 2.59 ops/core   103341
+round 1 dragonfly        P16  ops  1046699 p50 3.375 p99 10.175 cpu 1.92 ops/core   546249
+round 1 memcached        P1   ops   383668 p50 0.615 p99 0.807 cpu 3.96 ops/core    96771
+round 1 memcached        P16  ops  2326371 p50 1.367 p99 4.831 cpu 3.49 ops/core   665772
+round 2 tantalum-b       P1   ops   394856 p50 0.607 p99 0.687 cpu 3.96 ops/core    99621
+round 2 tantalum-b       P16  ops  4479009 p50 0.847 p99 0.999 cpu 3.94 ops/core  1135854
+round 2 valkey           P1   ops   300411 p50 0.775 p99 2.271 cpu 3.84 ops/core    78260
+round 2 valkey           P16  ops  3088811 p50 1.239 p99 1.383 cpu 3.98 ops/core   775680
+round 2 dragonfly        P1   ops   258311 p50 0.631 p99 5.471 cpu 2.72 ops/core    94832
+round 2 dragonfly        P16  ops  1060131 p50 3.087 p99 10.111 cpu 2.07 ops/core   511226
+round 2 memcached        P1   ops   341482 p50 0.687 p99 1.191 cpu 3.96 ops/core    86157
+round 2 memcached        P16  ops  2154801 p50 1.479 p99 5.055 cpu 3.49 ops/core   617922
+round 2 tantalum         P1   ops   355144 p50 0.679 p99 0.791 cpu 3.96 ops/core    89682
+round 2 tantalum         P16  ops  4015176 p50 0.951 p99 1.135 cpu 3.94 ops/core  1018778
+round 3 valkey           P1   ops   276940 p50 0.839 p99 2.511 cpu 3.84 ops/core    72149
+round 3 valkey           P16  ops  2900387 p50 1.319 p99 1.503 cpu 3.98 ops/core   728310
+round 3 dragonfly        P1   ops   248481 p50 0.647 p99 5.439 cpu 2.66 ops/core    93578
+round 3 dragonfly        P16  ops   986199 p50 3.663 p99 10.687 cpu 1.96 ops/core   502133
+round 3 memcached        P1   ops   346663 p50 0.671 p99 1.279 cpu 3.96 ops/core    87527
+round 3 memcached        P16  ops  2161739 p50 1.471 p99 4.991 cpu 3.50 ops/core   617814
+round 3 tantalum         P1   ops   351369 p50 0.687 p99 0.799 cpu 3.96 ops/core    88662
+round 3 tantalum         P16  ops  4010409 p50 0.959 p99 1.135 cpu 3.94 ops/core  1016712
+round 3 tantalum-b       P1   ops   354580 p50 0.679 p99 0.783 cpu 3.97 ops/core    89389
+round 3 tantalum-b       P16  ops  4085300 p50 0.935 p99 1.111 cpu 3.94 ops/core  1036750
+# First version, 4 and 8 threads alone:
+### 4 thread(s)
+### 4 thread(s)
+round 1 tantalum         P1   ops   400133 p50 0.599 p99 0.663 cpu 3.97 ops/core   100802
+round 1 tantalum         P16  ops  4407315 p50 0.871 p99 1.031 cpu 3.94 ops/core  1118536
+round 1 tantalum-b       P1   ops   398448 p50 0.607 p99 0.655 cpu 3.97 ops/core   100409
+round 1 tantalum-b       P16  ops  4447436 p50 0.855 p99 1.007 cpu 3.94 ops/core  1127713
+round 2 tantalum-b       P1   ops   395303 p50 0.607 p99 0.687 cpu 3.97 ops/core    99657
+round 2 tantalum-b       P16  ops  4473536 p50 0.855 p99 0.991 cpu 3.95 ops/core  1133628
+round 2 tantalum         P1   ops   397055 p50 0.607 p99 0.687 cpu 3.97 ops/core   100074
+round 2 tantalum         P16  ops  4451763 p50 0.863 p99 1.007 cpu 3.94 ops/core  1128639
+round 3 tantalum         P1   ops   397177 p50 0.607 p99 0.695 cpu 3.97 ops/core   100127
+round 3 tantalum         P16  ops  4452329 p50 0.863 p99 1.007 cpu 3.95 ops/core  1128538
+round 3 tantalum-b       P1   ops   394546 p50 0.607 p99 0.687 cpu 3.97 ops/core    99442
+round 3 tantalum-b       P16  ops  4471579 p50 0.855 p99 0.991 cpu 3.95 ops/core  1133269
+round 4 tantalum-b       P1   ops   394000 p50 0.607 p99 0.687 cpu 3.97 ops/core    99321
+round 4 tantalum-b       P16  ops  4474678 p50 0.855 p99 0.991 cpu 3.94 ops/core  1135005
+round 4 tantalum         P1   ops   396859 p50 0.607 p99 0.687 cpu 3.97 ops/core   100033
+round 4 tantalum         P16  ops  4433342 p50 0.863 p99 1.015 cpu 3.94 ops/core  1124827
+round 5 tantalum         P1   ops   398088 p50 0.607 p99 0.687 cpu 3.97 ops/core   100381
+round 5 tantalum         P16  ops  4448918 p50 0.863 p99 1.007 cpu 3.94 ops/core  1127960
+round 5 tantalum-b       P1   ops   395237 p50 0.607 p99 0.687 cpu 3.97 ops/core    99623
+round 5 tantalum-b       P16  ops  4480074 p50 0.847 p99 0.991 cpu 3.95 ops/core  1135272
+round 6 tantalum-b       P1   ops   394822 p50 0.607 p99 0.687 cpu 3.97 ops/core    99492
+round 6 tantalum-b       P16  ops  4475192 p50 0.855 p99 0.991 cpu 3.95 ops/core  1134278
+round 6 tantalum         P1   ops   397192 p50 0.607 p99 0.687 cpu 3.97 ops/core   100093
+round 6 tantalum         P16  ops  4440156 p50 0.863 p99 1.007 cpu 3.95 ops/core  1125482
+### 8 thread(s)
+round 1 tantalum         P1   ops   784807 p50 0.303 p99 0.399 cpu 6.70 ops/core   117063
+round 1 tantalum         P16  ops  8626469 p50 0.415 p99 0.671 cpu 7.84 ops/core  1100708
+round 1 tantalum-b       P1   ops   782973 p50 0.311 p99 0.359 cpu 6.70 ops/core   116948
+round 1 tantalum-b       P16  ops  8635419 p50 0.439 p99 0.559 cpu 7.82 ops/core  1103849
+round 2 tantalum-b       P1   ops   770164 p50 0.311 p99 0.367 cpu 7.94 ops/core    97019
+round 2 tantalum-b       P16  ops  8838293 p50 0.431 p99 0.543 cpu 7.86 ops/core  1124791
+round 2 tantalum         P1   ops   768098 p50 0.311 p99 0.407 cpu 7.94 ops/core    96762
+round 2 tantalum         P16  ops  8679444 p50 0.415 p99 0.663 cpu 7.85 ops/core  1106295
+round 3 tantalum         P1   ops   775774 p50 0.303 p99 0.399 cpu 7.94 ops/core    97737
+round 3 tantalum         P16  ops  8798434 p50 0.407 p99 0.655 cpu 7.85 ops/core  1120113
+round 3 tantalum-b       P1   ops   777046 p50 0.311 p99 0.359 cpu 7.94 ops/core    97874
+round 3 tantalum-b       P16  ops  8966080 p50 0.423 p99 0.527 cpu 7.85 ops/core  1141606
+round 4 tantalum-b       P1   ops   781375 p50 0.311 p99 0.367 cpu 7.94 ops/core    98446
+round 4 tantalum-b       P16  ops  8920337 p50 0.423 p99 0.551 cpu 7.86 ops/core  1135123
+round 4 tantalum         P1   ops   776240 p50 0.303 p99 0.399 cpu 7.94 ops/core    97793
+round 4 tantalum         P16  ops  8793802 p50 0.407 p99 0.647 cpu 7.86 ops/core  1119111
+round 5 tantalum         P1   ops   773090 p50 0.303 p99 0.407 cpu 7.94 ops/core    97417
+round 5 tantalum         P16  ops  8714619 p50 0.415 p99 0.655 cpu 7.84 ops/core  1111239
+round 5 tantalum-b       P1   ops   772045 p50 0.311 p99 0.367 cpu 7.94 ops/core    97285
+round 5 tantalum-b       P16  ops  8891175 p50 0.423 p99 0.535 cpu 7.85 ops/core  1132231
+round 6 tantalum-b       P1   ops   771346 p50 0.311 p99 0.367 cpu 7.94 ops/core    97190
+round 6 tantalum-b       P16  ops  8948434 p50 0.423 p99 0.535 cpu 7.86 ops/core  1138875
+round 6 tantalum         P1   ops   776180 p50 0.303 p99 0.399 cpu 7.94 ops/core    97797
+round 6 tantalum         P16  ops  8736549 p50 0.415 p99 0.655 cpu 7.85 ops/core  1113548
+# Final version:
+### 1 thread(s)
+round 1 tantalum         P1   ops   100924 p50 2.383 p99 2.559 cpu 0.90 ops/core   112144
+round 1 tantalum         P16  ops  1128800 p50 3.391 p99 3.663 cpu 0.90 ops/core  1253145
+round 1 tantalum-b       P1   ops    93897 p50 2.559 p99 2.751 cpu 0.90 ops/core   104451
+round 1 tantalum-b       P16  ops  1127290 p50 3.391 p99 3.695 cpu 0.90 ops/core  1251525
+round 2 tantalum-b       P1   ops    94183 p50 2.543 p99 2.783 cpu 0.90 ops/core   104764
+round 2 tantalum-b       P16  ops  1099330 p50 3.487 p99 3.759 cpu 0.90 ops/core  1220422
+round 2 tantalum         P1   ops    99800 p50 2.383 p99 2.687 cpu 0.90 ops/core   110890
+round 2 tantalum         P16  ops  1108925 p50 3.455 p99 3.775 cpu 0.90 ops/core  1232172
+round 3 tantalum         P1   ops   100127 p50 2.383 p99 2.735 cpu 0.90 ops/core   111272
+round 3 tantalum         P16  ops  1102175 p50 3.471 p99 3.807 cpu 0.90 ops/core  1223710
+round 3 tantalum-b       P1   ops    93927 p50 2.543 p99 2.815 cpu 0.90 ops/core   104361
+round 3 tantalum-b       P16  ops  1101609 p50 3.471 p99 3.807 cpu 0.90 ops/core  1224248
+round 4 tantalum-b       P1   ops    93263 p50 2.559 p99 2.831 cpu 0.90 ops/core   103538
+round 4 tantalum-b       P16  ops  1102520 p50 3.471 p99 3.791 cpu 0.90 ops/core  1226492
+round 4 tantalum         P1   ops   100166 p50 2.383 p99 2.671 cpu 0.90 ops/core   111315
+round 4 tantalum         P16  ops  1103468 p50 3.471 p99 3.791 cpu 0.90 ops/core  1226299
+### 2 thread(s)
+round 1 tantalum         P1   ops   198845 p50 1.207 p99 1.343 cpu 1.98 ops/core   100272
+round 1 tantalum         P16  ops  2203986 p50 1.735 p99 1.927 cpu 1.98 ops/core  1113199
+round 1 tantalum-b       P1   ops   188671 p50 1.271 p99 1.407 cpu 1.98 ops/core    95136
+round 1 tantalum-b       P16  ops  2202828 p50 1.735 p99 1.943 cpu 1.98 ops/core  1113079
+round 2 tantalum-b       P1   ops   187286 p50 1.279 p99 1.439 cpu 1.98 ops/core    94488
+round 2 tantalum-b       P16  ops  2189922 p50 1.743 p99 1.943 cpu 1.98 ops/core  1107289
+round 2 tantalum         P1   ops   196769 p50 1.215 p99 1.375 cpu 1.98 ops/core    99290
+round 2 tantalum         P16  ops  2181640 p50 1.751 p99 1.943 cpu 1.98 ops/core  1102976
+round 3 tantalum         P1   ops   196479 p50 1.223 p99 1.383 cpu 1.98 ops/core    99144
+round 3 tantalum         P16  ops  2199283 p50 1.743 p99 1.927 cpu 1.98 ops/core  1111454
+round 3 tantalum-b       P1   ops   187151 p50 1.279 p99 1.431 cpu 1.98 ops/core    94383
+round 3 tantalum-b       P16  ops  2194142 p50 1.743 p99 1.935 cpu 1.98 ops/core  1108789
+round 4 tantalum-b       P1   ops   187854 p50 1.271 p99 1.415 cpu 1.98 ops/core    94774
+round 4 tantalum-b       P16  ops  2187851 p50 1.751 p99 1.943 cpu 1.98 ops/core  1106188
+round 4 tantalum         P1   ops   196841 p50 1.215 p99 1.383 cpu 1.98 ops/core    99322
+round 4 tantalum         P16  ops  2193152 p50 1.743 p99 1.927 cpu 1.98 ops/core  1108315
+### 4 thread(s)
+round 1 tantalum         P1   ops   401731 p50 0.599 p99 0.655 cpu 3.97 ops/core   101267
+round 1 tantalum         P16  ops  4458649 p50 0.855 p99 0.999 cpu 3.95 ops/core  1129810
+round 1 tantalum-b       P1   ops   398732 p50 0.607 p99 0.655 cpu 3.97 ops/core   100487
+round 1 tantalum-b       P16  ops  4451427 p50 0.855 p99 1.007 cpu 3.94 ops/core  1128389
+round 2 tantalum-b       P1   ops   395401 p50 0.607 p99 0.687 cpu 3.97 ops/core    99678
+round 2 tantalum-b       P16  ops  4489371 p50 0.847 p99 0.991 cpu 3.95 ops/core  1137497
+round 2 tantalum         P1   ops   398849 p50 0.599 p99 0.687 cpu 3.97 ops/core   100548
+round 2 tantalum         P16  ops  4439906 p50 0.855 p99 0.999 cpu 3.95 ops/core  1125379
+round 3 tantalum         P1   ops   384138 p50 0.631 p99 0.719 cpu 3.97 ops/core    96821
+round 3 tantalum         P16  ops  4484328 p50 0.847 p99 0.991 cpu 3.95 ops/core  1136585
+round 3 tantalum-b       P1   ops   396880 p50 0.607 p99 0.679 cpu 3.97 ops/core   100005
+round 3 tantalum-b       P16  ops  4509192 p50 0.847 p99 0.983 cpu 3.95 ops/core  1142869
+round 4 tantalum-b       P1   ops   395632 p50 0.607 p99 0.687 cpu 3.97 ops/core    99715
+round 4 tantalum-b       P16  ops  4488773 p50 0.847 p99 0.991 cpu 3.95 ops/core  1137640
+round 4 tantalum         P1   ops   398658 p50 0.599 p99 0.687 cpu 3.97 ops/core   100530
+round 4 tantalum         P16  ops  4481010 p50 0.847 p99 0.991 cpu 3.95 ops/core  1135709
+### 8 thread(s)
+round 1 tantalum         P1   ops   780606 p50 0.303 p99 0.407 cpu 7.94 ops/core    98371
+round 1 tantalum         P16  ops  8717075 p50 0.431 p99 0.567 cpu 7.82 ops/core  1114888
+round 1 tantalum-b       P1   ops   785317 p50 0.311 p99 0.359 cpu 7.94 ops/core    98955
+round 1 tantalum-b       P16  ops  8654414 p50 0.439 p99 0.559 cpu 7.82 ops/core  1106427
+round 2 tantalum-b       P1   ops   773893 p50 0.311 p99 0.359 cpu 7.94 ops/core    97501
+round 2 tantalum-b       P16  ops  8954042 p50 0.423 p99 0.535 cpu 7.85 ops/core  1141036
+round 2 tantalum         P1   ops   782242 p50 0.303 p99 0.399 cpu 7.94 ops/core    98565
+round 2 tantalum         P16  ops  8925201 p50 0.423 p99 0.535 cpu 7.86 ops/core  1136144
+round 3 tantalum         P1   ops   779203 p50 0.303 p99 0.399 cpu 7.94 ops/core    98185
+round 3 tantalum         P16  ops  8958592 p50 0.423 p99 0.551 cpu 7.86 ops/core  1140006
+round 3 tantalum-b       P1   ops   784967 p50 0.311 p99 0.359 cpu 7.94 ops/core    98906
+round 3 tantalum-b       P16  ops  8958460 p50 0.423 p99 0.543 cpu 7.86 ops/core  1140106
+round 4 tantalum-b       P1   ops   784471 p50 0.311 p99 0.359 cpu 7.94 ops/core    98831
+round 4 tantalum-b       P16  ops  8939125 p50 0.423 p99 0.527 cpu 7.86 ops/core  1137609
+round 4 tantalum         P1   ops   777472 p50 0.303 p99 0.399 cpu 7.94 ops/core    97944
+round 4 tantalum         P16  ops  9014478 p50 0.415 p99 0.535 cpu 7.86 ops/core  1147576
