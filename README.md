@@ -288,7 +288,20 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   off, comparing every reply and every key, and adds 4,000 jobs with random
   options (colliding and repeated keys, nils, nesting, escapes, floats),
   checking each runs natively exactly when it should; on a queue run as apps
-  run it, every call stays native.
+  run it, every call stays native. Where a Lua script holds every shard, a
+  native one holds only those of the keys it uses, taken in ascending order
+  as everything that holds two does: it asks for them before using them,
+  those whose names depend on data too (the next job, from the waiting
+  list's end or the first prioritized; a new job's id, from the counter),
+  and all before it writes, so when one below those it holds is taken, it
+  lets go and starts over holding them all (`src/shard_lock.rs`). Using a
+  shard it didn't ask for panics, which every test would catch, rather
+  than risk waiting for ever; and while it holds some, eviction only tries
+  the others. Locking all 256 had been 40% of the server's work adding jobs
+  and 19% processing them; native scripts on different queues now also run
+  on different threads at once. Threads racing on three queues
+  (`tests/bullmq.rs`, with Lua scripts, transactions, plain commands and
+  eviction meanwhile) never deadlock and finish every job exactly once.
 - **Pub/sub** (`src/pubsub.rs`): channels map to their subscribers in 64
   shards, so publishers on different threads rarely meet, and patterns are
   a list each `PUBLISH` matches, as in Redis, skipped while there are none.

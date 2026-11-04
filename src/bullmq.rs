@@ -22,7 +22,7 @@ use crate::cmd::{self, Args};
 use crate::context::{Context, Session};
 use crate::resp;
 use crate::script::{format_number, lua_tostring};
-use crate::store::Millis;
+use crate::store::{Kind, Millis, ScriptShards};
 
 /// What a native script did.
 pub(crate) enum Outcome {
@@ -30,18 +30,26 @@ pub(crate) enum Outcome {
     Done,
     /// It wrote nothing: run the Lua script instead.
     Lua,
+    /// It wrote nothing, and needs a shard it couldn't take without
+    /// waiting while holding others: run it again holding all it asked for.
+    Retry,
 }
 
 pub(crate) type Native = fn(&mut Call<'_>) -> Outcome;
 
-/// The native version of the script with SHA-1 `sha`, if there is one.
-pub(crate) fn find(sha: &[u8; 40]) -> Option<Native> {
-    match sha {
-        b"8fb5163d74bbb5a726c1d3a7db4d7e4a37be3eb3" => Some(add_standard_job),
-        b"d96ca626f1ea141b44a856b312fc636d99aa9ea9" => Some(move_to_active),
-        b"69666e69dd5621df59067a03de685e55a486560d" => Some(move_to_finished),
-        _ => None,
-    }
+/// The native scripts: their SHA-1s, in [`find`]'s numbering.
+pub(crate) const NATIVE_SHAS: [&[u8; 40]; 3] = [
+    b"8fb5163d74bbb5a726c1d3a7db4d7e4a37be3eb3",
+    b"d96ca626f1ea141b44a856b312fc636d99aa9ea9",
+    b"69666e69dd5621df59067a03de685e55a486560d",
+];
+
+/// The native version of the script with SHA-1 `sha`, if there is one, and
+/// its number.
+pub(crate) fn find(sha: &[u8; 40]) -> Option<(usize, Native)> {
+    let natives: [Native; 3] = [add_standard_job, move_to_active, move_to_finished];
+    let i = NATIVE_SHAS.iter().position(|s| *s == sha)?;
+    Some((i, natives[i]))
 }
 
 /// A native script's run: its keys and arguments, and commands run as its
@@ -55,6 +63,10 @@ pub(crate) struct Call<'a> {
     pub(crate) argv: Vec<&'a [u8]>,
     /// The reply to the client.
     pub(crate) out: &'a mut Vec<u8>,
+    /// The shards it holds, and asks for before it uses their keys.
+    pub(crate) shards: ScriptShards<'a>,
+    /// Whether it has written yet: after that it can't start over.
+    wrote: bool,
     buf: Vec<u8>,
     ranges: Vec<Range<usize>>,
     reply: Vec<u8>,
@@ -82,6 +94,7 @@ impl<'a> Call<'a> {
         keys: Vec<&'a [u8]>,
         argv: Vec<&'a [u8]>,
         out: &'a mut Vec<u8>,
+        shards: ScriptShards<'a>,
     ) -> Self {
         Call {
             ctx,
@@ -91,6 +104,8 @@ impl<'a> Call<'a> {
             keys,
             argv,
             out,
+            shards,
+            wrote: false,
             buf: Vec::new(),
             ranges: Vec::new(),
             reply: Vec::new(),
@@ -99,6 +114,28 @@ impl<'a> Call<'a> {
 
     fn key(&self, i: usize) -> &'a [u8] {
         self.keys[i - 1]
+    }
+
+    /// Holds the shards of `keys`, which it may then use; false means start
+    /// over ([`Outcome::Retry`]). Every key must be asked for before it's
+    /// used, and all of them before anything is written.
+    fn hold(&mut self, keys: &[&[u8]]) -> bool {
+        debug_assert!(
+            !self.wrote,
+            "a native script asked for shards after writing"
+        );
+        self.shards.hold(keys)
+    }
+
+    /// What `INCR key` will make it, as INCR reads it (`None` if INCR will
+    /// fail), without the read counting as a lookup.
+    fn next_count(&self, key: &[u8]) -> Option<i64> {
+        let store = &self.ctx.store;
+        store.get_key(store.key(key), self.now, |value| match value {
+            None => Some(1),
+            Some(v) if v.kind() == Kind::String => resp::parse_int(v.as_bytes())?.checked_add(1),
+            Some(_) => None,
+        })
     }
 
     fn arg(&self, i: usize) -> Option<&'a [u8]> {
@@ -143,6 +180,7 @@ impl<'a> Call<'a> {
     /// A command while writing: if it fails, the script fails as Lua does at
     /// `line`, and `None` stops the native run.
     fn write(&mut self, line: u32, args: &[&[u8]]) -> Option<Value> {
+        self.wrote = true;
         match self.call(args) {
             Ok(value) => Some(value),
             Err(Failed(error)) => {
@@ -383,6 +421,9 @@ struct Fetch {
     name: Option<Vec<u8>>,
     paused: bool,
     concurrency: Option<f64>,
+    /// The job a fetch would take: the waiting list's last, or else the
+    /// first prioritized (whose shards it must hold).
+    next: Option<Vec<u8>>,
 }
 
 impl Fetch {
@@ -394,6 +435,7 @@ impl Fetch {
         meta: &[u8],
         delayed: &[u8],
         wait: &[u8],
+        prioritized: &[u8],
     ) -> Option<Fetch> {
         if !matches!(opts, Msg::Map(_)) || *opts.get("limiter") != Msg::Nil {
             return None;
@@ -451,19 +493,36 @@ impl Fetch {
             return None;
         }
         // A legacy marker ("0:...") next in line: Lua's.
-        match call.call(&[b"LINDEX", wait, b"-1"]).ok()? {
-            Value::Nil => {}
-            Value::Bulk(next) if !next.starts_with(b"0:") => {}
+        let next = match call.call(&[b"LINDEX", wait, b"-1"]).ok()? {
+            Value::Nil => match call.call(&[b"ZRANGE", prioritized, b"0", b"0"]).ok()? {
+                Value::Array(first) => match first.into_iter().next() {
+                    Some(Value::Bulk(id)) => Some(id),
+                    _ => None,
+                },
+                _ => return None,
+            },
+            Value::Bulk(next) if !next.starts_with(b"0:") => Some(next),
             _ => return None,
-        }
+        };
         Some(Fetch {
             token: token.clone(),
             lock_duration,
             name,
             paused,
             concurrency,
+            next,
         })
     }
+}
+
+/// Holds the shards of the job a fetch would take, and its lock's.
+fn hold_next(call: &mut Call<'_>, prefix: &[u8], state: &Fetch) -> bool {
+    let Some(id) = &state.next else {
+        return true;
+    };
+    let job = [prefix, id].concat();
+    let lock = [&job[..], b":lock"].concat();
+    call.hold(&[&job, &lock])
 }
 
 /// Lines of the `redis.call`s a fetch makes, in one script's text.
@@ -746,7 +805,6 @@ mod add_lines {
     pub(super) const INCR: u32 = 541;
     pub(super) const HGET_MAX_EVENTS: u32 = 313;
     pub(super) const HSET_MAX_EVENTS: u32 = 316;
-    pub(super) const HGET_PARENT: u32 = 488;
     pub(super) const EXISTS_PARENT: u32 = 490;
     pub(super) const XADD_DUPLICATED: u32 = 503;
     pub(super) const HMSET_JOB: u32 = 531;
@@ -794,15 +852,43 @@ fn add_standard_job(call: &mut Call<'_>) -> Outcome {
     if aliased {
         return Outcome::Lua;
     }
-    // Whether a job with the custom id exists already, and whether the
-    // queue is paused or at its concurrency (`isQueuePausedOrMaxed`).
-    let exists = match &job.id {
-        Some(id) => match call.call(&[b"EXISTS", &[&job.prefix[..], id].concat()]) {
+    // Its shards: the queue's keys, a custom id's job, a parent's
+    // dependencies; then a generated id's job (the count INCR will make).
+    let custom = job.id.as_ref().map(|id| [&job.prefix[..], id].concat());
+    let mut keys = used.to_vec();
+    keys.extend(custom.as_deref());
+    keys.extend(job.parent_dependencies.as_deref());
+    if !call.hold(&keys) {
+        return Outcome::Retry;
+    }
+    if job.id.is_none()
+        && let Some(count) = call.next_count(counter)
+        && !call.hold(&[&[&job.prefix[..], &lua_tostring(count as f64)].concat()])
+    {
+        return Outcome::Retry;
+    }
+    // Whether a job with the custom id exists already (and then its
+    // parent's key, which the script reads), and whether the queue is
+    // paused or at its concurrency (`isQueuePausedOrMaxed`).
+    let exists = match &custom {
+        Some(key) => match call.call(&[b"EXISTS", key]) {
             Ok(Value::Int(n)) => n == 1,
             _ => return Outcome::Lua,
         },
         None => false,
     };
+    let existing_parent = match &custom {
+        Some(key) if exists => match call.call(&[b"HGET", key, b"parentKey"]) {
+            Ok(parent) => parent,
+            Err(_) => return Outcome::Lua,
+        },
+        _ => Value::Nil,
+    };
+    if let Value::Bulk(parent) = &existing_parent
+        && !call.hold(&[parent])
+    {
+        return Outcome::Retry;
+    }
     let paused_or_maxed = if exists {
         false
     } else {
@@ -852,13 +938,10 @@ fn add_standard_job(call: &mut Call<'_>) -> Outcome {
     let key = [&job.prefix[..], &id].concat();
     if exists {
         // `handleDuplicatedJob`, without a parent: an event, and its id.
-        let parent = match call.write(line::HGET_PARENT, &[b"HGET", &key, b"parentKey"]) {
-            Some(parent) => parent,
-            None => return Outcome::Done,
-        };
-        if let Value::Bulk(parent) = parent
+        // (Its HGET of the parent's key was made above.)
+        if let Value::Bulk(parent) = &existing_parent
             && call
-                .write(line::EXISTS_PARENT, &[b"EXISTS", &parent])
+                .write(line::EXISTS_PARENT, &[b"EXISTS", parent])
                 .is_none()
         {
             return Outcome::Done;
@@ -957,6 +1040,10 @@ fn move_to_active(call: &mut Call<'_>) -> Outcome {
     let (Some(opts), Some(ts)) = (Msg::decode(opts), plain_number(timestamp)) else {
         return Outcome::Lua;
     };
+    let declared = call.keys.clone();
+    if !call.hold(&declared) {
+        return Outcome::Retry;
+    }
     let keys = FetchKeys {
         wait: call.key(1),
         active: call.key(2),
@@ -968,9 +1055,20 @@ fn move_to_active(call: &mut Call<'_>) -> Outcome {
         prefix,
         timestamp,
     };
-    let Some(state) = Fetch::read(call, &opts, ts, call.key(9), keys.delayed, keys.wait) else {
+    let Some(state) = Fetch::read(
+        call,
+        &opts,
+        ts,
+        call.key(9),
+        keys.delayed,
+        keys.wait,
+        keys.prioritized,
+    ) else {
         return Outcome::Lua;
     };
+    if !hold_next(call, prefix, &state) {
+        return Outcome::Retry;
+    }
     match fetch(call, &keys, &state, &MOVE_TO_ACTIVE_LINES) {
         Fetched::Replied | Fetched::Failed => Outcome::Done,
         Fetched::Nothing => call.reply_no_job(0, 0),
@@ -984,6 +1082,23 @@ fn move_to_finished(call: &mut Call<'_>) -> Outcome {
         return Outcome::Lua;
     }
     let job = call.key(12);
+    // Its keys, and the job's that it reads or removes.
+    let related: Vec<Vec<u8>> = [
+        &b":lock"[..],
+        b":dependencies",
+        b":unsuccessful",
+        b":logs",
+        b":processed",
+        b":failed",
+    ]
+    .iter()
+    .map(|part| [job, part].concat())
+    .collect();
+    let mut keys = call.keys.clone();
+    keys.extend(related.iter().map(Vec::as_slice));
+    if !call.hold(&keys) {
+        return Outcome::Retry;
+    }
     // The checks the script makes before writing anything.
     match call.call(&[b"EXISTS", job]) {
         Ok(Value::Int(1)) => {}
@@ -1082,13 +1197,26 @@ fn move_to_finished(call: &mut Call<'_>) -> Outcome {
         timestamp,
     };
     let state = if fetching {
-        match Fetch::read(call, &opts, ts, call.key(9), keys.delayed, keys.wait) {
+        match Fetch::read(
+            call,
+            &opts,
+            ts,
+            call.key(9),
+            keys.delayed,
+            keys.wait,
+            keys.prioritized,
+        ) {
             Some(state) => Some(state),
             None => return Outcome::Lua,
         }
     } else {
         None
     };
+    if let Some(state) = &state
+        && !hold_next(call, prefix, state)
+    {
+        return Outcome::Retry;
+    }
 
     // removeLock, then writes in the script's order.
     if token.as_slice() != b"0" {
@@ -1322,10 +1450,6 @@ mod tests {
             (
                 add_lines::HSET_MAX_EVENTS,
                 "rcall(\"HSET\", metaKey, \"opts.maxLenEvents\", maxEvents)",
-            ),
-            (
-                add_lines::HGET_PARENT,
-                "rcall(\"HGET\", jobKey, \"parentKey\")",
             ),
             (
                 add_lines::EXISTS_PARENT,
