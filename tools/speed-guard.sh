@@ -10,7 +10,7 @@
 # more than 3% slower (a real slowdown moves both; noise rarely does), and
 # memory per key (or field) when it grows at all (it's exact). Exits 1 if
 # anything is flagged. Metrics the base doesn't have yet are shown as new,
-# to record as their baseline. Works like Gallium's engine/tools/speed-guard.sh: the base is
+# to record as their baseline. The base is
 # exported with git archive into /tmp (once per tree) and built with its own
 # target dir; both binaries run from paths of the same length, and each round
 # pads the environment by a different length, because where the stack starts
