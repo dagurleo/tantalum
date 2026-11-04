@@ -168,6 +168,10 @@ pub struct Config {
     /// keys that collide on purpose.
     #[doc(hidden)]
     pub fixed_seed: bool,
+    /// Tests only: Unix time in milliseconds at store-clock time 0, in
+    /// place of the real one, so time-based IDs are the same every run.
+    #[doc(hidden)]
+    pub unix_base: Option<u64>,
 }
 
 /// A write was refused because it would exceed `maxmemory`.
@@ -1365,6 +1369,8 @@ pub struct Store {
     shard_mask: usize,
     hasher: Hasher,
     epoch: Instant,
+    /// Unix time in milliseconds at store-clock time 0.
+    unix_base: u64,
     maxmemory: usize,
     policy: EvictionPolicy,
     /// Sum of all shards' flushed footprints.
@@ -1433,6 +1439,13 @@ impl Store {
                 Hasher::random()
             },
             epoch: Instant::now(),
+            // `now()` starts at 1.
+            unix_base: config.unix_base.unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64)
+                    .saturating_sub(1)
+            }),
             maxmemory: config.maxmemory,
             policy: config.policy,
             used: AtomicI64::new(0),
@@ -1445,6 +1458,13 @@ impl Store {
     /// Current time on the store clock.
     pub fn now(&self) -> Millis {
         self.epoch.elapsed().as_millis() as Millis + 1
+    }
+
+    /// Unix time in milliseconds at store-clock time `now`, for `XADD`'s
+    /// automatic IDs: the time a command runs at, as Redis' snapshot of it,
+    /// so a script's `XADD`s (its time stands still) share a millisecond.
+    pub fn unix_ms(&self, now: Millis) -> u64 {
+        self.unix_base.saturating_add(now)
     }
 
     /// Converts a Unix timestamp in milliseconds to a store-clock deadline.

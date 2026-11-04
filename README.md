@@ -4,7 +4,8 @@ A small, fast key/value server in Rust that speaks the Redis protocol (RESP2
 and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
 lists, sorted sets, streams, blocking commands, pub/sub, transactions and
-Lua scripts (enough to run [BullMQ](https://bullmq.io)), and `SCAN`, `KEYS`
+Lua scripts (enough to run [BullMQ](https://bullmq.io), which processes jobs
+twice as fast as on Redis per core), and `SCAN`, `KEYS`
 and `RENAME`, with TTLs, eviction, a password, TLS and optional snapshots
 to disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
@@ -100,7 +101,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and subscriptions) reads as 0, `N` or `NULL` |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
-| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
+| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ...) and the keyspace line |
 | `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE channel\|pattern [...]`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `SUNSUBSCRIBE [...]` | Messages are pushes in RESP3. Subscribed in RESP2, a client may only run these, `PING`, `QUIT` and `RESET`, as in Redis. Shard channels are a namespace of their own (one server is one shard) |
 | `PUBLISH channel message`, `SPUBLISH` | Replies how many got it; a client subscribed both by channel and by pattern gets it twice. One publishing to its own channel gets the reply, then the message, as from Redis 7.2 |
 | `PUBSUB CHANNELS [pattern]\|NUMSUB [channel ...]\|NUMPAT\|SHARDCHANNELS\|SHARDNUMSUB\|HELP` | |
@@ -262,10 +263,26 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   answer at once), and replies become Lua values, and its result a reply,
   by Redis' rules. 311 commands' replies match Redis 7.2.4 in both
   protocols (`tests/scripting.rs`), and BullMQ 6.5.4's own test suite
-  passes against it: all 1,111 tests (3 more are skipped in BullMQ's code).
+  passes against it: all 1,111 tests (3 more are skipped in BullMQ's code),
+  one of them only with `--threads 1` (see "Not there yet": the order of a
+  woken client's reply).
   One difference on purpose: Redis 7.2.4 crashes on an
   error table without `err` (`error({})`); Tantalum replies Redis 8's
   `ERR unknown error`.
+- **Native BullMQ scripts** (`src/bullmq.rs`): BullMQ's two hottest
+  scripts, `moveToActive` (a worker takes a job) and `moveToFinished` (it
+  completes or fails one, and takes the next), run as Rust when `EVALSHA`
+  or `EVAL` gets their exact text (BullMQ 6.5.4's, recognised by SHA-1;
+  `--native-scripts no` turns this off). They do what the Lua does, with the
+  same commands in the same order, so keys, replies, stream events and
+  errors come out the same; they only skip the interpreter. First they read
+  what decides the path, and anything they don't cover (rate limits,
+  `keepJobs` by age or count, metrics, parents and dependencies, due delayed
+  jobs, legacy markers, other versions' scripts) goes to the Lua with nothing
+  written. `tests/bullmq.rs` runs random workloads (with state nudged toward
+  every branch: paused, concurrency, priorities, lost and stolen locks) on two
+  stores, natives on and off, comparing every reply and every key; on a queue
+  run as apps run it, every call stays native.
 - **Pub/sub** (`src/pubsub.rs`): channels map to their subscribers in 64
   shards, so publishers on different threads rarely meet, and patterns are
   a list each `PUBLISH` matches, as in Redis, skipped while there are none.
@@ -716,6 +733,27 @@ pipeline 16 went from 2.48M to 2.71M per core with io_uring (+9%) and from
 2.09M to 2.27M per-thread (+9%); without pipelining, 288k to 301k (+5%) and
 249k to 271k (+9%).
 
+### BullMQ jobs (Agent37 VM, November 2026)
+
+BullMQ 6.5.4 adding 100,000 jobs with `addBulk`, then three Node worker
+processes (concurrency 100, doing nothing) processing them, jobs removed on
+completion. Each server alone on one core of a 4-vCPU Xeon E-2388G VM, the
+clients on the other three; server CPU time from `/proc`. Medians of 3
+rotated rounds, 2026-11-04 (`bench/bullmq/run.sh`; raw output, and Valkey and
+Dragonfly in an earlier run: `bench/bullmq/results-agent37.txt`):
+
+| One server core | Add, jobs/s | Server µs per job | Process, jobs/s | Server µs per job |
+|---|---|---|---|---|
+| **Tantalum, native scripts** | **40.5k** | **12.9** | **65.1k** | **13.7** |
+| Tantalum, `--native-scripts no` | 41.4k | 12.6 | 36.2k | 26.7 |
+| Tantalum, io_uring, native | 38.9k | 14.0 | 55.0k | 16.2 |
+| Redis 8.10.3 | 38.1k | 14.5 | 31.0k | 31.5 |
+
+Processing with the native scripts, the server used 0.89 of its core (the
+clients limit the rate); the others used 0.97–0.98. Every one of a run's
+script calls stayed native (`INFO`: `native_script_fallbacks:0`). Adding
+jobs still runs BullMQ's Lua.
+
 ### Earlier results
 
 v0.0.2 Linux runs (`bench/railway/results-network.txt`, `results-loopback.txt`)
@@ -766,7 +804,14 @@ hit rates share the seeding flaw described above.
   and `MSET` writes one at a time, so a transaction or script can run
   between two of their keys; `SMOVE`, `LMOVE` and `RENAME` are atomic.
 - **Blocking gaps**: no `WAIT`, `CLIENT UNBLOCK`, or `b` flag in a client
-  list.
+  list. With more than one thread, a client a write wakes from `BLPOP`,
+  `BZPOPMIN` and the rest can get its reply after the writer gets its own
+  (the woken connection is on another thread, which the writer only signals).
+  Redis sends the woken client's reply first, and BullMQ's test "does not
+  process a job that is being processed when a new queue starts" relies on
+  that: a worker waiting on the queue takes a new job before the code that
+  added it can start a second worker. Against Tantalum the second worker
+  wins about half the time (every time it passes with `--threads 1`).
 - **Writes to a small collection decode it whole**: a list, set or sorted
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its

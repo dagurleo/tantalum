@@ -21,12 +21,13 @@ use std::collections::HashMap;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use mlua_sys::{self as lua, lua_State};
 use parking_lot::Mutex;
 
+use crate::bullmq;
 use crate::cmd::{self, Args};
 use crate::context::{Context, Session};
 use crate::resp;
@@ -152,6 +153,9 @@ pub(crate) struct Scripting {
     kill: AtomicBool,
     /// [`IDLE`], [`RUNNING`] or [`WROTE`].
     state: AtomicU8,
+    /// Scripts run natively, and calls a native one sent back to Lua.
+    natives: AtomicU64,
+    fallbacks: AtomicU64,
 }
 
 impl Scripting {
@@ -203,6 +207,29 @@ impl Scripting {
             return;
         }
         let read_only = read_only || (!flags.compat && flags.no_writes);
+        // BullMQ's hottest scripts natively, unless one sends this call
+        // back to Lua (having written nothing).
+        if ctx.settings.native_scripts
+            && !read_only
+            && let Some(native) = bullmq::find(&name)
+        {
+            let keys = (3..3 + numkeys).map(|i| args.get(i)).collect();
+            let argv = (3 + numkeys..args.len()).map(|i| args.get(i)).collect();
+            let start = out.len();
+            let mut call = bullmq::Call::new(ctx, now, &name, keys, argv, out);
+            let outcome = native(&mut call);
+            ctx.publish(&mut call.session);
+            match outcome {
+                bullmq::Outcome::Done => {
+                    self.natives.fetch_add(1, Relaxed);
+                    return;
+                }
+                bullmq::Outcome::Lua => {
+                    self.fallbacks.fetch_add(1, Relaxed);
+                    out.truncate(start);
+                }
+            }
+        }
         let keys = (3..3 + numkeys).map(|i| args.get(i));
         let argv = (3 + numkeys..args.len()).map(|i| args.get(i));
         let mut run = Run {
@@ -228,6 +255,11 @@ impl Scripting {
         if let Some(panic) = run.panic {
             resume_unwind(panic);
         }
+    }
+
+    /// Scripts run natively, and calls a native one sent back to Lua.
+    pub(crate) fn native_stats(&self) -> (u64, u64) {
+        (self.natives.load(Relaxed), self.fallbacks.load(Relaxed))
     }
 
     /// `SCRIPT LOAD`: compiles and keeps a script, replying its SHA-1.
@@ -1146,6 +1178,19 @@ unsafe fn push_reply(l: *mut lua_State, input: &mut &[u8]) {
             _ => lua::lua_pushnil(l),
         }
     }
+}
+
+/// A Lua number as a `redis.call` argument: Redis' `fpconv_dtoa`.
+pub(crate) fn format_number(n: f64) -> Vec<u8> {
+    let mut digits = [0 as c_char; 24];
+    // SAFETY: writes at most 24 bytes.
+    let len = unsafe { fpconv_dtoa(n, digits.as_mut_ptr()) };
+    digits[..len as usize].iter().map(|&c| c as u8).collect()
+}
+
+/// A Lua number a script returns, as its reply's integer.
+pub(crate) fn lua_integer(n: f64) -> i64 {
+    to_integer(n)
 }
 
 /// A Lua number as a reply's integer: C's `(long long)` cast on x86-64,

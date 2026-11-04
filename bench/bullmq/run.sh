@@ -24,6 +24,7 @@ server_cmd() {
   case $1 in
     tantalum) echo "$TANTALUM --port $PORT --threads 1 --io per-thread" ;;
     tantalum-uring) echo "$TANTALUM --port $PORT --threads 1 --io uring" ;;
+    tantalum-lua) echo "$TANTALUM --port $PORT --threads 1 --io per-thread --native-scripts no" ;;
     tantalum-b) echo "$TANTALUM_B --port $PORT --threads 1 --io per-thread" ;;
     tantalum-b-uring) echo "$TANTALUM_B --port $PORT --threads 1 --io uring" ;;
     redis) echo "redis-server --port $PORT --save '' --appendonly no" ;;

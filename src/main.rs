@@ -51,6 +51,9 @@ Options:
   --snapshot-interval <SECS>
                     Save this often if anything changed; 0 saves only at
                     shutdown and on SAVE or BGSAVE [default: 60]
+  --native-scripts <yes|no>
+                    Run BullMQ's hottest scripts natively, with the same
+                    results as their Lua [default: yes]
   -h, --help        Print this help
 
 On SIGTERM or SIGINT, Tantalum stops accepting, lets each connection finish
@@ -198,6 +201,13 @@ fn parse_args() -> Result<Config, String> {
             "--tls-key-file" => config.tls_key = Some(PathBuf::from(value)),
             "--snapshot-interval" => {
                 config.snapshot_interval = parse_secs(&value).ok_or_else(|| bad(()))?;
+            }
+            "--native-scripts" => {
+                config.settings.native_scripts = match value.as_str() {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Err(bad(())),
+                }
             }
             _ => return Err(format!("unknown option: {flag}")),
         }
