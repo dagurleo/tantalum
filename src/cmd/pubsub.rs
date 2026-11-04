@@ -311,6 +311,10 @@ pub(super) fn reset(
     session.watching = None;
     session.name = None;
     session.set_resp3(false);
+    ctx.update_client(session.id, |client| {
+        client.name = None;
+        client.resp3 = false;
+    });
     session.set_authenticated(!ctx.has_password());
     out.extend_from_slice(b"+RESET\r\n");
     Reply::Written

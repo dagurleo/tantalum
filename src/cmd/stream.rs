@@ -513,6 +513,12 @@ fn xread_attempt(
         let opt = args.get(i);
         let is = |name: &[u8]| opt.eq_ignore_ascii_case(name);
         if is(b"BLOCK") && more > 0 {
+            if session.in_script {
+                let mut msg = b"ERR ".to_vec();
+                msg.extend_from_slice(args.get(0));
+                msg.extend_from_slice(b" command is not allowed with BLOCK option from scripts");
+                return error(out, &msg);
+            }
             i += 1;
             match parse_timeout_ms(args.get(i)) {
                 Ok(timeout) => block = Some(timeout),

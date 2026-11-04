@@ -9,7 +9,8 @@
 
 FROM rust:1-bookworm AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY vendor vendor
 COPY src src
 RUN cargo build --release --bin tantalum
 

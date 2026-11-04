@@ -1,5 +1,6 @@
 //! Command dispatch. Replies match Redis 7 byte for byte where practical.
 
+mod eval;
 mod hash;
 mod keys;
 mod list;
@@ -170,6 +171,11 @@ static COMMANDS: &[Command] = &[
     Command { name: "watch", arity: -2, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: (1, -1, 1), run: multi::watch },
     Command { name: "unwatch", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: NO_KEYS, run: multi::unwatch },
     Command { name: "time", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: time },
+    Command { name: "eval", arity: -3, flags: &["noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::eval },
+    Command { name: "evalsha", arity: -3, flags: &["noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::evalsha },
+    Command { name: "eval_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::eval_ro },
+    Command { name: "evalsha_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::evalsha_ro },
+    Command { name: "script", arity: -2, flags: &[], keys: NO_KEYS, run: eval::script },
     Command { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"], keys: NO_KEYS, run: pubsub::reset },
     Command { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::subscribe },
     Command { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::unsubscribe },
@@ -360,6 +366,13 @@ pub fn execute(
         crate::blocking::serve_ready(ctx, now);
     }
     reply
+}
+
+pub(crate) use eval::call_from_script;
+
+/// Whether `name` is a command here, in any case.
+pub(crate) fn is_command(name: &[u8]) -> bool {
+    find_command(name).is_some()
 }
 
 /// The command called `name`, in any case. [`COMMANDS`] is split by name
@@ -1252,11 +1265,12 @@ fn hello(
         return Reply::Written;
     }
     if let Some(name) = name
-        && !set_client_name(session, name, out)
+        && !set_client_name(ctx, session, name, out)
     {
         return Reply::Written;
     }
     session.set_resp3(resp3);
+    ctx.update_client(session.id, |client| client.resp3 = resp3);
     resp::write_map_header(out, 7, resp3);
     for (field, value) in [("server", "redis"), ("version", REDIS_VERSION)] {
         resp::write_bulk(out, field.as_bytes());
@@ -1277,11 +1291,12 @@ fn hello(
 
 /// Sets the connection's name (an empty one clears it). Returns false after
 /// writing an error if it isn't valid.
-fn set_client_name(session: &mut Session, name: &[u8], out: &mut Vec<u8>) -> bool {
+fn set_client_name(ctx: &Context, session: &mut Session, name: &[u8], out: &mut Vec<u8>) -> bool {
     if !valid_client_attr(name, "Client names", out) {
         return false;
     }
     session.name = (!name.is_empty()).then(|| name.into());
+    ctx.update_client(session.id, |client| client.name.clone_from(&session.name));
     true
 }
 
@@ -1298,10 +1313,11 @@ fn valid_client_attr(value: &[u8], what: &str, out: &mut Vec<u8>) -> bool {
     valid
 }
 
-/// `CLIENT SETNAME | GETNAME | ID | SETINFO`: what client libraries send on
-/// connect.
+/// `CLIENT SETNAME | GETNAME | ID | SETINFO | LIST | INFO`: what client
+/// libraries send on connect, and what job queues read to find their
+/// workers.
 fn client(
-    _: &Context,
+    ctx: &Context,
     session: &mut Session,
     _: Millis,
     args: &Args<'_>,
@@ -1317,7 +1333,7 @@ fn client(
         ok
     };
     if is(b"SETNAME") {
-        if arity(3, "setname", out) && set_client_name(session, args.get(2), out) {
+        if arity(3, "setname", out) && set_client_name(ctx, session, args.get(2), out) {
             out.extend_from_slice(resp::OK);
         }
     } else if is(b"GETNAME") {
@@ -1333,9 +1349,9 @@ fn client(
         }
     } else if is(b"SETINFO") {
         if arity(4, "setinfo", out) {
-            // Accepted and checked, but not kept: nothing reports them.
             let attr = args.get(2);
-            let what = if attr.eq_ignore_ascii_case(b"LIB-NAME") {
+            let lib_name = attr.eq_ignore_ascii_case(b"LIB-NAME");
+            let what = if lib_name {
                 "lib-name"
             } else if attr.eq_ignore_ascii_case(b"LIB-VER") {
                 "lib-ver"
@@ -1346,14 +1362,87 @@ fn client(
                 resp::write_error(out, &msg);
                 return Reply::Written;
             };
-            if valid_client_attr(args.get(3), what, out) {
+            let value = args.get(3);
+            if valid_client_attr(value, what, out) {
+                let value = (!value.is_empty()).then(|| value.into());
+                ctx.update_client(session.id, |client| match lib_name {
+                    true => client.lib_name = value,
+                    false => client.lib_ver = value,
+                });
                 out.extend_from_slice(resp::OK);
             }
         }
+    } else if is(b"INFO") && args.len() == 2 {
+        let line = ctx.client_lines(session, &[session.id], "client|info");
+        resp::write_verbatim_text(out, &line, session.resp3);
+    } else if is(b"LIST") {
+        client_list(ctx, session, args, out);
     } else {
         unknown_subcommand(out, sub, "CLIENT");
     }
     Reply::Written
+}
+
+/// `CLIENT LIST [TYPE NORMAL|MASTER|REPLICA|PUBSUB] [ID id [id ...]]`, as
+/// Redis 7.2 reads its arguments. (Only the caller's subscriptions are
+/// known here, so `TYPE PUBSUB` lists the caller if it's subscribed.)
+fn client_list(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<u8>) {
+    let n = args.len();
+    let lines = if n == 4 && args.get(2).eq_ignore_ascii_case(b"TYPE") {
+        let kind = args.get(3);
+        let is = |name: &[u8]| kind.eq_ignore_ascii_case(name);
+        let subscribed = session.is_subscribed();
+        if is(b"NORMAL") {
+            let mut lines = ctx.client_lines(session, &[], "client|list");
+            if subscribed {
+                lines = drop_line(lines, session.id);
+            }
+            lines
+        } else if is(b"PUBSUB") {
+            if subscribed {
+                ctx.client_lines(session, &[session.id], "client|list")
+            } else {
+                Vec::new()
+            }
+        } else if is(b"MASTER") || is(b"REPLICA") || is(b"SLAVE") {
+            Vec::new()
+        } else {
+            let mut msg = b"ERR Unknown client type '".to_vec();
+            msg.extend_from_slice(kind);
+            msg.push(b'\'');
+            resp::write_error(out, &msg);
+            return;
+        }
+    } else if n > 3 && args.get(2).eq_ignore_ascii_case(b"ID") {
+        let mut ids = Vec::with_capacity(n - 3);
+        for i in 3..n {
+            match resp::parse_int(args.get(i)) {
+                Some(id) => ids.push(id as u64),
+                None => {
+                    resp::write_error(out, b"ERR Invalid client ID");
+                    return;
+                }
+            }
+        }
+        ctx.client_lines(session, &ids, "client|list")
+    } else if n != 2 {
+        resp::write_error(out, SYNTAX_ERROR);
+        return;
+    } else {
+        ctx.client_lines(session, &[], "client|list")
+    };
+    resp::write_verbatim_text(out, &lines, session.resp3);
+}
+
+/// `lines` without the one for client `id`.
+fn drop_line(lines: Vec<u8>, id: u64) -> Vec<u8> {
+    let prefix = format!("id={id} ");
+    lines
+        .split_inclusive(|&b| b == b'\n')
+        .filter(|line| !line.starts_with(prefix.as_bytes()))
+        .flatten()
+        .copied()
+        .collect()
 }
 
 /// `COMMAND`, `COMMAND COUNT | INFO [name ...] | LIST | DOCS`: enough for

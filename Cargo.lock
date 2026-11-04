@@ -319,6 +319,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlua-sys"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1631cda17bd6486410ab751d91f5fd4484f441589278cdad879eb3afc721a285"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "monoio"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,6 +478,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13bee6c73da26345c729282832b60b0363cf3dd9f4bfd81d8551b7a1c889a113"
 
 [[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
 name = "powerfmt"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -606,6 +624,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -688,9 +712,10 @@ dependencies = [
 
 [[package]]
 name = "tantalum"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "allocator-api2",
+ "cc",
  "crc32fast",
  "foldhash",
  "hashbrown",
@@ -699,10 +724,12 @@ dependencies = [
  "libc",
  "memchr",
  "mimalloc",
+ "mlua-sys",
  "monoio",
  "parking_lot",
  "rcgen",
  "rustls",
+ "sha1_smol",
  "socket2 0.6.5",
  "tokio",
  "tokio-rustls",

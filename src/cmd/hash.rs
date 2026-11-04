@@ -384,8 +384,12 @@ pub(super) fn hstrlen(
     })
 }
 
-/// `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]`. Like Redis
-/// with a small hash, it returns every field at once, with cursor 0.
+/// `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]`. A hash
+/// Redis keeps as a listpack comes whole, with cursor 0, as from Redis. One
+/// it would keep as a hash table (over 128 fields, or a field or value over
+/// 64 bytes) comes `COUNT` fields at a time, as Redis pages those, from the
+/// end of the fields' order: removing a field keeps the others' order, so
+/// nothing there all along is skipped.
 pub(super) fn hscan(
     ctx: &Context,
     session: &mut Session,
@@ -394,10 +398,10 @@ pub(super) fn hscan(
     out: &mut Vec<u8>,
 ) -> Reply {
     // In Redis' order: the cursor, then the key, then the options.
-    if parse_cursor(args.get(2)).is_none() {
+    let Some(cursor) = parse_cursor(args.get(2)) else {
         resp::write_error(out, INVALID_CURSOR);
         return Reply::Written;
-    }
+    };
     read(ctx, session, now, args, out, |hash, out| {
         let Some(hash) = hash else {
             out.extend_from_slice(b"*2\r\n$1\r\n0\r\n*0\r\n");
@@ -406,10 +410,24 @@ pub(super) fn hscan(
         let Some(options) = ScanOptions::parse(args, 3, Scan::Hash, out) else {
             return;
         };
-        let found: Vec<_> = hash::iter(hash)
+        let fields: Vec<_> = hash::iter(hash).collect();
+        let big = fields.len() > 128 || fields.iter().any(|(f, v)| f.len() > 64 || v.len() > 64);
+        let (page, next) = if big {
+            let end = match cursor {
+                0 => fields.len(),
+                c => usize::try_from(c).unwrap_or(usize::MAX).min(fields.len()),
+            };
+            let start = end.saturating_sub(options.count);
+            (&fields[start..end], start)
+        } else {
+            (&fields[..], 0)
+        };
+        let found: Vec<_> = page
+            .iter()
             .filter(|(field, _)| options.matches(field))
             .collect();
-        out.extend_from_slice(b"*2\r\n$1\r\n0\r\n");
+        out.extend_from_slice(b"*2\r\n");
+        resp::write_bulk(out, itoa::Buffer::new().format(next).as_bytes());
         let per_field = if options.values { 2 } else { 1 };
         resp::write_array_header(out, found.len() * per_field);
         for (field, value) in found {

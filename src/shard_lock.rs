@@ -55,6 +55,11 @@ impl<T> ShardLock<T> {
         ShardGuard::Locked(self.mutex.lock())
     }
 
+    /// Whether this thread holds it for a transaction (see [`hold_all`]).
+    pub(crate) fn held_here(&self) -> bool {
+        EXCLUSIVE.load(Relaxed) != 0 && self.owner.load(Relaxed) == this_thread()
+    }
+
     pub(crate) fn try_lock(&self) -> Option<ShardGuard<'_, T>> {
         self.mutex.try_lock().map(ShardGuard::Locked)
     }
