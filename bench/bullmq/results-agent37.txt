@@ -33,3 +33,29 @@ round 3 valkey           add   35488 jobs/s   16.5 us/job | process   26784 jobs
 round 3 dragonfly        add   33384 jobs/s   17.6 us/job | process   25229 jobs/s   39.1 us/job, server 0.99 cores
 round 3 tantalum         add   37650 jobs/s   14.9 us/job | process   27387 jobs/s   36.0 us/job, server 0.99 cores
 round 3 tantalum-uring   add   35089 jobs/s   16.8 us/job | process   22859 jobs/s   42.9 us/job, server 0.98 cores
+
+# After removing LREM matches in place (no list rebuild, no SipHash set) and giving Lua the server's allocator
+# (mimalloc) instead of libc's malloc, same VM, 2026-11-04. 0.17.0 as tantalum-b; medians of 3 rounds:
+#                         add jobs/s  us/job   process jobs/s  us/job
+#   tantalum (epoll)          38,977    13.0           34,110    27.9
+#   tantalum-b (0.17.0)       35,636    15.6           25,569    38.4
+#   tantalum (io_uring)       35,837    15.3           29,631    32.6
+#   tantalum-b (io_uring)     31,682    18.4           22,017    44.4
+#   redis                     35,629    15.3           27,939    35.2
+# A second run (4 rounds, with a same-thread wake change for io_uring that made no difference and was dropped):
+#   tantalum epoll 35.4k/s 27.2 us; io_uring 30.7k/s 31.6 us; redis 30.0k/s 32.5 us.
+# run2 round 1 tantalum         add   37970 jobs/s   13.3 us/job | process   34110 jobs/s   27.9 us/job, server 0.95 cores
+# run2 round 1 tantalum-b       add   33980 jobs/s   16.7 us/job | process   25569 jobs/s   38.4 us/job, server 0.98 cores
+# run2 round 1 tantalum-uring   add   34443 jobs/s   15.8 us/job | process   24596 jobs/s   39.8 us/job, server 0.98 cores
+# run2 round 1 tantalum-b-uring add   31652 jobs/s   18.4 us/job | process   22017 jobs/s   44.4 us/job, server 0.98 cores
+# run2 round 1 redis            add   33654 jobs/s   16.6 us/job | process   27939 jobs/s   35.2 us/job, server 0.98 cores
+# run2 round 2 tantalum-b       add   35636 jobs/s   15.6 us/job | process   24981 jobs/s   39.5 us/job, server 0.99 cores
+# run2 round 2 tantalum-uring   add   35837 jobs/s   15.3 us/job | process   31527 jobs/s   30.7 us/job, server 0.97 cores
+# run2 round 2 tantalum-b-uring add   35097 jobs/s   16.5 us/job | process   23188 jobs/s   42.4 us/job, server 0.98 cores
+# run2 round 2 redis            add   37593 jobs/s   15.0 us/job | process   30044 jobs/s   32.9 us/job, server 0.99 cores
+# run2 round 2 tantalum         add   41811 jobs/s   12.2 us/job | process   36002 jobs/s   26.7 us/job, server 0.96 cores
+# run2 round 3 tantalum-uring   add   38583 jobs/s   14.0 us/job | process   29631 jobs/s   32.6 us/job, server 0.97 cores
+# run2 round 3 tantalum-b-uring add   31682 jobs/s   19.3 us/job | process   19670 jobs/s   50.0 us/job, server 0.98 cores
+# run2 round 3 redis            add   35629 jobs/s   15.3 us/job | process   27008 jobs/s   35.9 us/job, server 0.97 cores
+# run2 round 3 tantalum         add   38977 jobs/s   13.0 us/job | process   30873 jobs/s   31.4 us/job, server 0.97 cores
+# run2 round 3 tantalum-b       add   36539 jobs/s   15.1 us/job | process   28448 jobs/s   34.4 us/job, server 0.98 cores

@@ -24,7 +24,9 @@ base=/tmp/tantalum-speed-base/$tree
 out=/tmp/tantalum-speed-results
 rm -rf "$out" && mkdir -p "$out"
 if [ ! -d "$base/src" ]; then
-  mkdir -p "$base" && git -C "$root" archive "$base_ref" Cargo.toml Cargo.lock src | tar -x -C "$base"
+  # build.rs and vendor/ (the C for Lua) where the base has them.
+  extra=$(git -C "$root" ls-tree --name-only "$base_ref" build.rs vendor)
+  mkdir -p "$base" && git -C "$root" archive "$base_ref" Cargo.toml Cargo.lock src $extra | tar -x -C "$base"
 fi
 if [ ! -f "$base/src/bin/bench.rs" ]; then
   echo "$base_ref has no benchmark (src/bin/bench.rs): compare against a later commit" >&2
