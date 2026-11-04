@@ -1,0 +1,35 @@
+# BullMQ 6.5.4 on each server, Agent37 VM (Xeon E-2388G, 4 vCPU, Linux 7.0), 2026-11-04. bench/bullmq/run.sh:
+# server alone on CPU 0, node 20 clients on CPUs 1-3; 100,000 jobs added with addBulk (500 per call), then
+# processed by 3 worker processes x concurrency 100 doing nothing; jobs removed on completion. Server CPU from
+# /proc (each server used ~0.98 of its core in both phases, so these are server limits). 3 rotated rounds.
+# Tantalum 0.17.0 (1 thread), Redis 8.10.3, Valkey 9.1.3, Dragonfly 2.0.2 (1 proactor thread,
+# --default_lua_flags=allow-undeclared-keys).
+#
+# Medians:                add jobs/s  us/job   process jobs/s  us/job
+#   tantalum (epoll)          37,650    14.9           26,704    36.6
+#   tantalum (io_uring)       34,985    16.8           22,987    42.9
+#   redis                     37,805    14.8           30,581    32.1
+#   valkey                    35,346    16.5           26,855    36.8
+#   dragonfly                 33,239    17.6           24,827    39.4
+#
+# Profile of Tantalum (epoll) while processing (perf, cpu-clock): 78% in tantalum, 17% libc, 4% kernel.
+# Lua's own work (luaS_newlstr 6.4%, luaV_execute 5.1%, GC sweeplist/propagatemark/luaF_findupval ~6%,
+# libc malloc/realloc/free for Lua); LREM rebuilding the list with a std HashSet<usize> (SipHash 6.2%, list
+# encode/iterate/push_back ~5%); holding every shard per script (unlock 4.0%, lock inside eval::run ~3.3%).
+# 7.0.0-38-generic, 4 CPUs, Intel(R) Xeon(R) E-2388G CPU @ 3.20GHz
+# BullMQ 6.5.4, node v20.19.2; 100000 jobs, 3 workers x 100; server on CPU 0, clients on 1-3
+round 1 tantalum         add   38105 jobs/s   14.6 us/job | process   26673 jobs/s   36.6 us/job, server 0.98 cores
+round 1 tantalum-uring   add   34985 jobs/s   16.7 us/job | process   23627 jobs/s   41.6 us/job, server 0.98 cores
+round 1 redis            add   37805 jobs/s   14.5 us/job | process   30136 jobs/s   32.5 us/job, server 0.98 cores
+round 1 valkey           add   35316 jobs/s   16.6 us/job | process   26886 jobs/s   36.6 us/job, server 0.98 cores
+round 1 dragonfly        add   33239 jobs/s   17.6 us/job | process   24827 jobs/s   39.4 us/job, server 0.98 cores
+round 2 tantalum-uring   add   34602 jobs/s   17.2 us/job | process   22987 jobs/s   42.9 us/job, server 0.99 cores
+round 2 redis            add   37764 jobs/s   14.9 us/job | process   30847 jobs/s   31.7 us/job, server 0.98 cores
+round 2 valkey           add   35346 jobs/s   16.4 us/job | process   26855 jobs/s   36.8 us/job, server 0.99 cores
+round 2 dragonfly        add   32993 jobs/s   17.9 us/job | process   24804 jobs/s   39.7 us/job, server 0.98 cores
+round 2 tantalum         add   37567 jobs/s   15.0 us/job | process   26704 jobs/s   36.6 us/job, server 0.98 cores
+round 3 redis            add   37871 jobs/s   14.8 us/job | process   30581 jobs/s   32.1 us/job, server 0.98 cores
+round 3 valkey           add   35488 jobs/s   16.5 us/job | process   26784 jobs/s   36.8 us/job, server 0.99 cores
+round 3 dragonfly        add   33384 jobs/s   17.6 us/job | process   25229 jobs/s   39.1 us/job, server 0.99 cores
+round 3 tantalum         add   37650 jobs/s   14.9 us/job | process   27387 jobs/s   36.0 us/job, server 0.99 cores
+round 3 tantalum-uring   add   35089 jobs/s   16.8 us/job | process   22859 jobs/s   42.9 us/job, server 0.98 cores

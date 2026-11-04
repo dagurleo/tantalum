@@ -1,0 +1,9 @@
+{
+  "name": "tantalum-bullmq-bench",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "bullmq": "6.5.4",
+    "ioredis": "5.11.1"
+  }
+}
