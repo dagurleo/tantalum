@@ -74,7 +74,10 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST` | |
 | `INCR`, `DECR`, `INCRBY`, `DECRBY` | 64-bit, keep the key's TTL |
 | `INCRBYFLOAT key n` | In C's `long double`, as Redis, and logged as what it came to |
-| `STRLEN`, `APPEND key value`, `GETRANGE key start end`, `SUBSTR`, `SETRANGE key offset value`, `GETSET key value` | A big string is one allocation: `APPEND` and `SETRANGE` copy it |
+| `STRLEN`, `APPEND key value`, `GETRANGE key start end`, `SUBSTR`, `SETRANGE key offset value`, `GETSET key value` | `APPEND` and `SETRANGE` change a big string in place, and it grows with room to spare, as in Redis |
+| `SETBIT key offset value`, `GETBIT key offset`, `BITCOUNT key [start end [BYTE\|BIT]]`, `BITPOS key bit [start [end [BYTE\|BIT]]]` | On strings. A `SETBIT` in a big bitmap changes it in place, without copying it |
+| `BITOP AND\|OR\|XOR\|NOT destkey key [key ...]` | Atomic |
+| `BITFIELD key [GET type offset\|SET type offset value\|INCRBY type offset n\|OVERFLOW WRAP\|SAT\|FAIL ...]`, `BITFIELD_RO` | |
 | `MSETNX key value [key value ...]` | Atomic: all or none, with nothing else running meanwhile |
 | `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN]` | |
 | `COPY source destination [DB 0] [REPLACE]`, `TOUCH key [key ...]`, `RANDOMKEY` | `COPY` is atomic, TTL included; there is one database. `RANDOMKEY` is about uniform |
@@ -1028,11 +1031,8 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- Replication, ACL users, `DUMP`/`RESTORE`, bitmaps (`SETBIT` and the like),
-  HyperLogLog, geo commands, and `WAITAOF`.
-- **`APPEND` and `SETRANGE` copy the string**, which is one allocation: O(n) per
-  call, where Redis grows it in place. Fine at the sizes caches keep; appending
-  a little at a time to a string of many MB is slow.
+- Replication, ACL users, `DUMP`/`RESTORE`, HyperLogLog, geo commands, and
+  `WAITAOF`.
 - **`OBJECT ENCODING` doesn't know a value's past**: a short string `APPEND` made
   is `raw` in Redis and `embstr` here, and a collection that grew past a limit
   and shrank back stays big in Redis.

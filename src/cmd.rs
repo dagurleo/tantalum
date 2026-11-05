@@ -1,5 +1,6 @@
 //! Command dispatch. Replies match Redis 7 byte for byte where practical.
 
+mod bit;
 mod eval;
 mod hash;
 mod keys;
@@ -149,6 +150,13 @@ static COMMANDS: &[Command] = &[
     Command { name: "setex", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: setex },
     Command { name: "psetex", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: psetex },
     Command { name: "setnx", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: setnx },
+    Command { name: "setbit", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: bit::setbit },
+    Command { name: "getbit", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: bit::getbit },
+    Command { name: "bitcount", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: bit::bitcount },
+    Command { name: "bitpos", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: bit::bitpos },
+    Command { name: "bitop", arity: -4, flags: &["write", "denyoom"], keys: (2, -1, 1), run: bit::bitop },
+    Command { name: "bitfield", arity: -2, flags: &["write", "denyoom"], keys: ONE_KEY, run: bit::bitfield },
+    Command { name: "bitfield_ro", arity: -2, flags: &["readonly", "fast"], keys: ONE_KEY, run: bit::bitfield_ro },
     Command { name: "strlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: string::strlen },
     Command { name: "append", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: string::append },
     Command { name: "getrange", arity: 4, flags: &["readonly"], keys: ONE_KEY, run: string::getrange },

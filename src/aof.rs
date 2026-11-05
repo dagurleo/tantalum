@@ -699,6 +699,16 @@ pub(crate) fn record(name: &str, args: &Args<'_>, reply: &[u8]) {
     if name == "sort" && reply.first() != Some(&b':') {
         return;
     }
+    // Nor does a `BITFIELD` of only `GET`s.
+    if name == "bitfield" {
+        let writes = |i: usize| {
+            let word = args.get(i);
+            word.eq_ignore_ascii_case(b"SET") || word.eq_ignore_ascii_case(b"INCRBY")
+        };
+        if !(2..args.len()).any(writes) {
+            return;
+        }
+    }
     if matches!(name, "incrbyfloat" | "hincrbyfloat") {
         // What it came to, so a machine that rounds differently gets the same.
         if let Some(Popped::One(value)) = resp_value(&mut { reply }) {

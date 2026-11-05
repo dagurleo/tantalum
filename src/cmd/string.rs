@@ -1,6 +1,5 @@
-//! String commands beyond `GET` and `SET`, and `LCS`. A big string is one
-//! allocation, so `APPEND` and `SETRANGE` copy it to change it (see the README's
-//! "Not there yet").
+//! String commands beyond `GET` and `SET`, and `LCS`. `APPEND` and `SETRANGE`
+//! change a big string where it lies when they can ([`Store::edit_string`]).
 
 use std::os::raw::{c_char, c_int};
 
@@ -114,6 +113,19 @@ pub(super) fn append(
 ) -> Reply {
     let store = &*ctx.store;
     let value = args.get(2);
+    let edited = store.edit_string(
+        args.key(store),
+        now,
+        |old| Some(old + value.len()).filter(|&len| len <= MAX_STRING),
+        |bytes, old| {
+            bytes[old..].copy_from_slice(value);
+            (bytes.len() as i64, true)
+        },
+    );
+    if let Some(len) = edited {
+        resp::write_integer(out, len);
+        return Reply::Written;
+    }
     let result = store.update_key(args.key(store), now, |current| match current {
         None => (
             Update::Replace(Kind::String, value.to_vec()),
@@ -216,6 +228,22 @@ pub(super) fn setrange(
     let too_long = offset
         .checked_add(value.len())
         .is_none_or(|total| total > MAX_STRING);
+    if !value.is_empty() && !too_long {
+        let end = offset + value.len();
+        let edited = store.edit_string(
+            args.key(store),
+            now,
+            |old| Some(old.max(end)),
+            |bytes, _| {
+                bytes[offset..end].copy_from_slice(value);
+                (bytes.len() as i64, true)
+            },
+        );
+        if let Some(len) = edited {
+            resp::write_integer(out, len);
+            return Reply::Written;
+        }
+    }
     let result = store.update_key(args.key(store), now, |current| {
         let old = match &current {
             None => &[][..],

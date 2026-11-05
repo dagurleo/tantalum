@@ -245,7 +245,7 @@ fn step(
     let v = n(rng, 1000);
     let ms = (1 + rng.below(60)).to_string();
     let at = (ctx.store.now() + rng.below(80)).to_string();
-    let commands: Vec<Vec<String>> = match rng.below(49) {
+    let commands: Vec<Vec<String>> = match rng.below(53) {
         0 => vec![vec!["SET".into(), s, v]],
         1 => vec![vec!["SET".into(), s, v, "PX".into(), ms]],
         2 => vec![vec!["SET".into(), s, v, "PXAT".into(), at]],
@@ -315,6 +315,17 @@ fn step(
             x,
             ms,
         ]],
+        49 => vec![vec!["SETBIT".into(), s, n(rng, 200), n(rng, 2)]],
+        50 => vec![vec![
+            "BITFIELD".into(),
+            s,
+            "INCRBY".into(),
+            "u8".into(),
+            "#1".into(),
+            n(rng, 300),
+        ]],
+        51 => vec![vec!["BITOP".into(), "XOR".into(), s, s2.clone(), s2]],
+        52 => vec![vec!["BITOP".into(), "NOT".into(), s, s2]],
         40 => vec![vec!["APPEND".into(), s, v]],
         41 => vec![vec!["SETRANGE".into(), s, n(rng, 8), v]],
         42 => vec![vec!["GETSET".into(), s, v]],

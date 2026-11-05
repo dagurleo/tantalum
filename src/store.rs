@@ -106,6 +106,10 @@ const EVICT_TRIES: usize = 64;
 const PREFETCH_AHEAD: usize = 8;
 const PREFETCH_ENTRY_AHEAD: usize = 4;
 
+/// The most room left for a big string that has grown to grow further, as Redis
+/// leaves up to 1 MB (under that, as much as it holds).
+const GROWING_STRING_ROOM: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Condition {
     Always,
@@ -2087,6 +2091,53 @@ impl Store {
         }
     }
 
+    /// Changes a big string where it lies, if it can: the key holds one, nothing
+    /// else holds a reference to it now, and it has room for the length
+    /// `new_len` gives (from its length, or `None` not to try). `edit` gets its
+    /// bytes, new ones zero, and its old length, and returns its result and
+    /// whether the string changed. Otherwise this does nothing and returns
+    /// `None`, for the caller's [`Store::update_key`]: small strings are cheap
+    /// to write again, and a reader holding a reference keeps what it has.
+    pub(crate) fn edit_string<R>(
+        &self,
+        key: Key<'_>,
+        now: Millis,
+        new_len: impl FnOnce(usize) -> Option<usize>,
+        edit: impl FnOnce(&mut [u8], usize) -> (R, bool),
+    ) -> Option<R> {
+        let (hash, index) = self.locate(key.hash);
+        let key = key.bytes;
+        let shard = &self.shards[index];
+        let mut garbage = Vec::new();
+        let mut guard = shard.inner.lock();
+        let inner = &mut *guard;
+        let (existing, expired) = inner.lookup_live(hash, key, now, &mut garbage);
+        let result = existing.and_then(|(loc, header)| {
+            let Body::External(i) = header.body else {
+                return None;
+            };
+            if header.kind() != Kind::String {
+                return None;
+            }
+            let value = inner.externals[i as usize].as_mut().expect("live external");
+            let old = value.value().len();
+            let bytes = value.edit(new_len(old)?)?;
+            let (result, changed) = edit(bytes, old);
+            inner.touch(loc, &header);
+            if changed {
+                inner.mem.writes += 1;
+                inner.changed(key, false);
+            }
+            Some(result)
+        });
+        if expired {
+            self.sync_usage(shard, inner, false);
+        }
+        drop(guard);
+        drop(garbage); // frees values outside the lock
+        result
+    }
+
     /// Applies `update` to the key's live entry (`existing`) under its
     /// shard's lock. Returns whether memory changed. A write that needs
     /// room under `maxmemory` returns [`Retry::NeedRoom`] instead, if
@@ -2219,8 +2270,22 @@ impl Store {
             None => (None, NO_EXPIRY, 0),
         };
         // Only a huge key makes this external.
-        let external =
-            (key.len() + value.len() + 20 > INLINE_MAX).then(|| KeyValue::new(key, value));
+        let external = (key.len() + value.len() + 20 > INLINE_MAX).then(|| {
+            // A big string growing, as `APPEND` and `SETBIT` do, is likely to go
+            // on: with room for it, `edit_string` can do that without copying it.
+            let grown = existing.as_ref().is_some_and(|(loc, header)| {
+                kind == Kind::String
+                    && header.kind() == Kind::String
+                    && matches!(header.body, Body::External(_))
+                    && inner.value_ref(*loc, header).as_bytes().len() < value.len()
+            });
+            let room = if grown {
+                value.len().min(GROWING_STRING_ROOM)
+            } else {
+                0
+            };
+            KeyValue::with_capacity(key, value, value.len() + room)
+        });
         let needed = match &external {
             Some(kv) => {
                 kv.allocation_size()
