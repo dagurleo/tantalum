@@ -61,6 +61,12 @@ const OUTBOX_BYTES: usize = 256 * 1024;
 /// From how many replies held the flusher looks at the reactor before sending.
 /// A look costs a syscall, not worth it for a client or two.
 const LOOK_FROM: usize = 8;
+/// Looks at most, a further one only if the last found more.
+const LOOKS: usize = 2;
+/// The longest batch whose replies are held: 16 commands gain 10-15%, each
+/// sparing the client a wake, where 32 gain little and wait longer (a p99 worse
+/// than Redis').
+const HELD_BATCH: usize = 16;
 /// The read buffer an idle io_uring connection keeps posted: a read must
 /// have its buffer in flight before data arrives. It grows as reads fill it.
 const URING_READ_BUFFER: usize = 2 * 1024;
@@ -927,7 +933,7 @@ async fn yield_to_others() {
     .await
 }
 
-/// One-command replies on this thread (`--io per-thread`), held until its
+/// Short batches' replies on this thread (`--io per-thread`), held until its
 /// other ready connections have run, then sent together in a tight loop by
 /// the thread's flusher task. A client thread that's busy when its next reply
 /// comes needn't be woken, and a wake costs more than the send. With a task
@@ -1040,7 +1046,15 @@ async fn run_flusher() {
         // look that started this one, and would wait out all of it (p99 at
         // twice the median; with this, just above it).
         if held >= LOOK_FROM {
-            tokio::task::yield_now().await;
+            let mut before = held;
+            for _ in 0..LOOKS {
+                tokio::task::yield_now().await;
+                let now = OUTBOX.with_borrow(|outbox| outbox.held.len());
+                if now == before {
+                    break;
+                }
+                before = now;
+            }
         }
         OUTBOX.with_borrow_mut(Outbox::flush);
     }
@@ -1199,13 +1213,11 @@ async fn serve_stream(
     let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
     let mut slot = OutboxSlot::new(session.socket);
-    // On a thread of its own (`--io per-thread`), a connection that ran one
-    // command sends its reply after the thread's other ready connections have
-    // read and run theirs, much as Redis sends replies just before it waits
-    // for more. Sent together, they wake each client fewer times: one wakeup
-    // per reply cost the kernel more than reading and running the request.
-    // A pipelined batch already sends many replies per wakeup, and deferring
-    // it measured slower at 4-8 threads.
+    // On a thread of its own (`--io per-thread`), a connection holds its reply
+    // until the thread's other ready connections have read and run theirs,
+    // much as Redis sends replies just before it waits for more. Sent together,
+    // they wake each client fewer times: one wakeup per reply cost the kernel
+    // more than reading and running the request. See `Outbox`.
     let defer_replies = tokio::runtime::Handle::current().runtime_flavor()
         == tokio::runtime::RuntimeFlavor::CurrentThread;
 
@@ -1271,7 +1283,7 @@ async fn serve_stream(
         // One clock read per batch, like Redis' cached time per event loop tick.
         let mut now = store.now();
         let mut pos = 0;
-        let mut ran = 0;
+        let mut ran = 0usize;
         let mut close = false;
         // Whether a command blocked, during which more may have been read.
         let mut blocked_meanwhile = false;
@@ -1341,7 +1353,7 @@ async fn serve_stream(
         }
         ctx.publish(&mut session);
         rbuf.drain(..pos);
-        if defer_replies && ran == 1 && !wbuf.is_empty() {
+        if defer_replies && !wbuf.is_empty() && ran <= HELD_BATCH {
             // (A connection closing waits to see its reply out.)
             if !close
                 && session.socket >= 0
@@ -1349,7 +1361,7 @@ async fn serve_stream(
                 && slot.hold(&wbuf).await
             {
                 wbuf.clear();
-            } else {
+            } else if ran == 1 {
                 yield_to_others().await;
             }
         }

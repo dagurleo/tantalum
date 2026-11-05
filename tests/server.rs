@@ -1525,10 +1525,13 @@ fn held_replies_go_to_their_own_connections() {
                 for round in 0..ROUNDS {
                     // Together, so the server finds many ready at once.
                     barrier.wait();
-                    // Of different lengths, so a mix-up can't go unnoticed.
+                    // Of different lengths, so a mix-up can't go unnoticed,
+                    // and some in batches, whose replies are held too.
                     let message = format!("{client}:{round}:{}", "y".repeat(client));
-                    stream.write_all(&request(&["ECHO", &message])).unwrap();
-                    let expected = format!("${}\r\n{message}\r\n", message.len());
+                    let one = request(&["ECHO", &message]);
+                    let batch = 1 + (client + round) % 4;
+                    stream.write_all(&one.repeat(batch)).unwrap();
+                    let expected = format!("${}\r\n{message}\r\n", message.len()).repeat(batch);
                     let mut reply = vec![0; expected.len()];
                     stream.read_exact(&mut reply).unwrap();
                     assert_eq!(String::from_utf8_lossy(&reply), expected);
@@ -1575,4 +1578,24 @@ fn a_client_gone_before_its_reply_disturbs_nobody() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// A batch's replies are held, and the rest of a command split across reads
+/// comes later: its reply must follow theirs.
+#[test]
+fn a_command_split_across_reads_is_answered_in_order() {
+    use std::io::{Read, Write};
+    let mut stream = blocking_connection(start_per_thread());
+    let third = request(&["ECHO", "c"]);
+    let (start, rest) = third.split_at(5);
+    let mut first = [request(&["ECHO", "a"]), request(&["ECHO", "b"])].concat();
+    first.extend_from_slice(start);
+    stream.write_all(&first).unwrap();
+    let mut reply = [0; 14];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"$1\r\na\r\n$1\r\nb\r\n");
+    stream.write_all(rest).unwrap();
+    let mut reply = [0; 7];
+    stream.read_exact(&mut reply).unwrap();
+    assert_eq!(&reply, b"$1\r\nc\r\n");
 }
