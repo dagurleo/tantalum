@@ -150,15 +150,30 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   on every request. Without pipelining, where each request is tiny work between two
   syscalls, that overhead decided the race: per-thread was 19% faster and
   overtook memcached. The trade-off: a few very busy connections can't be
-  rebalanced across threads. A connection that ran a single command lets the
-  thread's other ready connections read and run theirs before it sends its
-  reply, so the replies go out together, as Redis sends them just before it
-  waits for more. Each reply had cost a wakeup of its client, which took the
-  kernel more time than the request itself: batching them gained 6.6% at 1
-  thread and 4.9% at 2 (EC2), and made the epoll loop the fastest server
-  there. At 8 threads (30 clients each) it gained nothing and p99 rose from
-  0.36 to 0.40 ms. Pipelined batches send at once: they already carry many
-  replies, and deferring them measured 0.7–2% slower at 4–8 threads.
+  rebalanced across threads. A connection that ran a single command doesn't
+  send its reply: it copies it to the thread's outbox and goes back to waiting,
+  and the thread's flusher task, once the other ready connections have run,
+  sends what's there in one tight loop, as Redis sends replies just before it
+  waits for more. Waking a client took the kernel more time than the request
+  itself, and four things keep clients awake or the batch whole. The reactor is
+  looked at only when the thread runs out of work (tokio's default was every
+  61 task polls, about 30 connections of the hundreds that were ready). No task
+  switch comes between sends, which had let client threads go back to sleep
+  between replies. Replies go in socket order: a client's connections were
+  mostly accepted together, so its replies come in one run, where in arrival
+  order they alternated with those of its other threads. That took wakes per
+  request from 0.22 to 0.017 (Redis: 0.08, io_uring: 0.03). And before a batch
+  of 8 or more goes, the flusher looks at the reactor once more, so what came
+  in meanwhile joins it: the clients served last last time answer just too late
+  for the look that started a cycle, and would wait all of it out (p99 at twice
+  the median; with the look, just above it, and every connection is served
+  once per cycle wherever it comes in the order). The buffers a connection
+  used go straight to the next one, still in the CPU's cache, instead of being
+  freed and allocated per request. Paired against 0.19.0, on EC2: +11–13% at 1
+  to 4 threads with p50 and p99 both down about 10%; at 8 threads (30 clients
+  each) +6–7% with p50 down 5%, but p99 up from 0.38–0.43 to 0.49–0.52 ms.
+  Pipelined batches send at once: they already carry many replies, and
+  deferring them measured 0.7–2% slower at 4–8 threads.
 - **io_uring** (`--io uring`, the default where the kernel and container
   allow it): per-thread loops on [monoio](https://github.com/bytedance/monoio).
   On a 32-core EPYC it beat the epoll loop at every thread count (+17–25%
@@ -415,8 +430,8 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
     without closing don't hold a slot forever.
   - Idle connections hold almost no buffer memory. On epoll (per-thread and
     shared), a connection waits for data before taking a read buffer and hands
-    both buffers back once it has nothing left to process; mimalloc's
-    per-thread caches make that cheap. io_uring must post a read buffer before
+    both buffers back once it has nothing left to process, to a few its thread
+    keeps for the next connection. io_uring must post a read buffer before
     data arrives, so an idle connection keeps 2 KB, grown as reads fill it.
     10,000 idle connections on Linux: 14 MB on epoll and 43 MB on io_uring,
     against 92 and 101 MB before (RSS; macOS showed 166 MB against 11 MB for
@@ -732,6 +747,52 @@ Redis 104, Dragonfly 123, memcached 131, KeyDB 136, Garnet 297.
 - Garnet and KeyDB do poorly with one core and 240 connections; they're built
   to spread over many.
 
+### Replies sent together on epoll (AWS EC2, November 2026)
+
+The same machine and setup as above, with 0.19.1 (the outbox in the per-thread
+design note), SET only and 1:10 SET:GET. Total ops/s, then p99 in ms. Medians
+of 5 s runs: Tantalum's 3 paired rounds, Redis' and Valkey's 2 rounds, each
+server running alone, because their I/O threads spin on for some time after a
+test and slow whatever runs next (raw output:
+`bench/aws/results-outbox.txt`):
+
+| No pipelining, SET | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| **Tantalum 0.19.1, io_uring** | **112k**, 2.37 | **225k**, 1.32 | **452k**, 0.68 | **917k**, 0.38 |
+| **Tantalum 0.19.1, epoll** | **106k**, 2.53 | **210k**, 1.31 | **420k**, 0.68 | **829k**, 0.52 |
+| Tantalum 0.19.0, epoll | 94k, 2.83 | 186k, 1.48 | 377k, 0.75 | 778k, 0.43 |
+| Valkey 9.1.3 | 95k, 2.77 | 105k, 2.46 | 300k, 1.65 | 677k, 0.77 |
+| Redis 8.10.3 | 95k, 2.69 | 97k, 4.74 | 289k, 1.42 | 684k, 0.52 |
+
+| No pipelining, 1:10 | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| **Tantalum 0.19.1, io_uring** | **119k**, 2.21 | **237k**, 1.21 | **479k**, 0.63 | **978k**, 0.35 |
+| **Tantalum 0.19.1, epoll** | **112k**, 2.35 | **220k**, 1.24 | **446k**, 0.62 | **889k**, 0.49 |
+| Tantalum 0.19.0, epoll | 100k, 2.67 | 197k, 1.39 | 399k, 0.68 | 826k, 0.38 |
+| Valkey 9.1.3 | 97k, 3.20 | 107k, 2.37 | 314k, 0.79 | 718k, 0.37 |
+| Redis 8.10.3 | 96k, 2.67 | 100k, 4.69 | 296k, 1.42 | 703k, 0.51 |
+
+| Pipeline 16, SET | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| **Tantalum 0.19.1, io_uring** | **983k**, 4.38 | **1.94M**, 2.32 | **3.51M**, 1.45 | **6.21M**, 0.89 |
+| Tantalum 0.19.1, epoll | 818k, 5.21 | 1.69M, 2.61 | 3.18M, 1.44 | 5.82M, 0.85 |
+| Valkey 9.1.3 | 915k, 8.26 | 1.30M, 3.08 | 2.38M, 1.72 | 2.17M, 1.91 |
+| Redis 8.10.3 | 853k, 8.89 | 1.00M, 4.67 | 1.51M, 2.84 | 1.47M, 2.90 |
+
+| Pipeline 16, 1:10 | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| **Tantalum 0.19.1, io_uring** | **1.37M**, 3.06 | **2.72M**, 1.71 | **5.34M**, 0.89 | **10.7M**, 0.54 |
+| Tantalum 0.19.1, epoll | 1.12M, 3.69 | 2.25M, 1.89 | 4.64M, 0.94 | 9.47M, 0.50 |
+| Valkey 9.1.3 | 1.02M, 7.46 | 1.32M, 3.02 | 3.12M, 1.51 | 2.79M, 1.50 |
+| Redis 8.10.3 | 942k, 8.02 | 1.19M, 4.50 | 2.55M, 1.71 | 2.58M, 1.73 |
+
+Against 0.19.0 pipelining gained 0.3–1.5%, and io_uring, unchanged, read −1.4%
+to +0.5%. On one 4-vCPU Xeon E-2388G core (the Agent37 VM, three client threads,
+before the flusher's look), one-command requests went from 3% behind Redis to
+13–17% ahead. Two things Redis or Valkey still win: pipelined SET on one epoll
+thread, and p99 at 8 epoll threads with the 1:10 mix (Valkey, 0.37 against 0.49
+ms). io_uring wins both.
+
 ### io_uring (Docker Desktop, November 2026)
 
 Railway blocks io_uring, so this ran in Docker Desktop on an Apple M1 Pro
@@ -887,6 +948,12 @@ hit rates share the seeding flaw described above.
   (where that wait now lands) was the top function at ~10%, then parsing
   (~10%), the lookup itself (~6%) and reply headers (~5%, since sped up).
   Prefetching across connections' batches could hide more.
+- **Pipelined SET on one epoll thread** trails Valkey by 11% and Redis by 4%
+  on EC2 (818k against 915k and 853k; io_uring: 983k). At 2 threads and up
+  Tantalum leads.
+- **p99 at 8 epoll threads** rose with replies sent together (0.38–0.43 to
+  0.49–0.52 ms, for 6–7% more throughput and a lower median). More looks at the
+  reactor before sending didn't help; io_uring is at 0.35–0.38 ms.
 - **Per-thread I/O can't rebalance**: connections are dealt out round-robin
   and stay put, so a few very busy clients can load one thread more than the
   others (`--io shared` is the fallback). Accepting is on one thread.

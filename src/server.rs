@@ -52,7 +52,15 @@ use crate::wake::Mailbox;
 /// Minimum free space in the read buffer before each read.
 const READ_RESERVE: usize = 16 * 1024;
 /// A reply buffer's first allocation.
-const WRITE_RESERVE: usize = 16 * 1024;
+const WRITE_RESERVE: usize = READ_RESERVE;
+/// Buffers a thread keeps for its connections (see `SPARE_BUFFERS`).
+const MAX_SPARE_BUFFERS: usize = 8;
+/// The biggest reply an `Outbox` holds, and the most bytes it holds at once.
+const OUTBOX_REPLY: usize = 4 * 1024;
+const OUTBOX_BYTES: usize = 256 * 1024;
+/// From how many replies held the flusher looks at the reactor before sending.
+/// A look costs a syscall, not worth it for a client or two.
+const LOOK_FROM: usize = 8;
 /// The read buffer an idle io_uring connection keeps posted: a read must
 /// have its buffer in flight before data arrives. It grows as reads fill it.
 const URING_READ_BUFFER: usize = 2 * 1024;
@@ -72,6 +80,12 @@ const MAX_CLIENTS_ERROR: &[u8] = b"-ERR max number of clients reached\r\n";
 const PANIC_ERROR: &[u8] = b"-ERR internal error, closing the connection\r\n";
 /// How long a TLS client may take to finish its handshake.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Task polls between looks at the reactor on a `--io per-thread` thread.
+/// Tokio's default, 61, is about 30 one-command requests (two polls each):
+/// the thread would serve 30 connections of the hundreds that are ready, and
+/// wake their clients for that, where Redis serves all that are ready. It
+/// looks anyway when it runs out of work.
+const EVENT_INTERVAL: u32 = 1024;
 
 /// Commands parsed ahead of running them. Run one at a time, each command of a
 /// pipelined batch waits on its own cache misses in turn (its buckets, then
@@ -226,6 +240,7 @@ pub fn serve_per_thread_with(
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Incoming>();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .event_interval(EVENT_INTERVAL)
             .build()?;
         let ctx = ctx.clone();
         std::thread::Builder::new()
@@ -912,6 +927,255 @@ async fn yield_to_others() {
     .await
 }
 
+/// One-command replies on this thread (`--io per-thread`), held until its
+/// other ready connections have run, then sent together in a tight loop by
+/// the thread's flusher task. A client thread that's busy when its next reply
+/// comes needn't be woken, and a wake costs more than the send. With a task
+/// switch between sends, replies came just far enough apart for client threads
+/// to go back to sleep; and in the order requests came, a client's replies
+/// alternated with those of its other threads. A client's connections were
+/// mostly accepted together, so in socket order its replies come in one run:
+/// 0.017 wakes per request against 0.22 (Redis: 0.08, io_uring: 0.03). The
+/// order favours nobody: with the flusher's look at the reactor, every
+/// connection is served once per cycle wherever it comes in it.
+struct Outbox {
+    /// The replies, back to back. Copied here, a reply leaves its connection's
+    /// buffers free for the next connection, still in the CPU's cache.
+    bytes: Vec<u8>,
+    held: Vec<Held>,
+    /// How many times it has been sent: a connection's reply is out once this
+    /// has moved on from when it was held.
+    flushes: u64,
+    /// What sockets didn't take, for their connections' normal, waiting send
+    /// (which reports errors too).
+    stalled: Vec<(std::os::fd::RawFd, Vec<u8>)>,
+    /// To tell connections that have something in `stalled`.
+    wakers: std::collections::BTreeMap<std::os::fd::RawFd, std::task::Waker>,
+    flusher_running: bool,
+    flusher: Option<std::task::Waker>,
+}
+
+struct Held {
+    socket: std::os::fd::RawFd,
+    start: u32,
+    len: u32,
+}
+
+impl Outbox {
+    /// Sends what's held.
+    fn flush(&mut self) {
+        let Self {
+            bytes,
+            held,
+            flushes,
+            stalled,
+            wakers,
+            ..
+        } = self;
+        held.sort_unstable_by_key(|held| held.socket);
+        for held in held.iter() {
+            let start = held.start as usize;
+            let reply = &bytes[start..start + held.len as usize];
+            let sent = send_now(held.socket, reply);
+            if sent < reply.len() {
+                stalled.push((held.socket, reply[sent..].to_vec()));
+                if let Some(waker) = wakers.get(&held.socket) {
+                    waker.wake_by_ref();
+                }
+            }
+        }
+        held.clear();
+        bytes.clear();
+        *flushes += 1;
+    }
+}
+
+thread_local! {
+    static OUTBOX: std::cell::RefCell<Outbox> = const {
+        std::cell::RefCell::new(Outbox {
+            bytes: Vec::new(),
+            held: Vec::new(),
+            flushes: 0,
+            stalled: Vec::new(),
+            wakers: std::collections::BTreeMap::new(),
+            flusher_running: false,
+            flusher: None,
+        })
+    };
+    /// Buffers connections have finished with, for the next one on this
+    /// thread: a connection holds none while idle, and taking one from here
+    /// costs far less than allocating it, and it's still in the CPU's cache.
+    static SPARE_BUFFERS: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The thread's task that sends what's in its [`Outbox`]. It's woken by the
+/// first reply held, so it runs after the connections that were ready then.
+async fn run_flusher() {
+    struct Stopped;
+    impl Drop for Stopped {
+        fn drop(&mut self) {
+            let _ = OUTBOX.try_with(|outbox| {
+                let mut outbox = outbox.borrow_mut();
+                outbox.flusher_running = false;
+                outbox.flusher = None;
+            });
+        }
+    }
+    let _stopped = Stopped;
+    loop {
+        let held = std::future::poll_fn(|cx| {
+            OUTBOX.with_borrow_mut(|outbox| {
+                if outbox.held.is_empty() {
+                    outbox.flusher = Some(cx.waker().clone());
+                    Poll::Pending
+                } else {
+                    Poll::Ready(outbox.held.len())
+                }
+            })
+        })
+        .await;
+        // Before a big batch goes, what has come in meanwhile joins it: the
+        // clients served last in the cycle before answer just too late for the
+        // look that started this one, and would wait out all of it (p99 at
+        // twice the median; with this, just above it).
+        if held >= LOOK_FROM {
+            tokio::task::yield_now().await;
+        }
+        OUTBOX.with_borrow_mut(Outbox::flush);
+    }
+}
+
+/// A connection's side of the [`Outbox`].
+struct OutboxSlot {
+    socket: std::os::fd::RawFd,
+    /// `flushes` when its reply was held, until the connection hears more.
+    held_at: Option<u64>,
+    registered: bool,
+}
+
+impl OutboxSlot {
+    fn new(socket: std::os::fd::RawFd) -> Self {
+        Self {
+            socket,
+            held_at: None,
+            registered: false,
+        }
+    }
+
+    /// Holds a copy of `reply`, unless it's big or the outbox is full.
+    async fn hold(&mut self, reply: &[u8]) -> bool {
+        if !self.registered {
+            let waker = std::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+            OUTBOX.with_borrow_mut(|outbox| outbox.wakers.insert(self.socket, waker));
+            self.registered = true;
+        }
+        let start_flusher = OUTBOX.with_borrow_mut(|outbox| {
+            if reply.len() > OUTBOX_REPLY || outbox.bytes.len() + reply.len() > OUTBOX_BYTES {
+                return None;
+            }
+            outbox.held.push(Held {
+                socket: self.socket,
+                start: outbox.bytes.len() as u32,
+                len: reply.len() as u32,
+            });
+            outbox.bytes.extend_from_slice(reply);
+            self.held_at = Some(outbox.flushes);
+            if let Some(flusher) = outbox.flusher.take() {
+                flusher.wake();
+            }
+            Some(!std::mem::replace(&mut outbox.flusher_running, true))
+        });
+        match start_flusher {
+            Some(start) => {
+                if start {
+                    tokio::spawn(run_flusher());
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether the socket didn't take all of the last reply.
+    fn stalled(&self) -> bool {
+        self.held_at.is_some()
+            && OUTBOX.with_borrow(|outbox| {
+                !outbox.stalled.is_empty()
+                    && outbox
+                        .stalled
+                        .iter()
+                        .any(|(socket, _)| *socket == self.socket)
+            })
+    }
+
+    /// For when the connection has more to do: sees its last reply out, if
+    /// it isn't yet. What the socket didn't take is returned, to send first.
+    fn settle(&mut self) -> Option<Vec<u8>> {
+        let held_at = self.held_at.take()?;
+        OUTBOX.with_borrow_mut(|outbox| {
+            if outbox.flushes == held_at {
+                outbox.flush();
+            }
+            if outbox.stalled.is_empty() {
+                return None;
+            }
+            let i = outbox
+                .stalled
+                .iter()
+                .position(|(socket, _)| *socket == self.socket)?;
+            Some(outbox.stalled.swap_remove(i).1)
+        })
+    }
+}
+
+impl Drop for OutboxSlot {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        // Its socket closes next: nothing can go to it after this.
+        OUTBOX.with_borrow_mut(|outbox| {
+            if self.held_at == Some(outbox.flushes) {
+                outbox.flush();
+            }
+            outbox.wakers.remove(&self.socket);
+            outbox.stalled.retain(|(socket, _)| *socket != self.socket);
+        });
+    }
+}
+
+/// A buffer of `READ_RESERVE` (or `WRITE_RESERVE`) bytes.
+fn take_buffer() -> Vec<u8> {
+    SPARE_BUFFERS
+        .with_borrow_mut(Vec::pop)
+        .unwrap_or_else(|| Vec::with_capacity(READ_RESERVE))
+}
+
+/// Leaves a connection's buffer for the next one, if it's the usual size.
+fn give_back(mut buf: Vec<u8>) {
+    if buf.capacity() == READ_RESERVE {
+        buf.clear();
+        SPARE_BUFFERS.with_borrow_mut(|spare| {
+            if spare.len() < MAX_SPARE_BUFFERS {
+                spare.push(buf);
+            }
+        });
+    }
+}
+
+/// Sends what of `reply` the socket takes without waiting.
+fn send_now(socket: std::os::fd::RawFd, reply: &[u8]) -> usize {
+    #[cfg(target_os = "linux")]
+    let flags = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+    #[cfg(not(target_os = "linux"))]
+    let flags = libc::MSG_DONTWAIT;
+    // SAFETY: `reply` is valid for its length, and the socket is open: its
+    // connection's `InOutbox` marks it gone before the socket closes.
+    let sent = unsafe { libc::send(socket, reply.as_ptr().cast(), reply.len(), flags) };
+    usize::try_from(sent).unwrap_or(0)
+}
+
 /// Writes `buf` and flushes: rustls may hold encrypted bytes until then (for
 /// plain TCP, flushing does nothing).
 async fn send(socket: &mut impl Stream, buf: &[u8]) -> io::Result<()> {
@@ -934,6 +1198,7 @@ async fn serve_stream(
     let mut rbuf: Vec<u8> = Vec::new();
     let mut wbuf: Vec<u8> = Vec::new();
     let mut batch = Batch::default();
+    let mut slot = OutboxSlot::new(session.socket);
     // On a thread of its own (`--io per-thread`), a connection that ran one
     // command sends its reply after the thread's other ready connections have
     // read and run theirs, much as Redis sends replies just before it waits
@@ -960,7 +1225,12 @@ async fn serve_stream(
         } else {
             if plain {
                 // Wait for data before taking a buffer to read it into.
-                let ready = std::future::poll_fn(|cx| socket.poll_read_ready(cx));
+                let ready = std::future::poll_fn(|cx| {
+                    if slot.stalled() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    socket.poll_read_ready(cx)
+                });
                 match ctx.settings.timeout {
                     None => ready.await?,
                     Some(timeout) => match tokio::time::timeout(timeout, ready).await {
@@ -968,8 +1238,14 @@ async fn serve_stream(
                         Err(_) => return Ok(()),
                     },
                 }
+                if let Some(rest) = slot.settle() {
+                    send(&mut socket, &rest).await?;
+                    continue;
+                }
             }
-            if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
+            if rbuf.capacity() == 0 {
+                rbuf = take_buffer();
+            } else if rbuf.capacity() - rbuf.len() < READ_RESERVE / 4 {
                 rbuf.reserve(READ_RESERVE);
             }
             client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
@@ -990,7 +1266,7 @@ async fn serve_stream(
             return Ok(());
         }
         if wbuf.capacity() == 0 {
-            wbuf.reserve(WRITE_RESERVE);
+            wbuf = take_buffer();
         }
         // One clock read per batch, like Redis' cached time per event loop tick.
         let mut now = store.now();
@@ -1066,7 +1342,16 @@ async fn serve_stream(
         ctx.publish(&mut session);
         rbuf.drain(..pos);
         if defer_replies && ran == 1 && !wbuf.is_empty() {
-            yield_to_others().await;
+            // (A connection closing waits to see its reply out.)
+            if !close
+                && session.socket >= 0
+                && session.subscriber().is_none()
+                && slot.hold(&wbuf).await
+            {
+                wbuf.clear();
+            } else {
+                yield_to_others().await;
+            }
         }
         // Messages that came meanwhile go with the replies.
         let subscriber = session.subscriber().cloned();
@@ -1091,8 +1376,8 @@ async fn serve_stream(
         }
         if rbuf.is_empty() {
             // Idle until the next request: hold no buffers.
-            rbuf = Vec::new();
-            wbuf = Vec::new();
+            give_back(std::mem::take(&mut rbuf));
+            give_back(std::mem::take(&mut wbuf));
             client.set_buffer_bytes(0);
         } else if wbuf.capacity() > SHRINK_ABOVE {
             wbuf = Vec::new();
