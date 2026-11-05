@@ -1452,3 +1452,127 @@ async fn snapshot_commands_when_snapshots_are_off() {
         "{info}"
     );
 }
+
+/// A blocking connection for the tests of held replies below, sending each
+/// request in a `write` of its own.
+fn blocking_connection(addr: SocketAddr) -> std::net::TcpStream {
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    stream
+}
+
+fn request(args: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n{arg}\r\n", arg.len()).as_bytes());
+    }
+    out
+}
+
+/// With `--io per-thread`, one-command replies are held and sent together. A
+/// socket that can't take one (the client stopped reading) must get the rest
+/// of it later, ahead of anything else.
+#[test]
+fn a_client_that_stops_reading_gets_every_reply_in_order() {
+    use std::io::{Read, Write};
+    const REQUESTS: usize = 8000;
+    // A reply just under the size that's held, far more of them than the
+    // socket buffers hold.
+    let padding = "x".repeat(3900);
+    let payload = |i: usize| format!("{i:08}{padding}");
+
+    let addr = start_per_thread();
+    let mut reader = blocking_connection(addr);
+    let mut writer = reader.try_clone().unwrap();
+    let sender = {
+        let padding = padding.clone();
+        std::thread::spawn(move || {
+            for i in 0..REQUESTS {
+                let payload = format!("{i:08}{padding}");
+                writer.write_all(&request(&["ECHO", &payload])).unwrap();
+                // The server catches up, so each is read alone.
+                std::thread::sleep(Duration::from_micros(20));
+            }
+        })
+    };
+    // Long enough for the socket buffers to fill.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut reply = vec![0; format!("$3908\r\n{}\r\n", payload(0)).len()];
+    for i in 0..REQUESTS {
+        reader.read_exact(&mut reply).unwrap();
+        let expected = format!("$3908\r\n{}\r\n", payload(i));
+        assert!(reply == expected.as_bytes(), "reply {i} is wrong");
+    }
+    sender.join().unwrap();
+}
+
+/// Connections' replies held at the same moment go to the right clients.
+#[test]
+fn held_replies_go_to_their_own_connections() {
+    use std::io::{Read, Write};
+    const CLIENTS: usize = 40;
+    const ROUNDS: usize = 300;
+    let addr = start_per_thread();
+    let barrier = Arc::new(std::sync::Barrier::new(CLIENTS));
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|client| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let mut stream = blocking_connection(addr);
+                for round in 0..ROUNDS {
+                    // Together, so the server finds many ready at once.
+                    barrier.wait();
+                    // Of different lengths, so a mix-up can't go unnoticed.
+                    let message = format!("{client}:{round}:{}", "y".repeat(client));
+                    stream.write_all(&request(&["ECHO", &message])).unwrap();
+                    let expected = format!("${}\r\n{message}\r\n", message.len());
+                    let mut reply = vec![0; expected.len()];
+                    stream.read_exact(&mut reply).unwrap();
+                    assert_eq!(String::from_utf8_lossy(&reply), expected);
+                }
+            })
+        })
+        .collect();
+    for client in clients {
+        client.join().unwrap();
+    }
+}
+
+/// A client that goes away with its reply held costs nobody else anything,
+/// and what it sent still runs, as with Redis.
+#[test]
+fn a_client_gone_before_its_reply_disturbs_nobody() {
+    use std::io::{Read, Write};
+    const CLIENTS: usize = 500;
+    let addr = start_per_thread();
+    let mut other = blocking_connection(addr);
+    let mut pong = [0; 7];
+    for _ in 0..CLIENTS {
+        let mut leaving = blocking_connection(addr);
+        leaving.write_all(&request(&["INCR", "n"])).unwrap();
+        drop(leaving);
+        other.write_all(&request(&["PING"])).unwrap();
+        other.read_exact(&mut pong).unwrap();
+        assert_eq!(&pong, b"+PONG\r\n");
+    }
+    // They ran, whichever way each connection's end and its request met.
+    let expected = format!("${}\r\n{CLIENTS}\r\n", CLIENTS.to_string().len());
+    let mut reply = vec![0; expected.len()];
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        other.write_all(&request(&["GET", "n"])).unwrap();
+        other.read_exact(&mut reply).unwrap();
+        if reply == expected.as_bytes() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
