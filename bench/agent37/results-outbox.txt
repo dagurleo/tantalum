@@ -175,3 +175,118 @@ round 4 fin        set-P16  ops   2640668 p50 1.463 p99 2.687 user 0.379 kernel 
 round 4 base       set-P16  ops   2637267 p50 1.375 p99 2.847 user 0.402 kernel 0.234
 round 4 fin        mix-P16  ops   3007737 p50 1.239 p99 2.015 user 0.222 kernel 0.179
 round 4 base       mix-P16  ops   3021153 p50 1.231 p99 2.255 user 0.227 kernel 0.179
+
+# 0.19.3 (pfin): reading and starting to load buckets across connections, against
+# 0.19.2 (fin). Then BullMQ: tantalum = 0.19.3, tantalum-b = 0.18.3.
+round 1 redis      set-P1   ops    212297 p50 0.943 p99 3.215 user 1.582 kernel 3.117
+round 1 valkey     set-P1   ops    237837 p50 0.895 p99 2.959 user 1.387 kernel 2.808
+round 1 fin        set-P1   ops    268635 p50 0.831 p99 1.767 user 1.154 kernel 2.561
+round 1 pfin       set-P1   ops    282938 p50 0.791 p99 1.487 user 1.046 kernel 2.473
+round 1 redis      mix-P1   ops    281055 p50 0.815 p99 1.631 user 1.067 kernel 2.490
+round 1 valkey     mix-P1   ops    272750 p50 0.807 p99 1.727 user 1.078 kernel 2.581
+round 1 fin        mix-P1   ops    333776 p50 0.695 p99 1.351 user 0.827 kernel 2.169
+round 1 pfin       mix-P1   ops    323095 p50 0.679 p99 1.191 user 0.805 kernel 2.290
+round 1 redis      set-P4   ops    691103 p50 1.231 p99 2.639 user 0.773 kernel 0.671
+round 1 valkey     set-P4   ops    621915 p50 1.367 p99 3.535 user 0.820 kernel 0.784
+round 1 fin        set-P4   ops    564555 p50 1.559 p99 4.127 user 0.783 kernel 0.985
+round 1 pfin       set-P4   ops    458865 p50 1.959 p99 4.223 user 0.993 kernel 1.181
+round 1 redis      set-P16  ops   1276533 p50 2.815 p99 6.815 user 0.575 kernel 0.207
+round 1 valkey     set-P16  ops   1380444 p50 2.767 p99 4.895 user 0.562 kernel 0.161
+round 1 fin        set-P16  ops   1385843 p50 2.751 p99 5.951 user 0.452 kernel 0.255
+round 1 pfin       set-P16  ops   1544803 p50 2.431 p99 4.895 user 0.397 kernel 0.250
+round 1 redis      mix-P16  ops   1651626 p50 2.319 p99 3.839 user 0.450 kernel 0.153
+round 1 valkey     mix-P16  ops   1469051 p50 2.559 p99 4.543 user 0.472 kernel 0.208
+round 1 fin        mix-P16  ops   2348593 p50 1.423 p99 5.343 user 0.236 kernel 0.178
+round 1 pfin       mix-P16  ops   2052982 p50 1.695 p99 7.455 user 0.274 kernel 0.208
+round 1 redis      set-P32  ops   1224825 p50 5.503 p99 22.911 user 0.658 kernel 0.155
+round 1 valkey     set-P32  ops   1189733 p50 5.951 p99 19.711 user 0.672 kernel 0.163
+round 1 fin        set-P32  ops   2015038 p50 3.695 p99 6.239 user 0.333 kernel 0.163
+round 1 pfin       set-P32  ops   2086824 p50 3.679 p99 4.095 user 0.329 kernel 0.151
+round 2 valkey     set-P1   ops    277675 p50 0.831 p99 1.663 user 1.109 kernel 2.492
+round 2 fin        set-P1   ops    308266 p50 0.767 p99 1.087 user 0.837 kernel 2.407
+round 2 pfin       set-P1   ops    312827 p50 0.719 p99 1.135 user 0.869 kernel 2.327
+round 2 redis      set-P1   ops    270097 p50 0.863 p99 1.727 user 1.118 kernel 2.584
+round 2 valkey     mix-P1   ops    286219 p50 0.807 p99 1.623 user 0.985 kernel 2.508
+round 2 fin        mix-P1   ops    330165 p50 0.703 p99 1.383 user 0.763 kernel 2.265
+round 2 pfin       mix-P1   ops    328793 p50 0.663 p99 1.087 user 0.730 kernel 2.311
+round 2 redis      mix-P1   ops    283278 p50 0.815 p99 1.639 user 0.995 kernel 2.534
+round 2 valkey     set-P4   ops    778756 p50 1.151 p99 2.303 user 0.683 kernel 0.598
+round 2 fin        set-P4   ops    979649 p50 0.975 p99 1.183 user 0.439 kernel 0.580
+round 2 pfin       set-P4   ops    985684 p50 0.943 p99 1.463 user 0.418 kernel 0.594
+round 2 redis      set-P4   ops    778727 p50 1.127 p99 2.271 user 0.683 kernel 0.596
+round 2 valkey     set-P16  ops   1418235 p50 2.767 p99 3.567 user 0.548 kernel 0.155
+round 2 fin        set-P16  ops   1896938 p50 1.927 p99 3.967 user 0.322 kernel 0.190
+round 2 pfin       set-P16  ops   1561376 p50 2.303 p99 5.055 user 0.400 kernel 0.238
+round 2 redis      set-P16  ops   1387852 p50 2.751 p99 4.831 user 0.537 kernel 0.183
+round 2 valkey     mix-P16  ops   1725842 p50 2.287 p99 3.023 user 0.430 kernel 0.148
+round 2 fin        mix-P16  ops   2923263 p50 1.199 p99 2.527 user 0.176 kernel 0.159
+round 2 pfin       mix-P16  ops   2925510 p50 1.223 p99 2.047 user 0.172 kernel 0.170
+round 2 redis      mix-P16  ops   1666716 p50 2.383 p99 3.631 user 0.421 kernel 0.179
+round 2 valkey     set-P32  ops   1592835 p50 4.831 p99 6.399 user 0.542 kernel 0.084
+round 2 fin        set-P32  ops   2073105 p50 3.695 p99 4.159 user 0.327 kernel 0.155
+round 2 pfin       set-P32  ops   2074330 p50 3.695 p99 4.223 user 0.331 kernel 0.151
+round 2 redis      set-P32  ops   1732361 p50 4.447 p99 5.695 user 0.492 kernel 0.084
+round 3 fin        set-P1   ops    315286 p50 0.751 p99 1.343 user 0.888 kernel 2.277
+round 3 pfin       set-P1   ops    310626 p50 0.719 p99 1.183 user 0.888 kernel 2.324
+round 3 redis      set-P1   ops    268242 p50 0.847 p99 1.703 user 1.193 kernel 2.527
+round 3 valkey     set-P1   ops    272287 p50 0.847 p99 1.695 user 1.182 kernel 2.490
+round 3 fin        mix-P1   ops    338279 p50 0.687 p99 1.327 user 0.751 kernel 2.205
+round 3 pfin       mix-P1   ops    322245 p50 0.679 p99 1.191 user 0.788 kernel 2.315
+round 3 redis      mix-P1   ops    279939 p50 0.815 p99 1.639 user 1.072 kernel 2.500
+round 3 valkey     mix-P1   ops    284717 p50 0.807 p99 1.623 user 1.025 kernel 2.486
+round 3 fin        set-P4   ops    973024 p50 0.975 p99 1.415 user 0.432 kernel 0.596
+round 3 pfin       set-P4   ops    990186 p50 0.935 p99 1.455 user 0.404 kernel 0.604
+round 3 redis      set-P4   ops    795625 p50 1.127 p99 2.255 user 0.676 kernel 0.578
+round 3 valkey     set-P4   ops    779287 p50 1.135 p99 2.271 user 0.693 kernel 0.588
+round 3 fin        set-P16  ops   1910737 p50 1.935 p99 3.823 user 0.328 kernel 0.186
+round 3 pfin       set-P16  ops   1948276 p50 1.967 p99 2.767 user 0.285 kernel 0.226
+round 3 redis      set-P16  ops   1524127 p50 2.559 p99 3.439 user 0.501 kernel 0.155
+round 3 valkey     set-P16  ops   1380047 p50 2.815 p99 4.191 user 0.564 kernel 0.159
+round 3 fin        mix-P16  ops   2906476 p50 1.199 p99 2.559 user 0.185 kernel 0.152
+round 3 pfin       mix-P16  ops   2998813 p50 1.199 p99 1.831 user 0.165 kernel 0.167
+round 3 redis      mix-P16  ops   1741938 p50 2.271 p99 2.975 user 0.426 kernel 0.147
+round 3 valkey     mix-P16  ops   1721189 p50 2.271 p99 3.647 user 0.417 kernel 0.164
+round 3 fin        set-P32  ops   2117703 p50 3.631 p99 4.047 user 0.327 kernel 0.145
+round 3 pfin       set-P32  ops   2088506 p50 3.647 p99 5.407 user 0.325 kernel 0.153
+round 3 redis      set-P32  ops   1764727 p50 4.383 p99 5.663 user 0.485 kernel 0.082
+round 3 valkey     set-P32  ops   1660159 p50 4.639 p99 6.079 user 0.524 kernel 0.079
+round 4 pfin       set-P1   ops    311705 p50 0.719 p99 1.151 user 0.898 kernel 2.297
+round 4 redis      set-P1   ops    269179 p50 0.863 p99 1.735 user 1.204 kernel 2.504
+round 4 valkey     set-P1   ops    267986 p50 0.855 p99 1.719 user 1.134 kernel 2.589
+round 4 fin        set-P1   ops    310671 p50 0.759 p99 1.367 user 0.908 kernel 2.304
+round 4 pfin       mix-P1   ops    333360 p50 0.655 p99 1.047 user 0.798 kernel 2.202
+round 4 redis      mix-P1   ops    281052 p50 0.831 p99 1.655 user 1.039 kernel 2.519
+round 4 valkey     mix-P1   ops    282421 p50 0.815 p99 1.639 user 1.041 kernel 2.492
+round 4 fin        mix-P1   ops    326199 p50 0.711 p99 1.375 user 0.760 kernel 2.299
+round 4 pfin       set-P4   ops    949642 p50 0.951 p99 1.543 user 0.427 kernel 0.623
+round 4 redis      set-P4   ops    796272 p50 1.127 p99 2.239 user 0.670 kernel 0.583
+round 4 valkey     set-P4   ops    766437 p50 1.159 p99 2.335 user 0.694 kernel 0.608
+round 4 fin        set-P4   ops    963952 p50 0.983 p99 1.791 user 0.467 kernel 0.570
+round 4 pfin       set-P16  ops   1900863 p50 1.991 p99 2.943 user 0.330 kernel 0.196
+round 4 redis      set-P16  ops   1492484 p50 2.623 p99 3.615 user 0.514 kernel 0.155
+round 4 valkey     set-P16  ops   1392166 p50 2.783 p99 4.031 user 0.553 kernel 0.164
+round 4 fin        set-P16  ops   1866945 p50 1.983 p99 3.983 user 0.331 kernel 0.194
+round 4 pfin       mix-P16  ops   2945063 p50 1.207 p99 1.879 user 0.186 kernel 0.153
+round 4 redis      mix-P16  ops   1682864 p50 2.319 p99 3.407 user 0.429 kernel 0.164
+round 4 valkey     mix-P16  ops   1681200 p50 2.319 p99 3.599 user 0.438 kernel 0.156
+round 4 fin        mix-P16  ops   2896869 p50 1.199 p99 2.511 user 0.182 kernel 0.156
+round 4 pfin       set-P32  ops   2084711 p50 3.631 p99 5.695 user 0.327 kernel 0.152
+round 4 redis      set-P32  ops   1758517 p50 4.383 p99 5.951 user 0.484 kernel 0.084
+round 4 valkey     set-P32  ops   1596900 p50 4.799 p99 6.783 user 0.540 kernel 0.086
+round 4 fin        set-P32  ops   2073134 p50 3.695 p99 4.159 user 0.328 kernel 0.153
+/prof/ab2-inside.sh: line 48:    43 Killed                  taskset -c "${SERVER_CPUS:-0}" bash -c "exec $c" > /tmp/$port.log 2>&1
+### BULLMQ
+# 7.0.0-38-generic, 4 CPUs, Intel(R) Xeon(R) E-2388G CPU @ 3.20GHz
+# BullMQ 6.5.4, node v20.19.2; 100000 jobs, 3 workers x 100; server on CPU 0, clients on 1-3
+round 1 tantalum         add   58398 jobs/s    5.2 us/job | process   71246 jobs/s   11.9 us/job, server 0.85 cores
+round 1 tantalum-b       add   59676 jobs/s    4.9 us/job | process   71352 jobs/s   12.0 us/job, server 0.86 cores
+round 1 tantalum-uring   add   57780 jobs/s    4.9 us/job | process   69344 jobs/s   12.2 us/job, server 0.85 cores
+round 1 redis            add   37628 jobs/s   14.8 us/job | process   31360 jobs/s   31.1 us/job, server 0.98 cores
+round 2 tantalum-b       add   59266 jobs/s    4.6 us/job | process   69074 jobs/s   12.1 us/job, server 0.84 cores
+round 2 tantalum-uring   add   59078 jobs/s    4.6 us/job | process   71020 jobs/s   11.9 us/job, server 0.85 cores
+round 2 redis            add   38425 jobs/s   14.3 us/job | process   31107 jobs/s   31.4 us/job, server 0.98 cores
+round 2 tantalum         add   60149 jobs/s    4.7 us/job | process   69932 jobs/s   12.1 us/job, server 0.85 cores
+round 3 tantalum-uring   add   59805 jobs/s    4.6 us/job | process   65084 jobs/s   12.8 us/job, server 0.83 cores
+round 3 redis            add   37735 jobs/s   15.0 us/job | process   28374 jobs/s   34.8 us/job, server 0.99 cores
+round 3 tantalum         add   58662 jobs/s    4.7 us/job | process   63948 jobs/s   13.4 us/job, server 0.86 cores
+round 3 tantalum-b       add   58748 jobs/s    4.7 us/job | process   71978 jobs/s   11.7 us/job, server 0.84 cores

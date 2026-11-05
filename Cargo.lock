@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "tantalum"
-version = "0.19.2"
+version = "0.19.3"
 dependencies = [
  "allocator-api2",
  "cc",
