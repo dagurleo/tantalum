@@ -201,6 +201,14 @@ const COMMANDS: &[&[u8]] = &[
     b"XDEL",
     b"XTRIM",
     b"XREAD",
+    b"XREADGROUP",
+    b"XGROUP",
+    b"XACK",
+    b"XPENDING",
+    b"XCLAIM",
+    b"XAUTOCLAIM",
+    b"XINFO",
+    b"XSETID",
     b"ZRANDMEMBER",
     b"ZSCAN",
     b"ZUNION",
@@ -327,7 +335,7 @@ const WORDS: &[&[u8]] = &[
 /// few keys: random arguments rarely line those up.
 fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
     const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
-    let choice = rng.below(27);
+    let choice = rng.below(35);
     let mut key = || rng.pick(KEYS).to_vec();
     let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
     let mut args = match choice {
@@ -384,6 +392,36 @@ fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
         25 => [
             words(&["EVAL", "redis.call('xadd', KEYS[1], '*', 'f', 'v') return redis.call('zadd', KEYS[2], 1, ARGV[1])", "2"]),
             vec![key(), key(), b"m".to_vec()],
+        ]
+        .concat(),
+        26 => [
+            words(&["XGROUP", "CREATE"]),
+            vec![key()],
+            words(&["g", "0", "MKSTREAM"]),
+        ]
+        .concat(),
+        27 => [
+            words(&["XREADGROUP", "GROUP", "g", "c", "BLOCK", "0", "STREAMS"]),
+            vec![key(), b">".to_vec()],
+        ]
+        .concat(),
+        28 => [
+            words(&["XREADGROUP", "GROUP", "g", "d", "COUNT", "1", "STREAMS"]),
+            vec![key(), key(), b">".to_vec(), b"0".to_vec()],
+        ]
+        .concat(),
+        29 => [words(&["XGROUP", "DESTROY"]), vec![key()], words(&["g"])].concat(),
+        30 => [vec![b"XACK".to_vec(), key()], words(&["g", "0-1"])].concat(),
+        31 => [
+            vec![b"XAUTOCLAIM".to_vec(), key()],
+            words(&["g", "e", "0", "0"]),
+        ]
+        .concat(),
+        32 => [words(&["XINFO", "STREAM"]), vec![key()], words(&["FULL"])].concat(),
+        33 => [
+            words(&["XGROUP", "DELCONSUMER"]),
+            vec![key()],
+            words(&["g", "c"]),
         ]
         .concat(),
         _ => vec![b"DEL".to_vec(), key()],

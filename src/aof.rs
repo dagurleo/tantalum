@@ -709,6 +709,11 @@ pub(crate) fn record(name: &str, args: &Args<'_>, reply: &[u8]) {
             return;
         }
     }
+    // Nothing to read: the consumer it may have made was logged by itself, and
+    // polling shouldn't fill the log.
+    if name == "xreadgroup" && matches!(reply, b"*-1\r\n" | b"_\r\n") {
+        return;
+    }
     if matches!(name, "incrbyfloat" | "hincrbyfloat") {
         // What it came to, so a machine that rounds differently gets the same.
         if let Some(Popped::One(value)) = resp_value(&mut { reply }) {

@@ -15,13 +15,22 @@
 //! inside it) towards its 100, and goes when its last entry does (by
 //! `XDEL`). A stream stays when it's emptied, keeping its last ID.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 /// Redis' defaults for `stream-node-max-entries` and `-max-bytes`.
 const NODE_MAX_ENTRIES: usize = 100;
 const NODE_MAX_BYTES: usize = 4096;
 /// A whole entry in a chunk takes its fields from the chunk's first.
 const SAME_FIELDS: u8 = 1;
+/// A group's `entries_read` when it isn't known.
+pub const UNKNOWN_READS: i64 = -1;
+/// What a pending entry takes, in its group's tree and its consumer's: measured,
+/// the growth of a server's RSS as a million entries were delivered in order.
+const PENDING_BYTES: usize = 147;
+/// About what a consumer and a group take, without their names.
+const CONSUMER_BYTES: usize = 112;
+const GROUP_BYTES: usize = 160;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId {
@@ -349,17 +358,129 @@ impl Chunk {
     }
 }
 
+/// An entry delivered to a consumer and not acknowledged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    /// Unix milliseconds.
+    pub delivery_time: i64,
+    pub delivery_count: i64,
+    pub consumer: Arc<[u8]>,
+}
+
+/// A consumer in a group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Consumer {
+    /// When it last tried to read or claim, Unix milliseconds.
+    pub seen_time: i64,
+    /// When it last got an entry; -1 if it never has.
+    pub active_time: i64,
+    /// The entries pending for it, each also in its group's list.
+    pub pending: BTreeSet<StreamId>,
+}
+
+/// A consumer group. Consumers and groups sort by name, as Redis' radix trees
+/// do, which is the order `XINFO` lists them in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub last_id: StreamId,
+    /// How many entries it has read, or [`UNKNOWN_READS`].
+    pub entries_read: i64,
+    pub pending: BTreeMap<StreamId, Pending>,
+    pub consumers: BTreeMap<Arc<[u8]>, Consumer>,
+    /// What its pending entries and consumers take, kept as they change.
+    bytes: usize,
+}
+
+impl Group {
+    pub fn new(last_id: StreamId, entries_read: i64) -> Self {
+        Group {
+            last_id,
+            entries_read,
+            pending: BTreeMap::new(),
+            consumers: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    /// The consumer called `name`, made if there's none (then `true`).
+    pub fn consumer(&mut self, name: &[u8], now: i64) -> (Arc<[u8]>, bool) {
+        if let Some((name, _)) = self.consumers.get_key_value(name) {
+            return (name.clone(), false);
+        }
+        let name: Arc<[u8]> = name.into();
+        self.bytes += CONSUMER_BYTES + name.len();
+        self.consumers.insert(
+            name.clone(),
+            Consumer {
+                seen_time: now,
+                active_time: -1,
+                pending: BTreeSet::new(),
+            },
+        );
+        (name, true)
+    }
+
+    /// Removes a consumer and what's pending for it, returning how many were.
+    pub fn remove_consumer(&mut self, name: &[u8]) -> Option<usize> {
+        let (name, consumer) = self.consumers.remove_entry(name)?;
+        self.bytes -= CONSUMER_BYTES + name.len();
+        self.bytes -= consumer.pending.len() * PENDING_BYTES;
+        for id in &consumer.pending {
+            self.pending.remove(id);
+        }
+        Some(consumer.pending.len())
+    }
+
+    /// Takes an entry off the pending lists.
+    pub fn acknowledge(&mut self, id: StreamId) -> bool {
+        let Some(pending) = self.pending.remove(&id) else {
+            return false;
+        };
+        self.bytes -= PENDING_BYTES;
+        if let Some(consumer) = self.consumers.get_mut(&pending.consumer) {
+            consumer.pending.remove(&id);
+        }
+        true
+    }
+
+    /// Makes `id` pending for `consumer`, which must exist, with this time and
+    /// count: from whoever had it, if someone did.
+    pub fn assign(&mut self, id: StreamId, consumer: &Arc<[u8]>, time: i64, count: i64) {
+        let pending = Pending {
+            delivery_time: time,
+            delivery_count: count,
+            consumer: consumer.clone(),
+        };
+        match self.pending.insert(id, pending) {
+            Some(old) => {
+                if old.consumer != *consumer
+                    && let Some(old) = self.consumers.get_mut(&old.consumer)
+                {
+                    old.pending.remove(&id);
+                }
+            }
+            None => self.bytes += PENDING_BYTES,
+        }
+        if let Some(consumer) = self.consumers.get_mut(consumer) {
+            consumer.pending.insert(id);
+        }
+    }
+}
+
 /// A stream.
 #[derive(Clone, Default)]
 pub struct BigStream {
     chunks: VecDeque<Chunk>,
     len: usize,
     last_id: StreamId,
-    /// Ever added, and the largest removed by `XDEL` (for `XINFO`, later).
+    /// Ever added, and the largest removed by `XDEL`.
     entries_added: u64,
     max_deleted: StreamId,
     /// The chunks' allocations, kept as they change.
     bytes: usize,
+    /// Its consumer groups, by name: empty, as most streams' are, it holds no
+    /// memory.
+    pub groups: BTreeMap<Box<[u8]>, Group>,
 }
 
 /// Why `XADD` didn't add.
@@ -397,6 +518,245 @@ impl BigStream {
         std::mem::size_of::<Self>()
             + self.chunks.capacity() * std::mem::size_of::<Chunk>()
             + self.bytes
+            + self
+                .groups
+                .iter()
+                .map(|(name, group)| GROUP_BYTES + name.len() + group.bytes)
+                .sum::<usize>()
+    }
+
+    pub fn entries_added(&self) -> u64 {
+        self.entries_added
+    }
+
+    pub fn max_deleted(&self) -> StreamId {
+        self.max_deleted
+    }
+
+    /// How many chunks it has: Redis' `radix-tree-keys`.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// `XSETID`: what it checks first, then this.
+    pub fn set_ids(&mut self, last: StreamId, added: Option<u64>, max_deleted: StreamId) {
+        self.last_id = last;
+        if let Some(added) = added {
+            self.entries_added = added;
+        }
+        if max_deleted != StreamId::MIN {
+            self.max_deleted = max_deleted;
+        }
+    }
+
+    /// The first entry's ID, or 0-0 if it's empty: Redis' `first_id`.
+    pub fn first_id(&self) -> StreamId {
+        let mut first = StreamId::MIN;
+        self.range(StreamId::MIN, StreamId::MAX, false, |entry| {
+            first = entry.id;
+            false
+        });
+        first
+    }
+
+    /// The last entry's ID, which `XDEL` may have left below [`BigStream::last_id`].
+    pub fn last_entry_id(&self) -> StreamId {
+        let mut last = StreamId::MIN;
+        self.range(StreamId::MIN, StreamId::MAX, true, |entry| {
+            last = entry.id;
+            false
+        });
+        last
+    }
+
+    pub fn has_entry(&self, id: StreamId) -> bool {
+        let mut found = false;
+        self.range(id, id, false, |_| {
+            found = true;
+            false
+        });
+        found
+    }
+
+    /// Whether a deleted entry may lie after `start`: Redis'
+    /// `streamRangeHasTombstones` with no end.
+    pub fn tombstones_after(&self, start: StreamId) -> bool {
+        if self.len == 0 || self.max_deleted == StreamId::MIN {
+            return false;
+        }
+        self.first_id() <= self.max_deleted && start <= self.max_deleted
+    }
+
+    /// How many entries were added up to `id`, where that can be known: Redis'
+    /// `streamEstimateDistanceFromFirstEverEntry`.
+    pub fn entries_up_to(&self, id: StreamId) -> Option<i64> {
+        let added = self.entries_added as i64;
+        if self.entries_added == 0 {
+            return Some(0);
+        }
+        let len = self.len as i64;
+        if self.len == 0 && id <= self.last_id {
+            return Some(added);
+        }
+        if id == self.last_id {
+            return Some(added);
+        }
+        if id > self.last_id {
+            return None;
+        }
+        let first = self.first_id();
+        if self.max_deleted == StreamId::MIN || self.max_deleted < first {
+            if id < first {
+                return Some(added.wrapping_sub(len));
+            }
+            if id == first {
+                return Some(added.wrapping_sub(len).wrapping_add(1));
+            }
+        }
+        None
+    }
+
+    /// How many entries `group` has yet to read, where that can be known.
+    pub fn lag(&self, group: &Group) -> Option<i64> {
+        if self.entries_added == 0 {
+            return Some(0);
+        }
+        if group.entries_read != UNKNOWN_READS && !self.tombstones_after(group.last_id) {
+            return Some((self.entries_added as i64).wrapping_sub(group.entries_read));
+        }
+        self.entries_up_to(group.last_id)
+            .map(|read| (self.entries_added as i64).wrapping_sub(read))
+    }
+
+    /// Runs `f` with this stream and its group `name` apart, for what reads
+    /// entries while it changes the group. `f`'s stream shows no groups.
+    pub fn with_group<R>(
+        &mut self,
+        name: &[u8],
+        f: impl FnOnce(&BigStream, &mut Group) -> R,
+    ) -> Option<R> {
+        let mut groups = std::mem::take(&mut self.groups);
+        let result = groups.get_mut(name).map(|group| f(self, group));
+        self.groups = groups;
+        result
+    }
+
+    /// `XREADGROUP` with `>`: gives `emit` the entries after the group's last
+    /// (at most `count`, unless 0) and makes them pending for `consumer`, which
+    /// exists (unless `noack`). Returns how many.
+    pub fn deliver(
+        &self,
+        group: &mut Group,
+        consumer: &Arc<[u8]>,
+        count: usize,
+        noack: bool,
+        now: i64,
+        mut emit: impl FnMut(&Entry<'_>),
+    ) -> usize {
+        let Some(start) = group.last_id.next() else {
+            return 0;
+        };
+        let mut n = 0;
+        self.range(start, StreamId::MAX, false, |entry| {
+            if group.entries_read != UNKNOWN_READS && !self.tombstones_after(entry.id) {
+                group.entries_read = group.entries_read.wrapping_add(1);
+            } else if self.entries_added != 0 {
+                group.entries_read = self.entries_up_to(entry.id).unwrap_or(UNKNOWN_READS);
+            }
+            group.last_id = entry.id;
+            emit(entry);
+            if !noack {
+                group.assign(entry.id, consumer, now, 1);
+            }
+            n += 1;
+            count == 0 || n < count
+        });
+        if n > 0
+            && !noack
+            && let Some(consumer) = group.consumers.get_mut(consumer)
+        {
+            consumer.active_time = now;
+        }
+        n
+    }
+
+    /// `XREADGROUP` with an ID: gives `emit` what's pending for `consumer` from
+    /// `start` on (at most `count`, unless 0), as delivered again, or `None` for
+    /// an entry no longer in the stream. Returns how many.
+    pub fn redeliver(
+        &self,
+        group: &mut Group,
+        consumer: &[u8],
+        start: StreamId,
+        count: usize,
+        now: i64,
+        mut emit: impl FnMut(StreamId, Option<&Entry<'_>>),
+    ) -> usize {
+        let Group {
+            pending, consumers, ..
+        } = group;
+        let Some(consumer) = consumers.get(consumer) else {
+            return 0;
+        };
+        let mut n = 0;
+        for &id in consumer.pending.range(start..) {
+            if count != 0 && n == count {
+                break;
+            }
+            let mut found = false;
+            self.range(id, id, false, |entry| {
+                found = true;
+                emit(id, Some(entry));
+                false
+            });
+            if !found {
+                emit(id, None);
+            } else if let Some(pending) = pending.get_mut(&id) {
+                pending.delivery_time = now;
+                pending.delivery_count = pending.delivery_count.wrapping_add(1);
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// How many nodes Redis' radix tree of its chunks has, for `XINFO`: chunks
+    /// are keyed by their first ID in 16 big-endian bytes.
+    pub fn radix_nodes(&self) -> usize {
+        fn nodes(keys: &[[u8; 16]], depth: usize) -> usize {
+            if keys.is_empty() {
+                return 1;
+            }
+            let shared = |at: usize| keys.iter().all(|key| key[at] == keys[0][at]);
+            let mut end = depth;
+            while end < 16 && shared(end) {
+                end += 1;
+            }
+            // A run of bytes in common is one node, before what comes after it.
+            let run = usize::from(end > depth);
+            if end == 16 {
+                return run + 1;
+            }
+            let mut total = run + 1;
+            let mut rest = keys;
+            while let Some(first) = rest.first() {
+                let n = rest.iter().take_while(|key| key[end] == first[end]).count();
+                total += nodes(&rest[..n], end + 1);
+                rest = &rest[n..];
+            }
+            total
+        }
+        let keys: Vec<[u8; 16]> = self
+            .chunks
+            .iter()
+            .map(|chunk| {
+                let mut key = [0; 16];
+                key[..8].copy_from_slice(&chunk.first.ms.to_be_bytes());
+                key[8..].copy_from_slice(&chunk.first.seq.to_be_bytes());
+                key
+            })
+            .collect();
+        nodes(&keys, 0)
     }
 
     /// The ID `XADD` would use: given (`ms` and maybe `seq`), or with `id`
@@ -657,7 +1017,106 @@ impl BigStream {
             put_bytes(&mut out, &chunk.fields);
             put_bytes(&mut out, &chunk.data);
         }
+        // Only with groups: a stream without them is as version 4 has it.
+        if !self.groups.is_empty() {
+            put_varint(&mut out, self.groups.len() as u64);
+            for (name, group) in &self.groups {
+                put_bytes(&mut out, name);
+                put_varint(&mut out, group.last_id.ms);
+                put_varint(&mut out, group.last_id.seq);
+                put_varint(&mut out, (group.entries_read as u64).wrapping_add(1));
+                put_varint(&mut out, group.consumers.len() as u64);
+                for (name, consumer) in &group.consumers {
+                    put_bytes(&mut out, name);
+                    put_varint(&mut out, consumer.seen_time as u64);
+                    put_varint(&mut out, (consumer.active_time + 1) as u64);
+                }
+                put_varint(&mut out, group.pending.len() as u64);
+                // Each with its consumer's place among them.
+                let places: BTreeMap<&[u8], u64> = group
+                    .consumers
+                    .keys()
+                    .enumerate()
+                    .map(|(i, name)| (&**name, i as u64))
+                    .collect();
+                for (id, pending) in &group.pending {
+                    put_varint(&mut out, id.ms);
+                    put_varint(&mut out, id.seq);
+                    put_varint(&mut out, pending.delivery_time as u64);
+                    put_varint(&mut out, pending.delivery_count as u64);
+                    put_varint(&mut out, places[&*pending.consumer]);
+                }
+            }
+        }
         out
+    }
+
+    /// Whether [`BigStream::to_compact`]'s bytes have groups, which only a newer
+    /// snapshot version can hold. Bytes that aren't valid say no.
+    pub fn compact_has_groups(bytes: &[u8]) -> bool {
+        fn after_chunks(bytes: &[u8]) -> Option<usize> {
+            let mut pos = 0;
+            for _ in 0..5 {
+                get_varint(bytes, &mut pos)?;
+            }
+            for _ in 0..get_varint(bytes, &mut pos)? {
+                for _ in 0..7 {
+                    get_varint(bytes, &mut pos)?;
+                }
+                get_bytes(bytes, &mut pos)?;
+                get_bytes(bytes, &mut pos)?;
+            }
+            Some(pos)
+        }
+        after_chunks(bytes).is_some_and(|pos| pos < bytes.len())
+    }
+
+    /// The groups from where [`BigStream::to_compact`] puts them.
+    fn groups_from_compact(bytes: &[u8], pos: &mut usize) -> Option<BTreeMap<Box<[u8]>, Group>> {
+        let mut groups = BTreeMap::new();
+        for _ in 0..get_varint(bytes, pos)? {
+            let name: Box<[u8]> = get_bytes(bytes, pos)?.into();
+            let last_id = StreamId {
+                ms: get_varint(bytes, pos)?,
+                seq: get_varint(bytes, pos)?,
+            };
+            let entries_read = (get_varint(bytes, pos)?.wrapping_sub(1)) as i64;
+            if entries_read < UNKNOWN_READS {
+                return None;
+            }
+            let mut group = Group::new(last_id, entries_read);
+            let mut names = Vec::new();
+            for _ in 0..get_varint(bytes, pos)? {
+                let consumer = get_bytes(bytes, pos)?;
+                let seen_time = get_varint(bytes, pos)? as i64;
+                let active_time = i64::try_from(get_varint(bytes, pos)?).ok()? - 1;
+                let (name, created) = group.consumer(consumer, seen_time);
+                if !created {
+                    return None;
+                }
+                group.consumers.get_mut(&name)?.active_time = active_time;
+                names.push(name);
+            }
+            for _ in 0..get_varint(bytes, pos)? {
+                let id = StreamId {
+                    ms: get_varint(bytes, pos)?,
+                    seq: get_varint(bytes, pos)?,
+                };
+                let time = get_varint(bytes, pos)? as i64;
+                let count = get_varint(bytes, pos)? as i64;
+                let consumer = names
+                    .get(usize::try_from(get_varint(bytes, pos)?).ok()?)?
+                    .clone();
+                if group.pending.contains_key(&id) {
+                    return None;
+                }
+                group.assign(id, &consumer, time, count);
+            }
+            if groups.insert(name, group).is_some() {
+                return None;
+            }
+        }
+        Some(groups)
     }
 
     /// A stream from [`BigStream::to_compact`]'s bytes; `None` if they
@@ -725,6 +1184,9 @@ impl BigStream {
             stream.bytes += chunk.allocation_size();
             stream.chunks.push_back(chunk);
         }
+        if pos < bytes.len() {
+            stream.groups = Self::groups_from_compact(bytes, &mut pos)?;
+        }
         (pos == bytes.len()).then_some(stream)
     }
 }
@@ -748,6 +1210,22 @@ impl BigStream {
                 previous = Some(entry.id);
             }
         }
+        for group in self.groups.values() {
+            let mut held = 0;
+            let mut bytes = group.pending.len() * PENDING_BYTES;
+            for (name, consumer) in &group.consumers {
+                bytes += CONSUMER_BYTES + name.len();
+                held += consumer.pending.len();
+                for id in &consumer.pending {
+                    assert_eq!(
+                        &group.pending[id].consumer, name,
+                        "a pending entry's consumer"
+                    );
+                }
+            }
+            assert_eq!(held, group.pending.len(), "pending entries, both ways");
+            assert_eq!(bytes, group.bytes, "a group's bytes");
+        }
     }
 }
 
@@ -761,6 +1239,64 @@ mod tests {
 
     fn id(ms: u64, seq: u64) -> StreamId {
         StreamId { ms, seq }
+    }
+
+    #[test]
+    fn groups_keep_their_books_and_come_back_from_their_bytes() {
+        let mut stream = BigStream::default();
+        for ms in 1..=5 {
+            stream.add(id(ms, 0), &[(b"f", b"v")]);
+        }
+        assert!(!BigStream::compact_has_groups(&stream.to_compact()));
+        let mut group = Group::new(id(3, 0), 3);
+        let (a, created) = group.consumer(b"a", 100);
+        assert!(created);
+        assert!(!group.consumer(b"a", 200).1);
+        let (b, _) = group.consumer(b"b", 100);
+        group.assign(id(1, 0), &a, 150, 1);
+        group.assign(id(2, 0), &a, 160, 2);
+        group.assign(id(3, 0), &b, 170, 1);
+        // From one to the other.
+        group.assign(id(2, 0), &b, 180, 3);
+        assert_eq!(group.consumers[&a].pending.len(), 1);
+        assert_eq!(group.consumers[&b].pending.len(), 2);
+        assert!(group.acknowledge(id(1, 0)));
+        assert!(!group.acknowledge(id(1, 0)));
+        group.consumers.get_mut(&b).unwrap().active_time = 190;
+        stream.groups.insert((*b"g").into(), group);
+        stream
+            .groups
+            .insert((*b"empty").into(), Group::new(id(0, 0), UNKNOWN_READS));
+        stream.check();
+        let bytes = stream.to_compact();
+        assert!(BigStream::compact_has_groups(&bytes));
+        let back = BigStream::from_compact(&bytes).unwrap();
+        back.check();
+        assert_eq!(back.groups, stream.groups);
+        assert_eq!(back.to_compact(), bytes);
+        assert!(BigStream::from_compact(&bytes[..bytes.len() - 1]).is_none());
+
+        let group = stream.groups.get_mut(&b"g"[..]).unwrap();
+        assert_eq!(group.remove_consumer(b"b"), Some(2));
+        assert_eq!(group.remove_consumer(b"b"), None);
+        assert!(group.pending.is_empty());
+        stream.check();
+    }
+
+    /// Groups leave the other collections' objects the size they were: a
+    /// `Collection` is as big as its biggest kind.
+    #[test]
+    fn groups_cost_other_kinds_nothing() {
+        assert!(size_of::<BigStream>() <= size_of::<crate::zset::BigZSet>());
+    }
+
+    #[test]
+    fn radix_nodes_are_as_redis_counts_them() {
+        let mut stream = BigStream::default();
+        assert_eq!(stream.radix_nodes(), 1);
+        stream.add(id(1, 0), &[(b"f", b"v")]);
+        // A run of 16 bytes, and the key it ends in.
+        assert_eq!(stream.radix_nodes(), 2);
     }
 
     #[test]

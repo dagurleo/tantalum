@@ -110,6 +110,11 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] threshold [LIMIT n]] *\|id field value ...` | IDs as Redis makes and reads them (`ms-*` included). Trimming with `~` removes whole nodes where Redis' end, so it removes what Redis does |
 | `XLEN`, `XRANGE key start end [COUNT n]`, `XREVRANGE`, `XDEL key id ...`, `XTRIM key MAXLEN\|MINID [=\|~] threshold [LIMIT n]` | `(` for exclusive ends. An emptied stream stays, keeping its last ID, as in Redis |
 | `XREAD [COUNT n] [BLOCK ms] STREAMS key ... id ...` | `$` for new entries only. Blocked readers are all served by an entry that's new to them (reading takes nothing), and `$` means the last ID when the command came |
+| `XGROUP CREATE key group id\|$ [MKSTREAM] [ENTRIESREAD n]`, `XGROUP SETID key group id\|$ [ENTRIESREAD n]`, `XGROUP DESTROY key group`, `XGROUP CREATECONSUMER key group consumer`, `XGROUP DELCONSUMER key group consumer`, `XGROUP HELP` | As in Redis, what these do to a stream's groups isn't a change to clients watching the key, unless `MKSTREAM` makes it |
+| `XREADGROUP GROUP group consumer [COUNT n] [BLOCK ms] [NOACK] STREAMS key ... id ...` | `>` for what the group hasn't read, an ID for the consumer's own pending entries (a deleted one comes as an ID and a nil). The consumer is made if there's none. Blocked consumers are served longest-waiting first, and get `-NOGROUP` if the group or key goes, `-WRONGTYPE` if the key becomes another kind |
+| `XACK key group id ...`, `XPENDING key group [[IDLE ms] start end count [consumer]]` | |
+| `XCLAIM key group consumer min-idle id ... [IDLE ms] [TIME unix-ms] [RETRYCOUNT n] [FORCE] [JUSTID] [LASTID id]`, `XAUTOCLAIM key group consumer min-idle start [COUNT n] [JUSTID]` | Entries gone from the stream leave the pending lists; `XAUTOCLAIM` lists them third, as Redis 7 does |
+| `XINFO STREAM key [FULL [COUNT n]]`, `XINFO GROUPS key`, `XINFO CONSUMERS key group`, `XINFO HELP`, `XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]` | Lag and `entries-read` by Redis' rules (null when deletions make them unknowable). `radix-tree-keys` and `-nodes` are what Redis' tree would hold, worked out from the chunks on each call |
 | `TYPE key` | `string`, `hash`, `list`, `set`, `zset`, `stream` or `none`. Commands for one type reply `-WRONGTYPE` to the others, and `MGET` gives nil for them, as in Redis |
 | `SCAN cursor [MATCH pattern] [COUNT n] [TYPE type]` | A whole scan returns every key that existed throughout exactly once (Redis may repeat keys), and any cursor is safe. `COUNT` is about how many keys a call looks at, as in Redis; for big shards a call looks at a 1024th of the shard at least. Cursors are Tantalum's own and stay under 2^53, so clients that read them as JavaScript numbers work |
 | `KEYS pattern` | Every match at once, like Redis: it holds each shard's lock in turn while reading it, so prefer `SCAN` on big stores |
@@ -273,6 +278,45 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   100,000 BullMQ-like events take 32.2 bytes each (Redis 41.8), entries of
   one 8-byte field 13.0 (Redis 20.9). A stream is always an object
   (`collection.rs`); string entries pay nothing for it.
+- **Consumer groups** (`src/stream.rs`, `src/cmd/group.rs`) are ordered trees
+  by name, as Redis' radix trees list them: a group's pending entries by ID,
+  each consumer's too. A stream without groups holds no memory for them and
+  takes the same path as before; other kinds' objects stay the size they were
+  (a test keeps it so). 225,000 commands against Redis 7.2.4 gave the same
+  replies, times within a tolerance, over every argument error in both
+  protocols and random runs across chunks, `XDEL`, `XTRIM`, `XSETID`, `COPY` and
+  `RENAME` (`tools/groups-diff.py`, whose replies without times are replayed by
+  `tests/groups.rs`); 44 scenarios with blocked clients, `WATCH`, `MULTI` and
+  scripts too (`tools/groups-blocking-diff.py`). One Agent37 core, memtier
+  3 x 80 clients, all servers up, in commands per second (raw rows and how:
+  `bench/agent37/results-groups.txt`):
+
+  | | Pipeline | Redis 7.2.4 | Valkey | Tantalum | vs Redis | p99, Redis / Tantalum |
+  |---|---|---|---|---|---|---|
+  | `XADD` | 1 | 271,148 | 268,460 | 340,982 | +26% | 1.69 / 1.01 ms |
+  | | 16 | 1,017,783 | 982,623 | 2,200,207 | +116% | 4.81 / 2.59 ms |
+  | `XREADGROUP` `COUNT 1` | 1 | 152,672 | 155,429 | 253,292 | +66% | 2.85 / 1.32 ms |
+  | | 16 | 297,503 | 314,757 | 693,659 | +133% | 16.32 / 6.86 ms |
+  | `XREADGROUP` `COUNT 10` | 1 | 85,821 | 64,484 | 164,124 | +91% | 4.65 / 1.99 ms |
+  | | 16 | 111,344 | 80,189 | 264,661 | +138% | 46.08 / 15.07 ms |
+  | `XACK` | 1 | 311,840 | 298,431 | 365,721 | +17% | 1.51 / 0.99 ms |
+  | | 16 | 1,652,493 | 1,468,545 | 2,822,230 | +71% | 4.32 / 2.24 ms |
+  | `XPENDING` | 1 | 233,579 | 223,459 | 349,344 | +50% | 1.95 / 0.96 ms |
+  | | 16 | 910,759 | 816,735 | 2,630,945 | +189% | 5.71 / 2.52 ms |
+  | `XPENDING` of 10 rows | 1 | 180,055 | 162,142 | 291,906 | +62% | 2.27 / 1.13 ms |
+  | | 16 | 403,159 | 327,113 | 818,623 | +103% | 15.42 / 6.86 ms |
+  | `XINFO GROUPS` | 1 | 286,926 | 273,451 | 336,158 | +17% | 1.62 / 0.99 ms |
+  | | 16 | 1,232,139 | 1,110,448 | 2,075,714 | +68% | 5.34 / 3.17 ms |
+
+  With one client, so counting only what a server spends, Tantalum takes 55-76%
+  less CPU per command than Redis on each of these and on `XCLAIM`, `XAUTOCLAIM`,
+  a consumer's history and a read-and-acknowledge cycle. A pending entry takes
+  147 bytes of RSS (Redis 242, Valkey 126). A client blocked in `XREADGROUP`
+  registers with the clients watching its key, which writes check for anyway,
+  so it wakes when the key changes without `GET` or `SET` paying for it. Their
+  fast paths don't look for ready keys, though, so a stream overwritten by `SET`,
+  or expired on `GET`, tells a blocked consumer with the next other command, or
+  from the expiry thread, within 100 ms; the reply is the same.
 - **Sorted sets** (`src/zset.rs`) are packed while small (up to 128
   members of up to 64 bytes, Redis' listpack limits), in order, each entry
   a score and a member; a whole score below 2^52 is a varint of a byte or
@@ -486,7 +530,8 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   value, and the expiry as a Unix time, so TTLs carry over and keys that
   expired while the server was down are dropped at startup. The format has a
   version in its header: 2 has hashes, 3 the other collections, 4 streams
-  (with their chunks as they are, so `~` trims the same after a restart). A
+  (with their chunks as they are, so `~` trims the same after a restart), 5
+  streams' consumer groups, kept after their chunks. A
   save writes the lowest version that holds its data (without hashes still
   1, which builds from before hashes, 0.7, can read), and every build reads
   all versions up to its own (`tests/data/v1.snapshot` was written by 0.7.0). Each shard is copied out
@@ -1056,8 +1101,11 @@ hit rates share the seeding flaw described above.
   nothing to relax: there's no check before a script runs that memory is
   under `maxmemory` (a write over it fails inside the script instead). No
   `used_memory_lua` or `number_of_cached_scripts` in `INFO`.
-- **Stream gaps**: no consumer groups (`XGROUP`, `XREADGROUP`, `XACK`,
-  `XPENDING`, `XCLAIM`, `XAUTOCLAIM`), `XINFO` or `XSETID`.
+- **Stream gaps**: a pending entry takes more than in Valkey (147 bytes of RSS
+  against 126): trees half fill when entries come in order, and chunks that
+  fill up as a stream's do should take about a third of that. `XINFO STREAM`
+  walks the stream's chunks for `radix-tree-nodes`, under the shard's lock, which
+  a stream of billions of entries would feel.
 - **Transaction gaps**: Redis refuses a write command with `-OOM` while
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client

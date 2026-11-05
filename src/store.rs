@@ -44,7 +44,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
@@ -478,6 +478,9 @@ pub enum Update {
     Object(Collection),
     /// Its big collection was changed in place.
     Changed,
+    /// It was, in a way clients watching the key don't see, as in Redis: a
+    /// stream's consumer groups. (A snapshot does.)
+    ChangedUnseen,
 }
 
 fn join(id: usize, offset: usize) -> u32 {
@@ -586,6 +589,10 @@ struct Watcher {
     /// The key had expired already when it was watched, so its removal
     /// isn't a change (as in Redis).
     expired: bool,
+    /// Not a client watching but one blocked in `XREADGROUP`, whose group
+    /// goes when the key does: a change queues the key for it, so that this
+    /// costs other commands only the check for watchers they already make.
+    waking: Option<Arc<Store>>,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,6 +641,9 @@ impl ShardInner {
         for watcher in self.watched.get(key).into_iter().flatten() {
             if !(by_expiry && watcher.expired) {
                 watcher.flag.store(true, Relaxed);
+                if let Some(store) = &watcher.waking {
+                    store.queue_ready(key);
+                }
             }
         }
     }
@@ -2191,6 +2201,11 @@ impl Store {
                 inner.changed(key, false);
                 return Ok(true);
             }
+            (Update::ChangedUnseen, Some((loc, header))) => {
+                inner.touch(*loc, header);
+                inner.mem.writes += 1;
+                return Ok(true);
+            }
             (Update::Delete, Some((loc, _))) => {
                 inner.unlink(hash, *loc);
                 garbage.extend(inner.kill(*loc));
@@ -2354,10 +2369,17 @@ impl Store {
     /// ready if clients are blocked on it.
     fn created(&self, inner: &ShardInner, key: &[u8]) {
         if inner.waiting.contains_key(key) {
-            let mut keys = self.ready.keys.lock();
-            keys.push(key.into());
-            self.ready.pending.store(true, Relaxed);
+            self.queue_ready(key);
         }
+    }
+
+    /// Queues `key` for the clients blocked on it, once.
+    fn queue_ready(&self, key: &[u8]) {
+        let mut keys = self.ready.keys.lock();
+        if !keys.iter().any(|queued| **queued == *key) {
+            keys.push(key.into());
+        }
+        self.ready.pending.store(true, Relaxed);
     }
 
     /// After a write to `key` that may serve clients blocked on it without
@@ -2380,6 +2402,22 @@ impl Store {
             .entry(key.bytes.into())
             .or_default()
             .push_back(waiter.clone());
+    }
+
+    /// For a client blocked on `key` that wakes when it changes in any way:
+    /// [`Store::unwatch`] with `flag` ends it.
+    pub(crate) fn wake_on_change(self: &Arc<Self>, key: Key<'_>, flag: &Arc<AtomicBool>) {
+        let (_, index) = self.locate(key.hash);
+        let mut inner = self.shards[index].inner.lock();
+        inner
+            .watched
+            .entry(key.bytes.into())
+            .or_default()
+            .push(Watcher {
+                flag: flag.clone(),
+                expired: false,
+                waking: Some(self.clone()),
+            });
     }
 
     /// Deregisters `waiter` from `key`.
@@ -2416,9 +2454,9 @@ impl Store {
         key
     }
 
-    /// The first client blocked on `key` that it now has data for,
-    /// claimed (see [`Waiter::claim`]) for the caller to serve.
-    /// (Skipping those in `tried`.)
+    /// The first client blocked on `key` that it now has data for, or that
+    /// wants to hear of any change, claimed (see [`Waiter::claim`]) for the
+    /// caller to serve. (Skipping those in `tried`.)
     pub(crate) fn claim_waiter(
         &self,
         key: Key<'_>,
@@ -2426,14 +2464,14 @@ impl Store {
         tried: &[Arc<Waiter>],
     ) -> Option<Arc<Waiter>> {
         self.update_with(key, now, false, |inner, existing| {
-            let claimed = existing.and_then(|(_, header)| {
-                let kind = header.kind();
-                inner
-                    .waiting
-                    .get(key.bytes)?
+            let kind = existing.map(|(_, header)| header.kind());
+            let claimed = inner.waiting.get(key.bytes).and_then(|waiters| {
+                waiters
                     .iter()
                     .find(|w| {
-                        w.kind() == kind && !tried.iter().any(|t| Arc::ptr_eq(t, w)) && w.claim()
+                        (Some(w.kind()) == kind || w.wakes_on_change())
+                            && !tried.iter().any(|t| Arc::ptr_eq(t, w))
+                            && w.claim()
                     })
                     .cloned()
             });
@@ -2458,6 +2496,7 @@ impl Store {
             .push(Watcher {
                 flag: flag.clone(),
                 expired,
+                waking: None,
             });
         expired
     }
@@ -2978,21 +3017,6 @@ pub struct Stats {
     pub client_bytes: usize,
     pub expired_keys: u64,
     pub evicted_keys: u64,
-}
-
-/// Runs active expiry every `interval` until the store is dropped.
-pub fn spawn_expirer(store: &Arc<Store>, interval: Duration) -> std::thread::JoinHandle<()> {
-    let store = Arc::downgrade(store);
-    std::thread::Builder::new()
-        .name("tantalum-expire".into())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(interval);
-                let Some(store) = store.upgrade() else { break };
-                store.expire_cycle(store.now());
-            }
-        })
-        .expect("spawn expiry thread")
 }
 
 #[cfg(test)]

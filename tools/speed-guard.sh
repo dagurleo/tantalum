@@ -68,7 +68,7 @@ flagged = []
 print(f"speed guard: {ref} (base) against the working tree, {rounds} rounds")
 # Memory metrics are exact; timings are nanoseconds per command per run.
 memory = (("memory_per_key", "memory per key", "B"), ("hash_memory_per_field", "hash memory/field", "B"))
-timings = (("p1_ns", "no pipelining"), ("p16_ns", "pipeline 16"), ("scan_ns_per_key", "scan, per key"), ("hash_p16_ns", "hashes, pipe 16"))
+timings = (("p1_ns", "no pipelining"), ("p16_ns", "pipeline 16"), ("scan_ns_per_key", "scan, per key"), ("hash_p16_ns", "hashes, pipe 16"), ("group_p16_ns", "groups, pipe 16"))
 new = lambda metric: metric not in runs["base"][0]
 for metric, label, unit in memory:
     curr = runs["curr"][0][metric]

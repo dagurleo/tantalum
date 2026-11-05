@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tantalum::aof;
+use tantalum::cmd;
 use tantalum::context::{Context, Settings};
 use tantalum::server;
 use tantalum::snapshot::{self, Snapshots};
@@ -307,10 +308,10 @@ fn main() -> std::io::Result<()> {
     if let Some(options) = &config.aof {
         start_aof(&ctx, options.clone());
     }
+    let ctx = Arc::new(ctx);
     // After the log's commands ran again: they may still use keys that have
     // expired since.
-    let _expirer = store::spawn_expirer(&store, Duration::from_millis(100));
-    let ctx = Arc::new(ctx);
+    let _expirer = cmd::spawn_expirer(&ctx, Duration::from_millis(100));
     server::handle_signals(ctx.clone())?;
     // TLS listens on its own port, on tokio loops even with io_uring (monoio
     // has no TLS here).

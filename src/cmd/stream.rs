@@ -11,9 +11,9 @@ use crate::resp;
 use crate::store::{Entry, EntryValue, Key, Kind, Millis, Store, Update, View};
 use crate::stream::{self, AddError, BigStream, IdForm, StreamId, Trim};
 
-const INVALID_ID: &[u8] = b"ERR Invalid stream ID specified as stream command argument";
+pub(super) const INVALID_ID: &[u8] = b"ERR Invalid stream ID specified as stream command argument";
 
-fn reply_error(out: &mut Vec<u8>, msg: &[u8]) -> Reply {
+pub(super) fn reply_error(out: &mut Vec<u8>, msg: &[u8]) -> Reply {
     resp::write_error(out, msg);
     Reply::Written
 }
@@ -25,13 +25,13 @@ fn unix_ms() -> u64 {
 }
 
 /// Redis' `string2ll`, as `getLongLongFromObject` reads options.
-fn parse_i64(arg: &[u8]) -> Option<i64> {
+pub(super) fn parse_i64(arg: &[u8]) -> Option<i64> {
     resp::parse_int(arg)
 }
 
 /// Reads the stream at `key` under its lock: `f` gets `None` if there's
 /// none. `Err` if the key holds another kind.
-fn read<R>(
+pub(super) fn read<R>(
     store: &Store,
     key: Key<'_>,
     now: Millis,
@@ -51,16 +51,18 @@ fn read<R>(
 }
 
 /// What a change did.
-enum Done {
+pub(super) enum Done {
     Nothing,
     Changed,
+    /// To its consumer groups: clients watching the key don't see it.
+    Unseen,
     /// Made a new stream, to store.
     New(BigStream),
 }
 
 /// Changes the stream at `key` with `f` (`None` if there's none). `Err` if
 /// the key holds another kind.
-fn change<R>(
+pub(super) fn change<R>(
     store: &Store,
     key: Key<'_>,
     now: Millis,
@@ -79,6 +81,7 @@ fn change<R>(
                 ..
             }) => match f(Some(stream)) {
                 (Done::Changed, r) => (Update::Changed, Ok(r)),
+                (Done::Unseen, r) => (Update::ChangedUnseen, Ok(r)),
                 (_, r) => (Update::Peek, Ok(r)),
             },
             Some(_) => (Update::Peek, Err(())),
@@ -278,7 +281,7 @@ pub(super) fn xlen(
 }
 
 /// An entry as Redis replies one: its ID, and its fields and values.
-fn write_entry(out: &mut Vec<u8>, entry: &stream::Entry<'_>) {
+pub(super) fn write_entry(out: &mut Vec<u8>, entry: &stream::Entry<'_>) {
     resp::write_array_header(out, 2);
     let mut id = Vec::with_capacity(41);
     entry.id.write(&mut id);
@@ -291,7 +294,7 @@ fn write_entry(out: &mut Vec<u8>, entry: &stream::Entry<'_>) {
 }
 
 /// One end of an `XRANGE` interval: `(` for exclusive.
-fn interval(arg: &[u8], missing_seq: u64) -> Option<(StreamId, bool)> {
+pub(super) fn interval(arg: &[u8], missing_seq: u64) -> Option<(StreamId, bool)> {
     if arg.len() > 1 && arg[0] == b'(' {
         Some((
             stream::parse_whole_id(&arg[1..], missing_seq, IdForm::Strict)?,
@@ -466,7 +469,7 @@ pub(super) fn xtrim(
 }
 
 /// A blocking timeout in milliseconds, as Redis reads `XREAD`'s `BLOCK`.
-fn parse_timeout_ms(arg: &[u8]) -> Result<Option<Duration>, &'static [u8]> {
+pub(super) fn parse_timeout_ms(arg: &[u8]) -> Result<Option<Duration>, &'static [u8]> {
     let Some(ms) = parse_i64(arg) else {
         return Err(b"ERR timeout is not an integer or out of range");
     };
@@ -647,6 +650,7 @@ fn xread_attempt(
             .collect()
     });
     Attempt::Wait {
+        on_change: false,
         keys: streams_at..streams_at + streams,
         timeout,
         kind: Kind::Stream,
