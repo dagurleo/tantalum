@@ -405,7 +405,7 @@ fn varint_len(mut n: usize) -> usize {
 
 /// A random seed for a big set's hash (so members can't be chosen to
 /// collide), from the process's random state.
-fn random_seed() -> u64 {
+pub(crate) fn random_seed() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     foldhash::fast::RandomState::default().hash_one(COUNTER.fetch_add(1, Relaxed))

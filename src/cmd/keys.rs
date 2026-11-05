@@ -12,7 +12,7 @@ use crate::resp;
 use crate::store::{
     EvictionPolicy, Expiry, Kind, Millis, OutOfMemory, Renamed, Update, ValueRef, View,
 };
-use crate::{hash, list, set, zset};
+use crate::{list, set, zset};
 
 /// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`. Cursors are
 /// Tantalum's own (see `Store::scan`), and a whole scan returns each key
@@ -288,7 +288,6 @@ fn listpack_entry_size(element: &[u8]) -> usize {
 /// nothing. Redis' also depends on the value's past: a string made by `APPEND`
 /// is `raw`, and a collection that has shrunk back may stay big.
 fn encoding(value: &ValueRef<'_>) -> &'static str {
-    const HASH_ENTRIES: usize = 512;
     const PACKED_ENTRIES: usize = 128;
     const PACKED_VALUE: usize = 64;
     const INTSET_ENTRIES: usize = 512;
@@ -305,11 +304,7 @@ fn encoding(value: &ValueRef<'_>) -> &'static str {
             }
         }
         Kind::Hash => {
-            let bytes = value.as_bytes();
-            let short = |(field, value): (&[u8], &[u8])| {
-                field.len() <= PACKED_VALUE && value.len() <= PACKED_VALUE
-            };
-            if hash::len(bytes) <= HASH_ENTRIES && hash::iter(bytes).all(short) {
+            if super::hash::view(value.view()).fits_listpack() {
                 "listpack"
             } else {
                 "hashtable"

@@ -5,7 +5,7 @@ RSS and used_memory at checkpoints, small batches. Prints the slope and the tota
     memtypes.py KIND NAME PORT PID
 
 KIND is one of WORKLOADS below; a fresh server for each run, on Linux (it reads
-/proc). A big hash takes Tantalum far too long: see "Big hashes" in the README.
+/proc).
 """
 import socket, sys
 

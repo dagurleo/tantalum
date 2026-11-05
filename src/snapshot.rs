@@ -595,8 +595,54 @@ mod tests {
 
     fn kind_and_value(store: &Store, key: &[u8]) -> Option<(Kind, Vec<u8>)> {
         store.get_with(key, store.now(), |v| {
-            v.map(|v| (v.kind(), v.as_bytes().to_vec()))
+            v.map(|v| {
+                let bytes = match v.view() {
+                    crate::store::View::Bytes(bytes) => bytes.to_vec(),
+                    crate::store::View::Object(big) => big.to_compact(),
+                };
+                (v.kind(), bytes)
+            })
         })
+    }
+
+    /// A hash too big to stay packed goes out packed all the same, in the same
+    /// version, so a build from before big hashes can read it (and an old snapshot's
+    /// big hash comes in as one).
+    #[test]
+    fn big_hashes_roundtrip_in_version_2() {
+        use crate::collection::Collection;
+        use crate::hash::BigHash;
+        use crate::store::Update;
+        let path = temp_path("big-hashes");
+        let names: Vec<_> = (0..2_000).map(|i| format!("f{i}").into_bytes()).collect();
+        let pairs: Vec<(&[u8], &[u8])> = names.iter().map(|n| (&n[..], &b"v"[..])).collect();
+        let packed = hash(&pairs);
+        let s = Store::new(2);
+        let now = s.now();
+        s.update_collection(s.key(b"h"), now, true, |_| {
+            (
+                Update::Object(Collection::Hash(BigHash::from_packed(&packed))),
+                (),
+            )
+        })
+        .unwrap();
+        save(&s, &path).unwrap();
+        assert!(
+            fs::read(&path)
+                .unwrap()
+                .starts_with(b"TANTALUM SNAPSHOT 2\n")
+        );
+        let t = Store::new(2);
+        load(&t, &path).unwrap();
+        assert_eq!(kind_and_value(&t, b"h"), Some((Kind::Hash, packed)));
+        let big = t.get_with(b"h", now, |v| {
+            matches!(
+                v.unwrap().view(),
+                crate::store::View::Object(Collection::Hash(_))
+            )
+        });
+        assert!(big, "loaded as a big hash, to change in place");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

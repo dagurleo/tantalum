@@ -1765,7 +1765,9 @@ impl Store {
         expiry: Expiry,
         now: Millis,
     ) -> Result<(), OutOfMemory> {
-        if kind.is_collection() && !collection::fits_compact(kind, value) {
+        // (A key too long to pack it with makes even a small one big, as a write does.)
+        let too_long = key.len() + value.len() + 20 > INLINE_MAX;
+        if kind.is_collection() && (too_long || !collection::fits_compact(kind, value)) {
             let key = self.key(key);
             let mut big = Some(Collection::from_compact(kind, value));
             self.update_collection(key, now, true, |_| {

@@ -87,7 +87,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `HGET key field`, `HMGET key field [field ...]`, `HGETALL`, `HKEYS`, `HVALS` | `HGETALL` is a map in RESP3 |
 | `HDEL key field [field ...]`, `HEXISTS`, `HLEN`, `HSTRLEN`, `HINCRBY key field n`, `HINCRBYFLOAT key field n` | `HDEL` of the last field deletes the key |
 | `HRANDFIELD key [count [WITHVALUES]]` | A negative count may repeat fields |
-| `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0, as Redis does for a hash it keeps as a listpack; `COUNT` fields at a time for one it would keep as a hash table (over 128 fields, or a field or value over 64 bytes), as Redis pages those. Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
+| `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0, as Redis does for a hash it keeps as a listpack; `COUNT` fields at a time for one it would keep as a hash table (over 512 fields, or a field or value over 64 bytes), as Redis pages those. Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
 | `SADD key member [member ...]`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SMEMBERS` | Small sets reply in Redis' order: integers sorted, others in the order added. `SMEMBERS` is a set in RESP3 |
 | `SPOP key [count]`, `SRANDMEMBER key [count]` | Random members; a negative `SRANDMEMBER` count may repeat them. A count covering the whole set gives it in Redis' order |
 | `SMOVE source destination member` | Atomic: holds both keys' shards |
@@ -233,7 +233,7 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   has-TTL, external, 2-bit usage counter, and 3 bits for its type), varint key
   and value lengths, an optional varint deadline, then key and value. A 15-byte
   key with a 32-byte value takes 50 bytes.
-- **Hashes** (`src/hash.rs`) are one entry like a string, with the type bits
+- **Hashes** (`src/hash.rs`) are one entry like a string while small, with the type bits
   set and the fields in its value: a field count, then each field and value
   with a varint length (one byte below 128), in the order they were added.
   So a hash costs what its bytes do: 100k hashes of ten 6-byte fields with
@@ -243,6 +243,19 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   is unchanged (a field set to a value of the same length). Strings pay
   nothing for this: the type was already in the flags byte, so `GET` and
   `SET` read the same bytes, and the speed guard measured no difference.
+  Past 512 fields or 8 KB a hash becomes an object the shard keeps and changes in
+  place: its fields and values back to back in one buffer, a list of 5-byte offsets
+  (the order added, and positions for `HRANDFIELD` and `HSCAN`), and a hash table of
+  positions. A write costs the same at any size. A value that fits is written where
+  it is, a longer one goes at the end, and the holes are taken back once they pass half
+  the buffer. Removing a field keeps the order up to 512 fields, where Redis' replies
+  show it, and past that moves the last field into its place. In real memory, the
+  growth of RSS once settled, a field of 16 bytes with a 32-byte value takes 62.5-72.7
+  bytes from 500,000 to 8M fields (Redis 70.7-80.0, Valkey 70.2-80.5), ahead of both
+  at every size. On one core, in one hash of 1M fields, `HGET` and `HSET` do 8-11%
+  more than Redis and 12-16% more than Valkey one at a time, and 31-37% and 41-56%
+  more at pipeline 16 (`bench/agent37/results-hashes.txt`). A snapshot holds a big hash
+  as bytes as above, still version 2, so a build from before big hashes reads it.
 - **Sets** (`src/set.rs`) are packed in their entry while small, the way
   Redis packs them, and so reply in its order: up to 512 integers, sorted, as
   zigzag varints (Redis' intset), or up to 128 members of up to 64 bytes in
@@ -610,6 +623,12 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
     frees the old table, and through mimalloc those freed tables stayed stuck in
     partly used pages (~10 bytes/key at 1M keys). This is also why the default is
     256 shards rather than 1024: bigger tables per shard, all of them mappable.
+  It's asked for an alignment only when one is needed (`Allocator` in `src/main.rs`).
+  The `mimalloc` crate always asks, and when a size's bin has no block ready, unless
+  its blocks are a power of two, that adds `align - 1` to the size: 320 bytes aligned
+  to 8 took a 384-byte block, by a slower path, and left the bin empty, so the next did
+  too. Which sizes this hit depended on what had come before, so it came and went from
+  build to build: 134 instructions on an `HSET` on ten fields.
   Once a second a thread asks mimalloc to hand back what's been free past its delay
   (`spawn_memory_returner` in `src/main.rs`). It would otherwise do so only when
   something next asks it for whole pages, which a steady server may never do: a big
@@ -1076,12 +1095,14 @@ hit rates share the seeding flaw described above.
 - The server binds to `127.0.0.1` by default. If you expose it, set a password,
   and use TLS outside a private network. No client certificates, no
   certificate reloading without a restart.
-- **Big hashes are slow to change**: a hash is one entry, so every write
-  copies all of it (fine at the tens of fields caches keep, O(n) per write
-  at thousands; Redis switches to a hash table past 128 fields), and reads
-  scan it. `HGET` costs about 1.7× a `GET` at pipeline 16 (235 against 145 ns
-  in the in-process benchmark, 10 fields), mostly in the cache lines the
-  scan touches. No field TTLs (`HEXPIRE`).
+- **A big hash or set stops to grow**: its table and buffers double all at once, under
+  its shard's lock, where Redis and Valkey rehash a little at a time. Filling one to 8M,
+  the longest stop was 614 ms for a hash and 817 ms for a set (Redis and Valkey: 5-8 ms
+  for the hash), in proportion to its size, and commands on that shard wait it out.
+- **A small hash is scanned and written whole**: `HGET` costs about 1.6× a `GET` at
+  pipeline 16 (243 against 155 ns in the in-process benchmark, 10 fields), mostly in
+  the cache lines the scan touches, and a write copies it, up to 512 fields or 8 KB.
+  No field TTLs (`HEXPIRE`).
 - **`SCAN` on very big stores**: each call reads a whole shard's table, so
   at 100M keys (390k per shard) a call holds a lock for ~165 µs, which
   commands on that shard wait out, and a whole scan reads each table up to
@@ -1126,12 +1147,13 @@ hit rates share the seeding flaw described above.
   entries would feel.
 - **Memory gaps**: in real memory, the growth of RSS per item of a 32-byte value
   (`bench/agent37/memtypes.py`), strings (56.8 bytes; Redis 96.6, Valkey 79.6) and
-  a big sorted set (67.4; 108.4, 100.0) and a big set (44.5; 64.0, 54.2) lead and a
-  big list ties (34.5; 34.9, 35.0), but small collections of ten in one key trail:
+  a big sorted set (67.4; 108.4, 100.0), a big set (44.5; 64.0, 54.2) and a big hash
+  (63.2; 80.0, 70.2) lead and a big list ties (34.5; 34.9, 35.0), but small collections of ten in one key trail:
   hashes 53.6 (51.1, 50.2), lists 51.2 (45.2, 43.9), sets 49.6 (45.2, 43.9), sorted
   sets 54.7 (51.0, 50.1). With 8-byte values small lists lead (see above).
   `used_memory` can also be off, as it counts capacity not yet touched: a big list's
-  says 38.4, and a big set's 58.7, so `maxmemory` starts evicting a little early.
+  says 38.4, a big set's 58.7 and a big hash's 105.5, so `maxmemory` starts evicting
+  early.
 - **Transaction gaps**: Redis refuses a write command with `-OOM` while
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client

@@ -1,7 +1,8 @@
-//! Big collections: lists, sets and sorted sets too big to stay packed in
-//! their entry, and streams. Their shard keeps them as objects and commands
+//! Big collections: hashes, lists, sets and sorted sets too big to stay packed
+//! in their entry, and streams. Their shard keeps them as objects and commands
 //! change them in place; the store sees them only through this module.
 
+use crate::hash::{self, BigHash};
 use crate::list::{self, BigList};
 use crate::segment::Kind;
 use crate::set::{self, BigSet};
@@ -10,6 +11,7 @@ use crate::zset::{self, BigZSet};
 
 #[derive(Clone)]
 pub enum Collection {
+    Hash(BigHash),
     List(BigList),
     Set(BigSet),
     ZSet(BigZSet),
@@ -30,6 +32,7 @@ impl std::fmt::Debug for Collection {
 impl Collection {
     pub fn kind(&self) -> Kind {
         match self {
+            Collection::Hash(_) => Kind::Hash,
             Collection::List(_) => Kind::List,
             Collection::Set(_) => Kind::Set,
             Collection::ZSet(_) => Kind::ZSet,
@@ -40,6 +43,7 @@ impl Collection {
     /// Roughly what it takes in memory, for `used_memory` and eviction.
     pub fn allocation_size(&self) -> usize {
         match self {
+            Collection::Hash(hash) => hash.allocation_size(),
             Collection::List(list) => list.allocation_size(),
             Collection::Set(set) => set.allocation_size(),
             Collection::ZSet(set) => set.allocation_size(),
@@ -51,6 +55,7 @@ impl Collection {
     /// snapshots.
     pub fn to_compact(&self) -> Vec<u8> {
         match self {
+            Collection::Hash(hash) => hash.to_packed(),
             Collection::List(list) => list.to_packed(),
             Collection::Set(set) => set.to_compact(),
             Collection::ZSet(set) => set.to_packed(),
@@ -61,6 +66,7 @@ impl Collection {
     /// The big form of packed bytes (`is_valid` ones).
     pub fn from_compact(kind: Kind, bytes: &[u8]) -> Self {
         match kind {
+            Kind::Hash => Collection::Hash(BigHash::from_packed(bytes)),
             Kind::List => Collection::List(BigList::from_packed(bytes)),
             Kind::Set => Collection::Set(BigSet::from_compact(bytes)),
             Kind::ZSet => Collection::ZSet(BigZSet::from_packed(bytes)),
@@ -76,6 +82,7 @@ impl Collection {
 /// staying packed; past them it becomes a [`Collection`].
 pub fn fits_compact(kind: Kind, bytes: &[u8]) -> bool {
     match kind {
+        Kind::Hash => hash::fits_packed(bytes),
         Kind::List => list::fits_packed(bytes),
         Kind::Set => set::fits_compact(bytes),
         Kind::ZSet => zset::fits_packed(bytes),
@@ -87,6 +94,7 @@ pub fn fits_compact(kind: Kind, bytes: &[u8]) -> bool {
 /// Whether `bytes` are packed contents of `kind`, for values read from files.
 pub fn is_valid(kind: Kind, bytes: &[u8]) -> bool {
     match kind {
+        Kind::Hash => hash::is_valid(bytes),
         Kind::List => list::is_valid(bytes),
         Kind::Set => set::is_valid(bytes),
         Kind::ZSet => zset::is_valid(bytes),

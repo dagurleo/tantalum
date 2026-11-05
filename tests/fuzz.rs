@@ -335,7 +335,7 @@ const WORDS: &[&[u8]] = &[
 /// few keys: random arguments rarely line those up.
 fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
     const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
-    let choice = rng.below(35);
+    let choice = rng.below(38);
     let mut key = || rng.pick(KEYS).to_vec();
     let words = |w: &[&str]| w.iter().map(|w| w.as_bytes().to_vec()).collect::<Vec<_>>();
     let mut args = match choice {
@@ -422,6 +422,19 @@ fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
             words(&["XGROUP", "DELCONSUMER"]),
             vec![key()],
             words(&["g", "c"]),
+        ]
+        .concat(),
+        // A hash past its packed limits, to change in place, and fields to find.
+        34 => [
+            vec![b"HSET".to_vec(), key(), b"long".to_vec()],
+            vec![vec![b'l'; 9_000]],
+        ]
+        .concat(),
+        35 => [vec![b"HDEL".to_vec(), key()], words(&["long", "a"])].concat(),
+        36 => [
+            words(&["HSCAN"]),
+            vec![key()],
+            words(&["0", "COUNT", "2"]),
         ]
         .concat(),
         _ => vec![b"DEL".to_vec(), key()],

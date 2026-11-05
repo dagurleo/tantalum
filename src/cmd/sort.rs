@@ -10,7 +10,7 @@ use crate::context::{Context, Session};
 use crate::list::{self, BigList};
 use crate::resp;
 use crate::store::{Key, Kind, Millis, OutOfMemory, Store, Update, View};
-use crate::{hash, set, zset};
+use crate::{set, zset};
 
 unsafe extern "C" {
     fn tantalum_strtod(s: *const c_char, len: usize, out: *mut f64) -> c_int;
@@ -153,9 +153,9 @@ fn look_up(store: &Store, now: Millis, pattern: &[u8], element: &[u8]) -> Option
     store.get_key(store.key(&name), now, |value| {
         let value = value?;
         match field {
-            Some(field) if value.kind() == Kind::Hash => {
-                hash::get(value.as_bytes(), field).map(<[u8]>::to_vec)
-            }
+            Some(field) if value.kind() == Kind::Hash => super::hash::view(value.view())
+                .get(field)
+                .map(<[u8]>::to_vec),
             None if value.kind() == Kind::String => Some(value.as_bytes().to_vec()),
             _ => None,
         }
