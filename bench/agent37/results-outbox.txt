@@ -290,3 +290,56 @@ round 3 tantalum-uring   add   59805 jobs/s    4.6 us/job | process   65084 jobs
 round 3 redis            add   37735 jobs/s   15.0 us/job | process   28374 jobs/s   34.8 us/job, server 0.99 cores
 round 3 tantalum         add   58662 jobs/s    4.7 us/job | process   63948 jobs/s   13.4 us/job, server 0.86 cores
 round 3 tantalum-b       add   58748 jobs/s    4.7 us/job | process   71978 jobs/s   11.7 us/job, server 0.84 cores
+
+# 0.19.4 (naof) against 0.19.3 (taof), both with --aof, up together, 3 s between
+# runs for the disk to settle (with servers that have no log up too, a slow spell
+# followed each run of a log-on server).
+round 1 taof       set-P1   ops    288638 p50 0.783 p99 1.455 user 1.102 kernel 2.355
+round 1 naof       set-P1   ops    290735 p50 0.767 p99 1.295 user 1.066 kernel 2.373
+round 1 taof       mix-P1   ops    326680 p50 0.679 p99 1.079 user 0.784 kernel 2.277
+round 1 naof       mix-P1   ops    321501 p50 0.687 p99 1.119 user 0.715 kernel 2.395
+round 1 taof       set-P16  ops   1144475 p50 3.039 p99 6.943 user 0.587 kernel 0.253
+round 1 naof       set-P16  ops   1178144 p50 2.847 p99 6.847 user 0.552 kernel 0.251
+round 1 taof       mix-P16  ops   2723019 p50 1.279 p99 2.447 user 0.212 kernel 0.154
+round 1 naof       mix-P16  ops   2757756 p50 1.271 p99 2.335 user 0.202 kernel 0.160
+round 2 naof       set-P1   ops    294130 p50 0.759 p99 1.231 user 1.033 kernel 2.359
+round 2 taof       set-P1   ops    295966 p50 0.759 p99 1.215 user 1.081 kernel 2.291
+round 2 naof       mix-P1   ops    327683 p50 0.671 p99 1.103 user 0.738 kernel 2.313
+round 2 taof       mix-P1   ops    319332 p50 0.671 p99 1.159 user 0.852 kernel 2.273
+round 2 naof       set-P16  ops   1342288 p50 2.463 p99 5.983 user 0.481 kernel 0.231
+round 2 taof       set-P16  ops   1281589 p50 2.543 p99 6.879 user 0.498 kernel 0.240
+round 2 naof       mix-P16  ops   2745032 p50 1.247 p99 2.831 user 0.205 kernel 0.160
+round 2 taof       mix-P16  ops   2739516 p50 1.271 p99 2.303 user 0.206 kernel 0.159
+round 3 taof       set-P1   ops    294260 p50 0.767 p99 1.271 user 1.053 kernel 2.338
+round 3 naof       set-P1   ops    299302 p50 0.743 p99 1.199 user 1.056 kernel 2.265
+round 3 taof       mix-P1   ops    330726 p50 0.663 p99 1.079 user 0.798 kernel 2.225
+round 3 naof       mix-P1   ops    317319 p50 0.671 p99 1.455 user 0.781 kernel 2.363
+round 3 taof       set-P16  ops   1261099 p50 2.591 p99 7.135 user 0.518 kernel 0.238
+round 3 naof       set-P16  ops   1329172 p50 2.447 p99 6.623 user 0.483 kernel 0.233
+round 3 taof       mix-P16  ops   2675428 p50 1.295 p99 2.943 user 0.207 kernel 0.166
+round 3 naof       mix-P16  ops   2805374 p50 1.231 p99 2.239 user 0.195 kernel 0.160
+round 4 naof       set-P1   ops    273896 p50 0.767 p99 1.791 user 1.117 kernel 2.519
+round 4 taof       set-P1   ops    267766 p50 0.815 p99 1.607 user 1.262 kernel 2.464
+round 4 naof       mix-P1   ops    255035 p50 0.879 p99 1.639 user 1.247 kernel 2.666
+round 4 taof       mix-P1   ops    247197 p50 0.903 p99 1.847 user 1.230 kernel 2.815
+round 4 naof       set-P16  ops    923146 p50 3.903 p99 8.159 user 0.697 kernel 0.331
+round 4 taof       set-P16  ops    888097 p50 4.015 p99 9.727 user 0.725 kernel 0.358
+round 4 naof       mix-P16  ops   1845872 p50 1.983 p99 4.063 user 0.316 kernel 0.221
+round 4 taof       mix-P16  ops   1558537 p50 2.271 p99 5.055 user 0.372 kernel 0.267
+round 5 taof       set-P1   ops    236558 p50 0.943 p99 1.847 user 1.403 kernel 2.807
+round 5 naof       set-P1   ops    289208 p50 0.751 p99 1.351 user 1.065 kernel 2.365
+round 5 taof       mix-P1   ops    226769 p50 1.007 p99 2.607 user 1.199 kernel 3.209
+round 5 naof       mix-P1   ops    233263 p50 0.951 p99 2.591 user 1.166 kernel 3.121
+round 5 taof       set-P16  ops   1171239 p50 2.927 p99 7.295 user 0.560 kernel 0.261
+round 5 naof       set-P16  ops   1021970 p50 3.359 p99 8.447 user 0.618 kernel 0.325
+round 5 taof       mix-P16  ops   2041214 p50 1.767 p99 4.159 user 0.284 kernel 0.204
+round 5 naof       mix-P16  ops   2449357 p50 1.447 p99 4.159 user 0.229 kernel 0.178
+round 6 naof       set-P1   ops    289803 p50 0.751 p99 1.455 user 1.083 kernel 2.360
+round 6 taof       set-P1   ops    275604 p50 0.783 p99 1.415 user 1.139 kernel 2.467
+round 6 naof       mix-P1   ops    310010 p50 0.679 p99 1.503 user 0.793 kernel 2.432
+round 6 taof       mix-P1   ops    247278 p50 0.895 p99 2.367 user 1.189 kernel 2.854
+round 6 naof       set-P16  ops    860084 p50 4.063 p99 10.367 user 0.737 kernel 0.411
+round 6 taof       set-P16  ops   1279806 p50 2.511 p99 7.135 user 0.506 kernel 0.234
+round 6 naof       mix-P16  ops   2323440 p50 1.543 p99 3.375 user 0.246 kernel 0.182
+round 6 taof       mix-P16  ops   2563257 p50 1.367 p99 3.023 user 0.224 kernel 0.162
+/prof/ab2-inside.sh: line 49:    25 Killed                  taskset -c "${SERVER_CPUS:-0}" bash -c "exec $c" > /tmp/$port.log 2>&1

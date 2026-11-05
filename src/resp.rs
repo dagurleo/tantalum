@@ -235,6 +235,10 @@ pub fn write_integer(out: &mut Vec<u8>, n: i64) {
 
 /// Writes the header of an array of `len` replies; the replies follow.
 pub fn write_array_header(out: &mut Vec<u8>, len: usize) {
+    if len < 10 {
+        out.extend_from_slice(&[b'*', b'0' + len as u8, b'\r', b'\n']);
+        return;
+    }
     out.push(b'*');
     out.extend_from_slice(itoa::Buffer::new().format(len).as_bytes());
     out.extend_from_slice(b"\r\n");

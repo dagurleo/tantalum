@@ -952,6 +952,10 @@ took 0.2–1.1 s, with SETs waiting at most 5–9 ms but p99.9 3.1 ms. With the
 log off, 0.19.0 matches 0.18.3 (`saturate.sh`, medians of 4 rounds: epoll P1
 −0.1%, P16 +1.0%; io_uring P1 −1.0%, P16 0.0%).
 
+Those numbers are from 0.19.0. 0.19.4 recycles the log's buffer, gives `SET`
+its fast path back and encodes faster, for +2.0–3.4% with the log on (6 paired
+rounds), on top of the epoll work above; the table is yet to be measured again.
+
 ### Earlier results
 
 v0.0.2 Linux runs (`bench/railway/results-network.txt`, `results-loopback.txt`)
@@ -1024,9 +1028,11 @@ hit rates share the seeding flaw described above.
   nor Tantalum Redis'. No `CONFIG SET appendonly`, and no `aof_rewrites`,
   `aof_delayed_fsync` and the rest of Redis' AOF counters in `INFO`. With
   the log on, writes take turns across threads, so they don't scale with
-  `--threads` (reads do), and pipelined SETs lose 30% (see Benchmarks):
-  `SET` skips its fast path, and the log's buffer is grown anew every 10
-  ms.
+  `--threads` (reads do), and pipelined SETs lose about 30% (see Benchmarks),
+  in many small costs per write: its turn, a clock read, encoding the command.
+  (Each write reads the clock on its turn, not once per batch: active expiry
+  runs on the real clock, so with an older time a command could find a key gone
+  that its replay would find alive.)
 - **Scripting gaps**: no `FUNCTION`/`FCALL` or Lua debugger (`SCRIPT DEBUG
   YES`). While a script runs, other clients wait, where Redis replies
   `-BUSY` after 5 s; `SCRIPT KILL` has to come from a connection on another

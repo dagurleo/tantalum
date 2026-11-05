@@ -309,8 +309,14 @@ pub fn execute(
         if args.len() == 2 && name.eq_ignore_ascii_case(b"GET") {
             return get(ctx, session, now, args, out);
         }
-        if args.len() >= 3 && name.eq_ignore_ascii_case(b"SET") && ctx.aof().is_none() {
-            return set(ctx, session, now, args, out);
+        if args.len() >= 3 && name.eq_ignore_ascii_case(b"SET") {
+            match ctx.aof() {
+                None => return set(ctx, session, now, args, out),
+                Some(aof) if !aof.failing() => {
+                    return logged(ctx, session, aof, set_command(), args, out);
+                }
+                Some(_) => {}
+            }
         }
     } else if let Some(subscriber) = session.subscriber()
         && !subscriber.take(out)
@@ -470,6 +476,12 @@ fn logged(
         crate::blocking::serve_ready(ctx, now);
     }
     reply
+}
+
+/// `SET`'s table entry, for `execute`'s fast path.
+fn set_command() -> &'static Command {
+    static SET: std::sync::OnceLock<&'static Command> = std::sync::OnceLock::new();
+    SET.get_or_init(|| find_command(b"SET").expect("SET is in the table"))
 }
 
 /// The name of the write command called `name`, if it is one.
