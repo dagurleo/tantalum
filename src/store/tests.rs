@@ -2193,3 +2193,152 @@ fn watched_keys_change_when_they_expire_or_are_evicted() {
         0
     );
 }
+
+#[test]
+fn big_strings_change_in_place_unless_shared() {
+    let store = Store::new(1);
+    let now = 1;
+    let key = store.key(b"big");
+    let size = INLINE_MAX * 2;
+    store
+        .set_key(
+            key,
+            &vec![1; size],
+            Condition::Always,
+            Expiry::Never,
+            now,
+            false,
+        )
+        .unwrap();
+    let same = |old: usize| Some(old);
+    let held_memory = |store: &Store| store.shards[0].inner.lock().mem.external;
+    let byte =
+        |store: &Store, i: usize| store.get_key(key, now, |value| value.unwrap().as_bytes()[i]);
+
+    // Same length: in place.
+    let edited = store.edit_string(key, now, same, |bytes, old| {
+        assert_eq!(old, size);
+        bytes[0] = 9;
+        ((), true)
+    });
+    assert!(edited.is_some());
+    assert_eq!(byte(&store, 0), 9);
+
+    // No room to grow until it has grown through a write.
+    assert!(
+        store
+            .edit_string(key, now, |old| Some(old + 1), |_, _| ((), true))
+            .is_none()
+    );
+    let before = held_memory(&store);
+    store
+        .update_key(key, now, |current| {
+            let mut new = current.unwrap().value.as_bytes().to_vec();
+            new.push(2);
+            (Update::Replace(Kind::String, new), ())
+        })
+        .unwrap();
+    assert!(
+        held_memory(&store) >= before + size,
+        "its room is counted as memory"
+    );
+    let at_room = held_memory(&store);
+    let edited = store.edit_string(
+        key,
+        now,
+        |old| Some(old + 8),
+        |bytes, old| {
+            assert_eq!(old, size + 1);
+            assert_eq!(&bytes[old..], [0; 8], "new bytes are zero");
+            (bytes.len(), true)
+        },
+    );
+    assert_eq!(edited, Some(size + 9));
+    assert_eq!(
+        held_memory(&store),
+        at_room,
+        "growing into its room adds nothing"
+    );
+    store.shards[0].inner.lock().check(&store.hasher);
+    assert_eq!(byte(&store, size), 2);
+
+    // A reader holding a reference keeps what it has: no edit until it's done.
+    let held = store.get_key(key, now, |value| value.unwrap().share());
+    assert!(
+        store
+            .edit_string(key, now, same, |_, _| ((), true))
+            .is_none()
+    );
+    assert_eq!(held.as_bytes()[0], 9);
+    drop(held);
+    assert!(
+        store
+            .edit_string(key, now, same, |_, _| ((), true))
+            .is_some()
+    );
+
+    // `new_len` can decline.
+    assert!(
+        store
+            .edit_string(key, now, |_| None, |_, _| ((), true))
+            .is_none()
+    );
+
+    // Not for small strings, other kinds or no key.
+    store
+        .set(b"small", b"v", Condition::Always, Expiry::Never, now, false)
+        .unwrap();
+    let small = store.key(b"small");
+    assert!(
+        store
+            .edit_string(small, now, same, |_, _| ((), true))
+            .is_none()
+    );
+    let missing = store.key(b"missing");
+    assert!(
+        store
+            .edit_string(missing, now, same, |_, _| ((), true))
+            .is_none()
+    );
+
+    // Gone, all its memory goes with it.
+    store
+        .update_key(key, now, |_| (Update::Delete, ()))
+        .unwrap();
+    assert_eq!(held_memory(&store), 0);
+    store.shards[0].inner.lock().check(&store.hasher);
+}
+
+#[test]
+fn an_edit_counts_as_a_write_only_if_it_says_so() {
+    let store = Store::new(1);
+    let now = 1;
+    let key = store.key(b"big");
+    store
+        .set_key(
+            key,
+            &vec![1; INLINE_MAX * 2],
+            Condition::Always,
+            Expiry::At(1000),
+            now,
+            false,
+        )
+        .unwrap();
+    let same = |old: usize| Some(old);
+    let writes = |store: &Store| store.shards[0].inner.lock().mem.writes;
+    let before = writes(&store);
+    store
+        .edit_string(key, now, same, |_, _| ((), false))
+        .unwrap();
+    assert_eq!(writes(&store), before);
+    store
+        .edit_string(key, now, same, |_, _| ((), true))
+        .unwrap();
+    assert_eq!(writes(&store), before + 1);
+    // An expired string isn't edited.
+    assert!(
+        store
+            .edit_string(key, 2000, same, |_, _| ((), true))
+            .is_none()
+    );
+}
