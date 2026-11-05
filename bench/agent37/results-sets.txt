@@ -1,0 +1,78 @@
+# 2026-11-05, Agent37 VM (Xeon E-2388G), one server core. 0.22.1 against 0.22.2, which
+# asks mimalloc once a second to hand back what it has had free past its delay.
+
+# A big set of 32-byte members: the growth of RSS per member, 3 s after each size,
+# setsizes.py, a fresh server each.
+#              0.5M   1M    2M    3M    4M    6M    8M
+# 0.22.1       73.4  74.9  73.3  70.7  53.3  70.3  53.6
+# 0.22.2       53.2  50.0  49.5  45.2  48.1  44.4  47.8
+# Redis 7.2.4  59.7  61.4  57.0  64.0  54.7  62.5  54.7
+# Valkey       64.4  64.1  64.0  54.2  63.9  54.1  63.8
+
+# The same in 0.22.1 with mimalloc's purge delay at 0, at 3M: 44.3, so its delay
+# isn't what was keeping it; what's asked of it is. The purge at once wasn't taken up
+# because dropping pages on every free has cost pipelined throughput before.
+
+# Each type on 0.22.2, 3M items of a 32-byte value, memtypes.py: only sets moved.
+string      purge     used_memory/item   56.6  RSS/item   56.8   slope: used   57.2  RSS   57.2
+list        purge     used_memory/item   38.4  RSS/item   34.4   slope: used   38.4  RSS   34.2
+set         purge     used_memory/item   58.7  RSS/item   44.5   slope: used   63.4  RSS   39.1
+zset        purge     used_memory/item   75.2  RSS/item   67.5   slope: used   81.4  RSS   65.2
+small-hash  purge     used_memory/item   51.6  RSS/item   53.6   slope: used   50.6  RSS   51.1
+small-list  purge     used_memory/item   49.2  RSS/item   51.1   slope: used   48.0  RSS   49.0
+small-set   purge     used_memory/item   47.8  RSS/item   49.6   slope: used   46.9  RSS   48.0
+small-zset  purge     used_memory/item   52.8  RSS/item   54.7   slope: used   52.1  RSS   52.8
+
+# Speed, memtier 3 x 80 on the other three cores, old = 0.22.1, new = 0.22.2, order
+# alternating by round. Fields: ops/s, p50 ms, p99 ms. big-values: 64 KB values over
+# 2,000 keys. reconnect: clients reconnecting every 20 requests.
+health, redis SET P1 ops/s: 291468.61
+health, redis SET P1 ops/s: 282633.50
+round 1 old set-P1 330603.69 0.65500 1.03100
+round 1 new set-P1 330274.82 0.65500 1.02300
+round 1 old mix-P1 334831.06 0.64700 1.04700
+round 1 new mix-P1 338201.25 0.63900 1.00700
+round 1 old set-P16 2581255.93 1.42300 2.28700
+round 1 new set-P16 2592739.24 1.42300 2.27100
+round 1 old mix-P16 3085974.93 1.19100 2.28700
+round 1 new mix-P16 3120110.13 1.17500 2.19100
+round 1 old big-values 41070.29 5.79100 8.89500
+round 1 new big-values 40791.23 5.82300 9.34300
+round 1 old reconnect 250885.74 0.91100 1.60700
+round 1 new reconnect 244521.73 0.92700 1.83100
+round 2 new set-P1 324292.71 0.67100 1.05500
+round 2 old set-P1 318955.58 0.68700 1.11900
+round 2 new mix-P1 330105.10 0.65500 1.01500
+round 2 old mix-P1 331821.15 0.65500 1.06300
+round 2 new set-P16 2307074.67 1.60700 2.44700
+round 2 old set-P16 2315138.33 1.64700 2.47900
+round 2 new mix-P16 3054048.03 1.19900 2.07900
+round 2 old mix-P16 3028445.93 1.20700 2.30300
+round 2 new big-values 40660.47 5.79100 9.47100
+round 2 old big-values 40253.38 5.95100 9.02300
+round 2 new reconnect 249845.12 0.91900 1.59900
+round 2 old reconnect 251364.58 0.91900 1.52700
+round 3 old set-P1 320385.85 0.68700 1.08700
+round 3 new set-P1 315572.47 0.69500 1.17500
+round 3 old mix-P1 335777.93 0.65500 1.01500
+round 3 new mix-P1 333732.42 0.64700 1.04700
+round 3 old set-P16 2314415.97 1.62300 2.47900
+round 3 new set-P16 2274119.18 1.64700 2.51100
+round 3 old mix-P16 3074506.57 1.19100 2.12700
+round 3 new mix-P16 2983511.43 1.23900 2.39900
+round 3 old big-values 40027.15 5.95100 9.47100
+round 3 new big-values 39546.25 6.14300 9.08700
+round 3 old reconnect 249902.51 0.91900 1.57500
+round 3 new reconnect 249529.91 0.91100 1.63900
+round 4 new set-P1 320791.23 0.68700 1.07100
+round 4 old set-P1 320321.47 0.67900 1.09500
+round 4 new mix-P1 332140.91 0.64700 1.11900
+round 4 old mix-P1 335280.79 0.65500 1.02300
+round 4 new set-P16 2293047.04 1.63900 2.43100
+round 4 old set-P16 2315573.01 1.61500 2.46300
+round 4 new mix-P16 3086181.28 1.19100 1.91900
+round 4 old mix-P16 3062694.71 1.19900 1.95100
+round 4 new big-values 39498.70 5.98300 8.95900
+round 4 old big-values 40198.32 6.04700 8.95900
+round 4 new reconnect 251544.86 0.91900 1.55100
+round 4 old reconnect 251357.06 0.92700 1.52700

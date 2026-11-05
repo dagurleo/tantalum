@@ -14,6 +14,28 @@ use tokio::net::TcpListener;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+}
+
+/// Hands back to the OS what the allocator has had free for a while. It would do
+/// so only when something next asks it for whole pages, which a steady server may
+/// never do: a big set's old buffer stayed resident from the moment it doubled,
+/// for 66% more memory than the set needed. Asking from this thread costs commands
+/// nothing, and memory freed and used again within the allocator's delay (a second
+/// by default) stays resident, so steady churn doesn't fault it back in.
+fn spawn_memory_returner() -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("tantalum-purge".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                // SAFETY: takes no pointers, and may be called from any thread.
+                unsafe { mi_collect(false) };
+            }
+        })
+}
+
 const USAGE: &str = "\
 Usage: tantalum [OPTIONS]
 
@@ -312,6 +334,7 @@ fn main() -> std::io::Result<()> {
     // After the log's commands ran again: they may still use keys that have
     // expired since.
     let _expirer = cmd::spawn_expirer(&ctx, Duration::from_millis(100));
+    let _memory_returner = spawn_memory_returner()?;
     server::handle_signals(ctx.clone())?;
     // TLS listens on its own port, on tokio loops even with io_uring (monoio
     // has no TLS here).

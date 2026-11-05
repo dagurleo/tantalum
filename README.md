@@ -253,7 +253,10 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   `SRANDMEMBER` pick in O(1) and `SSCAN` walks positions), and a hash table
   of positions. Measured with `used_memory` against Redis 7.2.4 (Docker):
   100k sets of ten 8-byte members take 12.5 bytes per member (Redis 17.8),
-  and one set of 1M take 23.0 (Redis 29.3). Entries of object kinds use the
+  and one set of 1M take 23.0 (Redis 29.3). In real memory, the growth of RSS
+  once settled, a set of 32-byte members takes 44-53 bytes each from 500,000 to
+  8M members (Redis 55-64, Valkey 54-64), ahead of both at every size measured
+  (`bench/agent37/results-sets.txt`). Entries of object kinds use the
   external bit to point into the shard's object table, so strings and
   hashes read the same bytes as before.
 - **Lists** (`src/list.rs`) are packed while small (up to 128 elements in
@@ -607,6 +610,12 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
     frees the old table, and through mimalloc those freed tables stayed stuck in
     partly used pages (~10 bytes/key at 1M keys). This is also why the default is
     256 shards rather than 1024: bigger tables per shard, all of them mappable.
+  Once a second a thread asks mimalloc to hand back what's been free past its delay
+  (`spawn_memory_returner` in `src/main.rs`). It would otherwise do so only when
+  something next asks it for whole pages, which a steady server may never do: a big
+  set's old buffer stayed resident from the moment it doubled, up to 74.9 bytes a
+  member for 45 in use. It costs commands nothing, memory reused within the delay
+  stays resident, and `tests/memory.rs` checks it in the real binary on Linux.
 - **Transparent huge pages are disabled for the process on Linux**, as Redis
   does. With them on (`always` on Railway's hosts), the kernel backed barely
   used 2 MB regions with whole huge pages: RSS was 114 MB instead of 97 MB at
@@ -1117,11 +1126,12 @@ hit rates share the seeding flaw described above.
   entries would feel.
 - **Memory gaps**: in real memory, the growth of RSS per item of a 32-byte value
   (`bench/agent37/memtypes.py`), strings (56.8 bytes; Redis 96.6, Valkey 79.6) and
-  a big sorted set (67.4; 108.4, 100.0) lead and a big list ties (34.5; 34.9,
-  35.0), but a big set trails (73.6; 63.9, 54.2), as do small collections of ten
-  in one key: hashes 53.6 (51.1, 50.2), lists 51.2 (45.2, 43.9), sets 49.6 (45.2,
-  43.9), sorted sets 54.7 (51.0, 50.1). With 8-byte values small lists lead (see
-  above). `used_memory` can also be off: a big list's says 38.4, a big set's 58.7.
+  a big sorted set (67.4; 108.4, 100.0) and a big set (44.5; 64.0, 54.2) lead and a
+  big list ties (34.5; 34.9, 35.0), but small collections of ten in one key trail:
+  hashes 53.6 (51.1, 50.2), lists 51.2 (45.2, 43.9), sets 49.6 (45.2, 43.9), sorted
+  sets 54.7 (51.0, 50.1). With 8-byte values small lists lead (see above).
+  `used_memory` can also be off, as it counts capacity not yet touched: a big list's
+  says 38.4, and a big set's 58.7, so `maxmemory` starts evicting a little early.
 - **Transaction gaps**: Redis refuses a write command with `-OOM` while
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client
