@@ -1100,6 +1100,39 @@ fn memory_budget() {
     );
 }
 
+/// Bytes a stream's entries and pending entries are accounted for, which real
+/// memory follows: on a real server, RSS grows 38.3 and 61.2 bytes for these.
+#[test]
+fn stream_memory_budget() {
+    use crate::stream::{BigStream, Group, StreamId};
+    let entries = 200_000;
+    let mut stream = BigStream::default();
+    for ms in 1..=entries {
+        stream.add(StreamId { ms, seq: 0 }, &[(b"f", &[b'v'; 32])]);
+    }
+    let bare = stream.allocation_size();
+    let per_entry = bare as f64 / entries as f64;
+    println!("memory per stream entry: {per_entry:.2} bytes");
+    assert!(
+        per_entry <= 38.0,
+        "{per_entry:.2} bytes per entry, over the 38 budget"
+    );
+    stream
+        .groups
+        .insert((*b"g").into(), Group::new(StreamId::MIN, 0));
+    let delivered = stream.with_group(b"g", |stream, group| {
+        let (consumer, _) = group.consumer(b"c", 1);
+        stream.deliver(group, consumer, 0, false, 1, |_| {})
+    });
+    assert_eq!(delivered, Some(entries as usize));
+    let per_pending = (stream.allocation_size() - bare) as f64 / entries as f64;
+    println!("memory per pending entry: {per_pending:.2} bytes");
+    assert!(
+        per_pending <= 58.0,
+        "{per_pending:.2} bytes per pending entry, over the 58 budget"
+    );
+}
+
 /// A whole scan returns every key that existed throughout exactly once, and
 /// no key twice, whatever happens between its steps: overwrites and
 /// compaction move entries, new keys move slots and grow the table, deletes

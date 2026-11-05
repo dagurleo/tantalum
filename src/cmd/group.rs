@@ -4,8 +4,6 @@
 //! As in Redis, what these do to a stream's groups isn't a change to clients
 //! watching the key (a `Done::Unseen`), unless they make the key itself.
 
-use std::sync::Arc;
-
 use super::stream::{
     Done, INVALID_ID, change, interval, parse_i64, parse_timeout_ms, read, reply_error, write_entry,
 };
@@ -16,7 +14,7 @@ use crate::cmd::{Args, Reply};
 use crate::context::{Context, Session};
 use crate::resp;
 use crate::store::{Key, Kind, Millis, Store};
-use crate::stream::{self, BigStream, Group, IdForm, StreamId, UNKNOWN_READS};
+use crate::stream::{self, BigStream, ConsumerId, Group, IdForm, StreamId, UNKNOWN_READS};
 
 /// A name as Redis' `%s` shows it: up to a NUL byte.
 fn shown(name: &[u8]) -> &[u8] {
@@ -147,13 +145,11 @@ fn serve_stream(
     let mut entries = Vec::new();
     let Some((n, shows, created)) = stream.with_group(request.group, |stream, group| {
         let (consumer, created) = group.consumer(request.consumer, request.now);
-        if let Some(consumer) = group.consumers.get_mut(&consumer) {
-            consumer.seen_time = request.now;
-        }
+        group.consumer_mut(consumer).seen_time = request.now;
         if after == StreamId::MAX {
             let n = stream.deliver(
                 group,
-                &consumer,
+                consumer,
                 request.count,
                 request.noack,
                 request.now,
@@ -165,7 +161,7 @@ fn serve_stream(
         let start = after.next().unwrap_or(StreamId::MAX);
         let n = stream.redeliver(
             group,
-            &consumer,
+            consumer,
             start,
             request.count,
             request.now,
@@ -767,11 +763,9 @@ pub(super) fn xpending(
         };
         if summary {
             resp::write_array_header(out, 4);
-            resp::write_integer(out, group.pending.len() as i64);
-            let (Some((&first, _)), Some((&last, _))) = (
-                group.pending.first_key_value(),
-                group.pending.last_key_value(),
-            ) else {
+            resp::write_integer(out, group.pending().len() as i64);
+            let (Some(first), Some(last)) = (group.pending().first(), group.pending().last())
+            else {
                 out.extend_from_slice(null);
                 out.extend_from_slice(null);
                 out.extend_from_slice(null_list);
@@ -779,15 +773,12 @@ pub(super) fn xpending(
             };
             write_id(out, first);
             write_id(out, last);
-            let busy = group
-                .consumers
-                .iter()
-                .filter(|(_, c)| !c.pending.is_empty());
+            let busy = group.consumers().filter(|c| !c.pending().is_empty());
             resp::write_array_header(out, busy.clone().count());
-            for (name, consumer) in busy {
+            for consumer in busy {
                 resp::write_array_header(out, 2);
-                resp::write_bulk(out, name);
-                resp::write_bulk(out, consumer.pending.len().to_string().as_bytes());
+                resp::write_bulk(out, consumer.name());
+                resp::write_bulk(out, consumer.pending().len().to_string().as_bytes());
             }
             return;
         }
@@ -802,7 +793,7 @@ pub(super) fn xpending(
             n += 1;
             resp::write_array_header(&mut body, 4);
             write_id(&mut body, id);
-            resp::write_bulk(&mut body, &pending.consumer);
+            resp::write_bulk(&mut body, group.owner(pending));
             resp::write_integer(&mut body, elapsed.max(0));
             resp::write_integer(&mut body, pending.delivery_count);
             n < count
@@ -810,9 +801,9 @@ pub(super) fn xpending(
         if count > 0 && start <= end {
             match consumer {
                 Some(name) => {
-                    if let Some(consumer) = group.consumers.get(name) {
-                        for &id in consumer.pending.range(start..=end) {
-                            if let Some(pending) = group.pending.get(&id)
+                    if let Some(consumer) = group.consumer_named(name) {
+                        for (id, ()) in consumer.pending().range(start, end) {
+                            if let Some(pending) = group.pending().get(id)
                                 && !add(id, pending)
                             {
                                 break;
@@ -821,7 +812,7 @@ pub(super) fn xpending(
                     }
                 }
                 None => {
-                    for (&id, pending) in group.pending.range(start..=end) {
+                    for (id, pending) in group.pending().range(start, end) {
                         if !add(id, pending) {
                             break;
                         }
@@ -907,11 +898,9 @@ fn parse_claim(args: &Args<'_>, now: i64) -> Result<Claim, Vec<u8>> {
 }
 
 /// The consumer `name`, made if need be, as just seen.
-fn seen_consumer(group: &mut Group, name: &[u8], now: i64) -> Arc<[u8]> {
+fn seen_consumer(group: &mut Group, name: &[u8], now: i64) -> ConsumerId {
     let (consumer, _) = group.consumer(name, now);
-    if let Some(consumer) = group.consumers.get_mut(&consumer) {
-        consumer.seen_time = now;
-    }
+    group.consumer_mut(consumer).seen_time = now;
     consumer
 }
 
@@ -960,8 +949,8 @@ pub(super) fn xclaim(
             let mut n = 0;
             for &id in &claim.ids {
                 let pending = group
-                    .pending
-                    .get(&id)
+                    .pending()
+                    .get(id)
                     .map(|p| (p.delivery_time, p.delivery_count));
                 // Gone from the stream: gone from the pending lists too.
                 if !stream.has_entry(id) {
@@ -988,12 +977,10 @@ pub(super) fn xclaim(
                 } else {
                     deliveries.wrapping_add(1)
                 };
-                group.assign(id, &consumer, claim.delivery, deliveries);
+                group.reassign(id, consumer, claim.delivery, deliveries);
                 write_claimed(&mut body, stream, id, claim.just_id);
                 n += 1;
-                if let Some(consumer) = group.consumers.get_mut(&consumer) {
-                    consumer.active_time = time;
-                }
+                group.consumer_mut(consumer).active_time = time;
             }
             let mut reply = Vec::with_capacity(body.len() + 16);
             resp::write_array_header(&mut reply, n);
@@ -1084,7 +1071,7 @@ pub(super) fn xautoclaim(
             while attempts > 0 && left > 0 {
                 attempts -= 1;
                 let Some(at) = from else { break };
-                let Some((&id, pending)) = group.pending.range(at..).next() else {
+                let Some((id, pending)) = group.pending().first_from(at) else {
                     from = None;
                     break;
                 };
@@ -1105,16 +1092,15 @@ pub(super) fn xautoclaim(
                 } else {
                     deliveries.wrapping_add(1)
                 };
-                group.assign(id, &consumer, time, deliveries);
+                group.reassign(id, consumer, time, deliveries);
                 write_claimed(&mut body, stream, id, just_id);
                 n += 1;
                 left -= 1;
-                if let Some(consumer) = group.consumers.get_mut(&consumer) {
-                    consumer.active_time = time;
-                }
+                group.consumer_mut(consumer).active_time = time;
             }
             let next = from
-                .and_then(|at| group.pending.range(at..).next().map(|(&id, _)| id))
+                .and_then(|at| group.pending().first_from(at))
+                .map(|(id, _)| id)
                 .unwrap_or(StreamId::MIN);
             let mut reply = Vec::with_capacity(body.len() + 64);
             resp::write_array_header(&mut reply, 3);
@@ -1249,34 +1235,36 @@ fn xinfo_stream(stream: &BigStream, args: &Args<'_>, resp3: bool, null: &[u8], o
         field(out, "lag");
         write_lag(out, stream, group, null);
         field(out, "pel-count");
-        resp::write_integer(out, group.pending.len() as i64);
+        resp::write_integer(out, group.pending().len() as i64);
         field(out, "pending");
-        resp::write_array_header(out, limit(group.pending.len()));
-        for (&id, pending) in group.pending.iter().take(limit(group.pending.len())) {
+        let shown = limit(group.pending().len());
+        resp::write_array_header(out, shown);
+        for (id, pending) in group.pending().iter().take(shown) {
             resp::write_array_header(out, 4);
             write_id(out, id);
-            resp::write_bulk(out, &pending.consumer);
+            resp::write_bulk(out, group.owner(pending));
             resp::write_integer(out, pending.delivery_time);
             resp::write_integer(out, pending.delivery_count);
         }
         field(out, "consumers");
-        resp::write_array_header(out, group.consumers.len());
-        for (name, consumer) in &group.consumers {
+        resp::write_array_header(out, group.consumer_count());
+        for consumer in group.consumers() {
             resp::write_map_header(out, 5, resp3);
             field(out, "name");
-            resp::write_bulk(out, name);
+            resp::write_bulk(out, consumer.name());
             field(out, "seen-time");
             resp::write_integer(out, consumer.seen_time);
             field(out, "active-time");
             resp::write_integer(out, consumer.active_time);
             field(out, "pel-count");
-            resp::write_integer(out, consumer.pending.len() as i64);
+            resp::write_integer(out, consumer.pending().len() as i64);
             field(out, "pending");
-            resp::write_array_header(out, limit(consumer.pending.len()));
-            for &id in consumer.pending.iter().take(limit(consumer.pending.len())) {
+            let shown = limit(consumer.pending().len());
+            resp::write_array_header(out, shown);
+            for (id, ()) in consumer.pending().iter().take(shown) {
                 resp::write_array_header(out, 3);
                 write_id(out, id);
-                let pending = group.pending.get(&id);
+                let pending = group.pending().get(id);
                 resp::write_integer(out, pending.map_or(0, |p| p.delivery_time));
                 resp::write_integer(out, pending.map_or(0, |p| p.delivery_count));
             }
@@ -1330,13 +1318,13 @@ pub(super) fn xinfo(
                 resp::write_error(out, &no_such_group(key_name, args.get(3)));
                 return;
             };
-            resp::write_array_header(out, group.consumers.len());
-            for (name, consumer) in &group.consumers {
+            resp::write_array_header(out, group.consumer_count());
+            for consumer in group.consumers() {
                 resp::write_map_header(out, 4, resp3);
                 field(out, "name");
-                resp::write_bulk(out, name);
+                resp::write_bulk(out, consumer.name());
                 field(out, "pending");
-                resp::write_integer(out, consumer.pending.len() as i64);
+                resp::write_integer(out, consumer.pending().len() as i64);
                 field(out, "idle");
                 resp::write_integer(out, time.wrapping_sub(consumer.seen_time).max(0));
                 field(out, "inactive");
@@ -1356,9 +1344,9 @@ pub(super) fn xinfo(
                 field(out, "name");
                 resp::write_bulk(out, name);
                 field(out, "consumers");
-                resp::write_integer(out, group.consumers.len() as i64);
+                resp::write_integer(out, group.consumer_count() as i64);
                 field(out, "pending");
-                resp::write_integer(out, group.pending.len() as i64);
+                resp::write_integer(out, group.pending().len() as i64);
                 field(out, "last-delivered-id");
                 write_id(out, group.last_id);
                 field(out, "entries-read");

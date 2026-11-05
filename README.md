@@ -274,13 +274,23 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   values from empty to 4 KB, gave the same replies from Redis 7.2.4. The
   entries themselves are stored more compactly than a listpack: varint IDs
   relative to the chunk's first, varint lengths, field names left out when
-  they're the chunk's first entry's. Against Redis 7.2.4 (`used_memory`),
-  100,000 BullMQ-like events take 32.2 bytes each (Redis 41.8), entries of
-  one 8-byte field 13.0 (Redis 20.9). A stream is always an object
-  (`collection.rs`); string entries pay nothing for it.
-- **Consumer groups** (`src/stream.rs`, `src/cmd/group.rs`) are ordered trees
-  by name, as Redis' radix trees list them: a group's pending entries by ID,
-  each consumer's too. A stream without groups holds no memory for them and
+  they're the chunk's first entry's. A chunk that's done is copied to an
+  exact fit (asked to shrink by less than half, mimalloc keeps the block, so
+  `shrink_to_fit` had left every chunk in a 5,120-byte one and `used_memory` a
+  third below what the process really took), and the next starts about that
+  size. In real memory, the growth of RSS over 5M entries, an entry of one
+  32-byte value takes 38.3 bytes (Redis 7.2.4 44.0, Valkey 44.2), of one 8-byte
+  value 13.8 (21.6, 21.7). A stream is always an object (`collection.rs`);
+  string entries pay nothing for it.
+- **Consumer groups** (`src/stream.rs`, `src/cmd/group.rs`) keep groups and
+  consumers by name, as Redis' radix trees list them, and a group's pending
+  entries by ID, each consumer's too, in sorted leaves of 64 under a tree of
+  where they start (`src/id_map.rs`). Entries delivered in order fill each leaf,
+  where a B-tree's nodes stay half empty, and each knows its consumer by a
+  number, so a pending entry takes 61.2 bytes of RSS, 10 consumers or one
+  (Redis 242.3, Valkey 126.2). Entries that don't come in order split a leaf,
+  and leaves left nearly empty join a neighbour. A stream without groups holds
+  no memory for them and
   takes the same path as before; other kinds' objects stay the size they were
   (a test keeps it so). 225,000 commands against Redis 7.2.4 gave the same
   replies, times within a tolerance, over every argument error in both
@@ -293,25 +303,26 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
 
   | | Pipeline | Redis 7.2.4 | Valkey | Tantalum | vs Redis | p99, Redis / Tantalum |
   |---|---|---|---|---|---|---|
-  | `XADD` | 1 | 271,148 | 268,460 | 340,982 | +26% | 1.69 / 1.01 ms |
-  | | 16 | 1,017,783 | 982,623 | 2,200,207 | +116% | 4.81 / 2.59 ms |
-  | `XREADGROUP` `COUNT 1` | 1 | 152,672 | 155,429 | 253,292 | +66% | 2.85 / 1.32 ms |
-  | | 16 | 297,503 | 314,757 | 693,659 | +133% | 16.32 / 6.86 ms |
-  | `XREADGROUP` `COUNT 10` | 1 | 85,821 | 64,484 | 164,124 | +91% | 4.65 / 1.99 ms |
-  | | 16 | 111,344 | 80,189 | 264,661 | +138% | 46.08 / 15.07 ms |
-  | `XACK` | 1 | 311,840 | 298,431 | 365,721 | +17% | 1.51 / 0.99 ms |
-  | | 16 | 1,652,493 | 1,468,545 | 2,822,230 | +71% | 4.32 / 2.24 ms |
-  | `XPENDING` | 1 | 233,579 | 223,459 | 349,344 | +50% | 1.95 / 0.96 ms |
-  | | 16 | 910,759 | 816,735 | 2,630,945 | +189% | 5.71 / 2.52 ms |
-  | `XPENDING` of 10 rows | 1 | 180,055 | 162,142 | 291,906 | +62% | 2.27 / 1.13 ms |
-  | | 16 | 403,159 | 327,113 | 818,623 | +103% | 15.42 / 6.86 ms |
-  | `XINFO GROUPS` | 1 | 286,926 | 273,451 | 336,158 | +17% | 1.62 / 0.99 ms |
-  | | 16 | 1,232,139 | 1,110,448 | 2,075,714 | +68% | 5.34 / 3.17 ms |
+  | `XADD` | 1 | 245,087 | 246,770 | 304,380 | +24% | 1.91 / 1.29 ms |
+  | | 16 | 997,990 | 980,581 | 2,300,654 | +131% | 6.35 / 2.81 ms |
+  | `XREADGROUP` `COUNT 1` | 1 | 142,518 | 147,048 | 251,679 | +77% | 3.27 / 1.45 ms |
+  | | 16 | 289,085 | 305,254 | 761,258 | +163% | 17.28 / 5.89 ms |
+  | `XREADGROUP` `COUNT 10` | 1 | 82,430 | 63,640 | 200,498 | +143% | 4.96 / 1.74 ms |
+  | | 16 | 103,083 | 80,287 | 342,288 | +232% | 51.97 / 16.13 ms |
+  | `XACK` | 1 | 281,264 | 284,264 | 348,313 | +24% | 1.68 / 1.05 ms |
+  | | 16 | 1,655,401 | 1,471,894 | 2,525,810 | +53% | 3.24 / 2.58 ms |
+  | `XPENDING` | 1 | 202,725 | 195,900 | 314,098 | +55% | 2.19 / 1.16 ms |
+  | | 16 | 879,803 | 800,729 | 2,419,144 | +175% | 5.81 / 2.63 ms |
+  | `XPENDING` of 10 rows | 1 | 163,798 | 153,748 | 250,953 | +53% | 2.70 / 1.47 ms |
+  | | 16 | 379,690 | 313,722 | 733,710 | +93% | 16.06 / 8.56 ms |
+  | `XINFO GROUPS` | 1 | 263,848 | 254,163 | 310,802 | +18% | 1.76 / 1.09 ms |
+  | | 16 | 1,192,991 | 1,071,877 | 1,833,924 | +54% | 4.85 / 3.45 ms |
 
-  With one client, so counting only what a server spends, Tantalum takes 55-76%
-  less CPU per command than Redis on each of these and on `XCLAIM`, `XAUTOCLAIM`,
-  a consumer's history and a read-and-acknowledge cycle. A pending entry takes
-  147 bytes of RSS (Redis 242, Valkey 126). A client blocked in `XREADGROUP`
+  With one client, so counting only what a server spends, 0.22.0 took 55-76% less
+  CPU per command than Redis on each of these and on `XCLAIM`, `XAUTOCLAIM`, a
+  consumer's history and a read-and-acknowledge cycle; since then, on x86-64,
+  `XREADGROUP` of 10 takes 30% fewer instructions and `XACK` 11% fewer. A client blocked in
+  `XREADGROUP`
   registers with the clients watching its key, which writes check for anyway,
   so it wakes when the key changes without `GET` or `SET` paying for it. Their
   fast paths don't look for ready keys, though, so a stream overwritten by `SET`,
@@ -1101,11 +1112,16 @@ hit rates share the seeding flaw described above.
   nothing to relax: there's no check before a script runs that memory is
   under `maxmemory` (a write over it fails inside the script instead). No
   `used_memory_lua` or `number_of_cached_scripts` in `INFO`.
-- **Stream gaps**: a pending entry takes more than in Valkey (147 bytes of RSS
-  against 126): trees half fill when entries come in order, and chunks that
-  fill up as a stream's do should take about a third of that. `XINFO STREAM`
-  walks the stream's chunks for `radix-tree-nodes`, under the shard's lock, which
-  a stream of billions of entries would feel.
+- **Stream gaps**: `XINFO STREAM` walks the stream's chunks for
+  `radix-tree-nodes`, under the shard's lock, which a stream of billions of
+  entries would feel.
+- **Memory gaps**: in real memory, the growth of RSS per item of a 32-byte value
+  (`bench/agent37/memtypes.py`), strings (56.8 bytes; Redis 96.6, Valkey 79.6) and
+  a big sorted set (67.4; 108.4, 100.0) lead and a big list ties (34.5; 34.9,
+  35.0), but a big set trails (73.6; 63.9, 54.2), as do small collections of ten
+  in one key: hashes 53.6 (51.1, 50.2), lists 51.2 (45.2, 43.9), sets 49.6 (45.2,
+  43.9), sorted sets 54.7 (51.0, 50.1). With 8-byte values small lists lead (see
+  above). `used_memory` can also be off: a big list's says 38.4, a big set's 58.7.
 - **Transaction gaps**: Redis refuses a write command with `-OOM` while
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client

@@ -707,10 +707,10 @@ mod tests {
         let mut group = Group::new(id(5), 5);
         let (alice, _) = group.consumer(b"alice", 1_000);
         let (bob, _) = group.consumer(b"b\xffb", 2_000);
-        group.assign(id(1), &alice, 3_000, 1);
-        group.assign(id(2), &alice, 3_001, 7);
-        group.assign(id(3), &bob, 3_002, i64::MAX);
-        group.consumers.get_mut(&alice).unwrap().active_time = 3_001;
+        group.assign(id(1), alice, 3_000, 1);
+        group.assign(id(2), alice, 3_001, 7);
+        group.assign(id(3), bob, 3_002, i64::MAX);
+        group.consumer_mut(alice).active_time = 3_001;
         stream.groups.insert((*b"g").into(), group);
         stream
             .groups

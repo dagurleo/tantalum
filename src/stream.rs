@@ -15,8 +15,10 @@
 //! inside it) towards its 100, and goes when its last entry does (by
 //! `XDEL`). A stream stays when it's emptied, keeping its last ID.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
+
+use crate::id_map::IdMap;
 
 /// Redis' defaults for `stream-node-max-entries` and `-max-bytes`.
 const NODE_MAX_ENTRIES: usize = 100;
@@ -25,12 +27,11 @@ const NODE_MAX_BYTES: usize = 4096;
 const SAME_FIELDS: u8 = 1;
 /// A group's `entries_read` when it isn't known.
 pub const UNKNOWN_READS: i64 = -1;
-/// What a pending entry takes, in its group's tree and its consumer's: measured,
-/// the growth of a server's RSS as a million entries were delivered in order.
-const PENDING_BYTES: usize = 147;
-/// About what a consumer and a group take, without their names.
-const CONSUMER_BYTES: usize = 112;
-const GROUP_BYTES: usize = 160;
+/// About what a consumer takes besides its slot and its pending list: its name's
+/// header, and its place in the tree of names.
+const CONSUMER_BYTES: usize = 64;
+/// About what a group takes besides what it holds.
+const GROUP_BYTES: usize = 192;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StreamId {
@@ -358,112 +359,246 @@ impl Chunk {
     }
 }
 
-/// An entry delivered to a consumer and not acknowledged.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// An entry delivered to a consumer and not acknowledged. There can be millions,
+/// so it's packed, and knows its consumer by number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, packed(4))]
 pub struct Pending {
     /// Unix milliseconds.
     pub delivery_time: i64,
     pub delivery_count: i64,
-    pub consumer: Arc<[u8]>,
+    consumer: u32,
 }
 
 /// A consumer in a group.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Consumer {
+    name: Arc<[u8]>,
     /// When it last tried to read or claim, Unix milliseconds.
     pub seen_time: i64,
     /// When it last got an entry; -1 if it never has.
     pub active_time: i64,
     /// The entries pending for it, each also in its group's list.
-    pub pending: BTreeSet<StreamId>,
+    pending: IdMap<()>,
 }
+
+impl Consumer {
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
+    pub fn pending(&self) -> &IdMap<()> {
+        &self.pending
+    }
+}
+
+/// A consumer of a group, for the length of a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerId(u32);
 
 /// A consumer group. Consumers and groups sort by name, as Redis' radix trees
 /// do, which is the order `XINFO` lists them in.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Group {
     pub last_id: StreamId,
     /// How many entries it has read, or [`UNKNOWN_READS`].
     pub entries_read: i64,
-    pub pending: BTreeMap<StreamId, Pending>,
-    pub consumers: BTreeMap<Arc<[u8]>, Consumer>,
-    /// What its pending entries and consumers take, kept as they change.
-    bytes: usize,
+    pending: IdMap<Pending>,
+    by_name: BTreeMap<Arc<[u8]>, ConsumerId>,
+    /// Its consumers by number; `free` has the numbers of those gone.
+    slots: Vec<Option<Consumer>>,
+    free: Vec<u32>,
+    /// What its consumers take but for their slots, kept as they change.
+    consumer_bytes: usize,
 }
+
+impl Clone for Group {
+    fn clone(&self) -> Self {
+        let slots = self.slots.clone();
+        // Copies of pending lists have no spare room, so they take less.
+        let consumer_bytes = slots
+            .iter()
+            .flatten()
+            .map(|consumer| CONSUMER_BYTES + consumer.name.len() + consumer.pending.bytes())
+            .sum();
+        Group {
+            last_id: self.last_id,
+            entries_read: self.entries_read,
+            pending: self.pending.clone(),
+            by_name: self.by_name.clone(),
+            slots,
+            free: self.free.clone(),
+            consumer_bytes,
+        }
+    }
+}
+
+/// The same as far as a client can tell, however it's laid out.
+impl PartialEq for Group {
+    fn eq(&self, other: &Self) -> bool {
+        fn pending(group: &Group) -> impl Iterator<Item = (StreamId, i64, i64, &[u8])> {
+            group
+                .pending
+                .iter()
+                .map(|(id, p)| (id, p.delivery_time, p.delivery_count, group.owner(p)))
+        }
+        fn consumers(group: &Group) -> impl Iterator<Item = (&[u8], i64, i64, Vec<StreamId>)> {
+            group.consumers().map(|c| {
+                let ids = c.pending.iter().map(|(id, _)| id).collect();
+                (c.name(), c.seen_time, c.active_time, ids)
+            })
+        }
+        self.last_id == other.last_id
+            && self.entries_read == other.entries_read
+            && pending(self).eq(pending(other))
+            && consumers(self).eq(consumers(other))
+    }
+}
+
+impl Eq for Group {}
 
 impl Group {
     pub fn new(last_id: StreamId, entries_read: i64) -> Self {
         Group {
             last_id,
             entries_read,
-            pending: BTreeMap::new(),
-            consumers: BTreeMap::new(),
-            bytes: 0,
+            pending: IdMap::default(),
+            by_name: BTreeMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            consumer_bytes: 0,
         }
     }
 
+    /// What it has allocated.
+    fn bytes(&self) -> usize {
+        GROUP_BYTES
+            + self.pending.bytes()
+            + self.consumer_bytes
+            + self.slots.capacity() * size_of::<Option<Consumer>>()
+            + self.free.capacity() * size_of::<u32>()
+    }
+
+    pub fn pending(&self) -> &IdMap<Pending> {
+        &self.pending
+    }
+
+    /// The name of the consumer an entry is pending for.
+    pub fn owner(&self, pending: &Pending) -> &[u8] {
+        self.slot(ConsumerId(pending.consumer)).name()
+    }
+
+    fn slot(&self, id: ConsumerId) -> &Consumer {
+        self.slots[id.0 as usize].as_ref().expect("a live consumer")
+    }
+
+    pub fn consumer_mut(&mut self, id: ConsumerId) -> &mut Consumer {
+        self.slots[id.0 as usize].as_mut().expect("a live consumer")
+    }
+
+    /// Its consumers, by name.
+    pub fn consumers(&self) -> impl Iterator<Item = &Consumer> + Clone {
+        self.by_name.values().map(|&id| self.slot(id))
+    }
+
+    pub fn consumer_count(&self) -> usize {
+        self.by_name.len()
+    }
+
+    pub fn consumer_named(&self, name: &[u8]) -> Option<&Consumer> {
+        self.by_name.get(name).map(|&id| self.slot(id))
+    }
+
     /// The consumer called `name`, made if there's none (then `true`).
-    pub fn consumer(&mut self, name: &[u8], now: i64) -> (Arc<[u8]>, bool) {
-        if let Some((name, _)) = self.consumers.get_key_value(name) {
-            return (name.clone(), false);
+    pub fn consumer(&mut self, name: &[u8], now: i64) -> (ConsumerId, bool) {
+        if let Some(&id) = self.by_name.get(name) {
+            return (id, false);
         }
         let name: Arc<[u8]> = name.into();
-        self.bytes += CONSUMER_BYTES + name.len();
-        self.consumers.insert(
-            name.clone(),
-            Consumer {
-                seen_time: now,
-                active_time: -1,
-                pending: BTreeSet::new(),
-            },
-        );
-        (name, true)
+        self.consumer_bytes += CONSUMER_BYTES + name.len();
+        let consumer = Consumer {
+            name: name.clone(),
+            seen_time: now,
+            active_time: -1,
+            pending: IdMap::default(),
+        };
+        let id = match self.free.pop() {
+            Some(slot) => {
+                self.slots[slot as usize] = Some(consumer);
+                ConsumerId(slot)
+            }
+            None => {
+                self.slots.push(Some(consumer));
+                ConsumerId(self.slots.len() as u32 - 1)
+            }
+        };
+        self.by_name.insert(name, id);
+        (id, true)
     }
 
     /// Removes a consumer and what's pending for it, returning how many were.
     pub fn remove_consumer(&mut self, name: &[u8]) -> Option<usize> {
-        let (name, consumer) = self.consumers.remove_entry(name)?;
-        self.bytes -= CONSUMER_BYTES + name.len();
-        self.bytes -= consumer.pending.len() * PENDING_BYTES;
-        for id in &consumer.pending {
+        let (name, id) = self.by_name.remove_entry(name)?;
+        let consumer = self.slots[id.0 as usize].take().expect("a live consumer");
+        self.free.push(id.0);
+        self.consumer_bytes -= CONSUMER_BYTES + name.len() + consumer.pending.bytes();
+        for (id, ()) in consumer.pending.iter() {
             self.pending.remove(id);
         }
         Some(consumer.pending.len())
     }
 
+    /// Runs `f` on a consumer's pending list, keeping count of what it takes.
+    fn pending_of<R>(&mut self, id: ConsumerId, f: impl FnOnce(&mut IdMap<()>) -> R) -> R {
+        let list = &mut self.consumer_mut(id).pending;
+        let before = list.bytes();
+        let result = f(list);
+        let after = list.bytes();
+        self.consumer_bytes = self.consumer_bytes + after - before;
+        result
+    }
+
     /// Takes an entry off the pending lists.
     pub fn acknowledge(&mut self, id: StreamId) -> bool {
-        let Some(pending) = self.pending.remove(&id) else {
+        let Some(pending) = self.pending.remove(id) else {
             return false;
         };
-        self.bytes -= PENDING_BYTES;
-        if let Some(consumer) = self.consumers.get_mut(&pending.consumer) {
-            consumer.pending.remove(&id);
-        }
+        self.pending_of(ConsumerId(pending.consumer), |list| list.remove(id));
         true
     }
 
-    /// Makes `id` pending for `consumer`, which must exist, with this time and
-    /// count: from whoever had it, if someone did.
-    pub fn assign(&mut self, id: StreamId, consumer: &Arc<[u8]>, time: i64, count: i64) {
+    /// [`Group::assign`] for an entry that's likely pending already: a claim,
+    /// which needn't look for where a new one would go.
+    pub fn reassign(&mut self, id: StreamId, consumer: ConsumerId, time: i64, count: i64) {
+        let Some(pending) = self.pending.get_mut(id) else {
+            return self.assign(id, consumer, time, count);
+        };
+        let owner = ConsumerId(pending.consumer);
+        pending.delivery_time = time;
+        pending.delivery_count = count;
+        pending.consumer = consumer.0;
+        if owner != consumer {
+            self.pending_of(owner, |list| list.remove(id));
+            self.pending_of(consumer, |list| list.insert(id, ()));
+        }
+    }
+
+    /// Makes `id` pending for `consumer` with this time and count: from whoever
+    /// had it, if someone did.
+    pub fn assign(&mut self, id: StreamId, consumer: ConsumerId, time: i64, count: i64) {
         let pending = Pending {
             delivery_time: time,
             delivery_count: count,
-            consumer: consumer.clone(),
+            consumer: consumer.0,
         };
-        match self.pending.insert(id, pending) {
-            Some(old) => {
-                if old.consumer != *consumer
-                    && let Some(old) = self.consumers.get_mut(&old.consumer)
-                {
-                    old.pending.remove(&id);
-                }
+        if let Some(old) = self.pending.insert(id, pending) {
+            let owner = ConsumerId(old.consumer);
+            if owner == consumer {
+                return;
             }
-            None => self.bytes += PENDING_BYTES,
+            self.pending_of(owner, |list| list.remove(id));
         }
-        if let Some(consumer) = self.consumers.get_mut(consumer) {
-            consumer.pending.insert(id);
-        }
+        self.pending_of(consumer, |list| list.insert(id, ()));
     }
 }
 
@@ -521,7 +656,7 @@ impl BigStream {
             + self
                 .groups
                 .iter()
-                .map(|(name, group)| GROUP_BYTES + name.len() + group.bytes)
+                .map(|(name, group)| name.len() + group.bytes())
                 .sum::<usize>()
     }
 
@@ -647,7 +782,7 @@ impl BigStream {
     pub fn deliver(
         &self,
         group: &mut Group,
-        consumer: &Arc<[u8]>,
+        consumer: ConsumerId,
         count: usize,
         noack: bool,
         now: i64,
@@ -671,11 +806,8 @@ impl BigStream {
             n += 1;
             count == 0 || n < count
         });
-        if n > 0
-            && !noack
-            && let Some(consumer) = group.consumers.get_mut(consumer)
-        {
-            consumer.active_time = now;
+        if n > 0 && !noack {
+            group.consumer_mut(consumer).active_time = now;
         }
         n
     }
@@ -686,20 +818,18 @@ impl BigStream {
     pub fn redeliver(
         &self,
         group: &mut Group,
-        consumer: &[u8],
+        consumer: ConsumerId,
         start: StreamId,
         count: usize,
         now: i64,
         mut emit: impl FnMut(StreamId, Option<&Entry<'_>>),
     ) -> usize {
-        let Group {
-            pending, consumers, ..
-        } = group;
-        let Some(consumer) = consumers.get(consumer) else {
+        let Some(Some(consumer)) = group.slots.get(consumer.0 as usize) else {
             return 0;
         };
+        let pending = &mut group.pending;
         let mut n = 0;
-        for &id in consumer.pending.range(start..) {
+        for (id, ()) in consumer.pending.range(start, StreamId::MAX) {
             if count != 0 && n == count {
                 break;
             }
@@ -711,7 +841,7 @@ impl BigStream {
             });
             if !found {
                 emit(id, None);
-            } else if let Some(pending) = pending.get_mut(&id) {
+            } else if let Some(pending) = pending.get_mut(id) {
                 pending.delivery_time = now;
                 pending.delivery_count = pending.delivery_count.wrapping_add(1);
             }
@@ -801,11 +931,19 @@ impl BigStream {
             }
         };
         if starts_chunk {
-            // The last chunk is done growing: give back its spare capacity.
+            // The last chunk is done growing: a copy takes only what it holds.
+            // (Shrinking it in place wouldn't: an allocator may keep a block
+            // asked to shrink by less than half, and mimalloc does.) The next will
+            // likely hold about as much, so it won't have to grow its way there.
+            let mut room = 0;
             if let Some(last) = self.chunks.back_mut() {
                 let before = last.allocation_size();
-                last.data.shrink_to_fit();
+                let held = last.data.len();
+                if last.data.capacity() > held {
+                    last.data = last.data.as_slice().to_vec();
+                }
                 self.bytes = self.bytes + last.allocation_size() - before;
+                room = held + held / 8;
             }
             let mut fields = Vec::new();
             put_varint(&mut fields, pairs.len() as u64);
@@ -824,6 +962,7 @@ impl BigStream {
                 first: id,
                 last: id,
                 fields: fields.into(),
+                data: Vec::with_capacity(room),
                 lp_bytes,
                 ..Chunk::default()
             });
@@ -1025,26 +1164,23 @@ impl BigStream {
                 put_varint(&mut out, group.last_id.ms);
                 put_varint(&mut out, group.last_id.seq);
                 put_varint(&mut out, (group.entries_read as u64).wrapping_add(1));
-                put_varint(&mut out, group.consumers.len() as u64);
-                for (name, consumer) in &group.consumers {
+                put_varint(&mut out, group.consumer_count() as u64);
+                // Each pending entry says its consumer's place among them.
+                let mut places = vec![0; group.slots.len()];
+                for (place, (name, &id)) in group.by_name.iter().enumerate() {
+                    let consumer = group.slot(id);
+                    places[id.0 as usize] = place as u64;
                     put_bytes(&mut out, name);
                     put_varint(&mut out, consumer.seen_time as u64);
                     put_varint(&mut out, (consumer.active_time + 1) as u64);
                 }
                 put_varint(&mut out, group.pending.len() as u64);
-                // Each with its consumer's place among them.
-                let places: BTreeMap<&[u8], u64> = group
-                    .consumers
-                    .keys()
-                    .enumerate()
-                    .map(|(i, name)| (&**name, i as u64))
-                    .collect();
-                for (id, pending) in &group.pending {
+                for (id, pending) in group.pending.iter() {
                     put_varint(&mut out, id.ms);
                     put_varint(&mut out, id.seq);
                     put_varint(&mut out, pending.delivery_time as u64);
                     put_varint(&mut out, pending.delivery_count as u64);
-                    put_varint(&mut out, places[&*pending.consumer]);
+                    put_varint(&mut out, places[pending.consumer as usize]);
                 }
             }
         }
@@ -1090,12 +1226,12 @@ impl BigStream {
                 let consumer = get_bytes(bytes, pos)?;
                 let seen_time = get_varint(bytes, pos)? as i64;
                 let active_time = i64::try_from(get_varint(bytes, pos)?).ok()? - 1;
-                let (name, created) = group.consumer(consumer, seen_time);
+                let (id, created) = group.consumer(consumer, seen_time);
                 if !created {
                     return None;
                 }
-                group.consumers.get_mut(&name)?.active_time = active_time;
-                names.push(name);
+                group.consumer_mut(id).active_time = active_time;
+                names.push(id);
             }
             for _ in 0..get_varint(bytes, pos)? {
                 let id = StreamId {
@@ -1104,13 +1240,11 @@ impl BigStream {
                 };
                 let time = get_varint(bytes, pos)? as i64;
                 let count = get_varint(bytes, pos)? as i64;
-                let consumer = names
-                    .get(usize::try_from(get_varint(bytes, pos)?).ok()?)?
-                    .clone();
-                if group.pending.contains_key(&id) {
+                let consumer = *names.get(usize::try_from(get_varint(bytes, pos)?).ok()?)?;
+                if group.pending.get(id).is_some() {
                     return None;
                 }
-                group.assign(id, &consumer, time, count);
+                group.assign(id, consumer, time, count);
             }
             if groups.insert(name, group).is_some() {
                 return None;
@@ -1211,20 +1345,23 @@ impl BigStream {
             }
         }
         for group in self.groups.values() {
+            group.pending.check();
             let mut held = 0;
-            let mut bytes = group.pending.len() * PENDING_BYTES;
-            for (name, consumer) in &group.consumers {
-                bytes += CONSUMER_BYTES + name.len();
+            let mut bytes = 0;
+            for consumer in group.consumers() {
+                consumer.pending.check();
+                bytes += CONSUMER_BYTES + consumer.name.len() + consumer.pending.bytes();
                 held += consumer.pending.len();
-                for id in &consumer.pending {
-                    assert_eq!(
-                        &group.pending[id].consumer, name,
-                        "a pending entry's consumer"
-                    );
+                for (id, ()) in consumer.pending.iter() {
+                    let pending = group.pending.get(id).expect("pending in the group too");
+                    assert_eq!(group.owner(pending), consumer.name(), "its consumer");
                 }
             }
             assert_eq!(held, group.pending.len(), "pending entries, both ways");
-            assert_eq!(bytes, group.bytes, "a group's bytes");
+            assert_eq!(bytes, group.consumer_bytes, "a group's bytes");
+            let live = group.slots.iter().flatten().count();
+            assert_eq!(live, group.by_name.len(), "its consumers");
+            assert_eq!(live + group.free.len(), group.slots.len(), "its slots");
         }
     }
 }
@@ -1253,16 +1390,16 @@ mod tests {
         assert!(created);
         assert!(!group.consumer(b"a", 200).1);
         let (b, _) = group.consumer(b"b", 100);
-        group.assign(id(1, 0), &a, 150, 1);
-        group.assign(id(2, 0), &a, 160, 2);
-        group.assign(id(3, 0), &b, 170, 1);
+        group.assign(id(1, 0), a, 150, 1);
+        group.assign(id(2, 0), a, 160, 2);
+        group.assign(id(3, 0), b, 170, 1);
         // From one to the other.
-        group.assign(id(2, 0), &b, 180, 3);
-        assert_eq!(group.consumers[&a].pending.len(), 1);
-        assert_eq!(group.consumers[&b].pending.len(), 2);
+        group.assign(id(2, 0), b, 180, 3);
+        assert_eq!(group.consumer_named(b"a").unwrap().pending().len(), 1);
+        assert_eq!(group.consumer_named(b"b").unwrap().pending().len(), 2);
         assert!(group.acknowledge(id(1, 0)));
         assert!(!group.acknowledge(id(1, 0)));
-        group.consumers.get_mut(&b).unwrap().active_time = 190;
+        group.consumer_mut(b).active_time = 190;
         stream.groups.insert((*b"g").into(), group);
         stream
             .groups
@@ -1281,6 +1418,35 @@ mod tests {
         assert_eq!(group.remove_consumer(b"b"), None);
         assert!(group.pending.is_empty());
         stream.check();
+
+        // A number that's free goes to the next, and entries find theirs.
+        let group = stream.groups.get_mut(&b"g"[..]).unwrap();
+        let (c, _) = group.consumer(b"c", 300);
+        assert_eq!(c, b);
+        group.assign(id(4, 0), c, 310, 1);
+        assert_eq!(group.owner(group.pending().get(id(4, 0)).unwrap()), b"c");
+        stream.check();
+    }
+
+    /// A chunk that's done takes what it holds, however it grew: asked to
+    /// shrink by less than half, an allocator keeps the block.
+    #[test]
+    fn full_chunks_fit_what_they_hold() {
+        for value in [&b"v"[..], &[b'v'; 32], &[b'v'; 700]] {
+            let mut stream = BigStream::default();
+            for ms in 1..=2_000 {
+                stream.add(id(ms, 0), &[(b"f", value)]);
+            }
+            stream.check();
+            let last = stream.chunks.len() - 1;
+            assert!(last > 1);
+            for chunk in stream.chunks.iter().take(last) {
+                assert_eq!(chunk.data.capacity(), chunk.data.len());
+            }
+            // And the one still filling, sized by the last, has room to finish.
+            let full = stream.chunks[last - 1].data.len();
+            assert!(stream.chunks[last].data.capacity() >= full);
+        }
     }
 
     /// Groups leave the other collections' objects the size they were: a
