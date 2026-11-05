@@ -128,7 +128,16 @@ fn dump(ctx: &Context, cutoff: i64) -> String {
                 &mut session,
                 &[b"ZRANGE", &key, b"0", b"-1", b"WITHSCORES"],
             ),
-            b"+stream\r\n" => run(ctx, &mut session, &[b"XRANGE", &key, b"-", b"+"]),
+            b"+stream\r\n" => {
+                let mut stream = run(ctx, &mut session, &[b"XRANGE", &key, b"-", b"+"]);
+                let info = run(
+                    ctx,
+                    &mut session,
+                    &[b"XINFO", b"STREAM", &key, b"FULL", b"COUNT", b"0"],
+                );
+                stream.extend_from_slice(&without_seen_times(&info));
+                stream
+            }
             other => other.to_vec(),
         };
         out.push_str(&format!(
@@ -139,6 +148,21 @@ fn dump(ctx: &Context, cutoff: i64) -> String {
             String::from_utf8_lossy(&expires).trim()
         ));
     }
+    out
+}
+
+/// `XINFO STREAM FULL`'s reply without the times consumers were last seen.
+fn without_seen_times(info: &[u8]) -> Vec<u8> {
+    const SEEN: &[u8] = b"$9\r\nseen-time\r\n:";
+    let mut out = Vec::with_capacity(info.len());
+    let mut rest = info;
+    while let Some(at) = rest.windows(SEEN.len()).position(|w| w == SEEN) {
+        out.extend_from_slice(&rest[..at]);
+        rest = &rest[at + SEEN.len()..];
+        let end = rest.iter().position(|&b| b == b'\r').unwrap();
+        rest = &rest[end..];
+    }
+    out.extend_from_slice(rest);
     out
 }
 
@@ -245,7 +269,98 @@ fn step(
     let v = n(rng, 1000);
     let ms = (1 + rng.below(60)).to_string();
     let at = (ctx.store.now() + rng.below(80)).to_string();
-    let commands: Vec<Vec<String>> = match rng.below(53) {
+    let g = format!("g{}", rng.below(2));
+    let who = format!("c{}", rng.below(3));
+    let group_read = |rest: &[&str]| -> Vec<Vec<String>> {
+        let mut command: Vec<String> = ["XREADGROUP", "GROUP", &g, &who]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        command.extend(rest.iter().map(|a| a.to_string()));
+        vec![command]
+    };
+    let words = |parts: &[&str]| -> Vec<Vec<String>> {
+        vec![parts.iter().map(|a| a.to_string()).collect()]
+    };
+    let commands: Vec<Vec<String>> = match rng.below(69) {
+        // A consumer blocked on a stream, served by the entry that follows
+        // (run again by the writer, and logged then); or still waiting when it
+        // gives up, which leaves only the consumer it made.
+        67 | 68 => {
+            let served = rng.below(2) == 0;
+            // Nobody else's, or a later command would make it again anyway.
+            let who = format!("once{}", rng.below(1_000_000));
+            let args: Vec<&[u8]> = vec![
+                b"XREADGROUP",
+                b"GROUP",
+                g.as_bytes(),
+                who.as_bytes(),
+                b"BLOCK",
+                b"0",
+                b"STREAMS",
+                x.as_bytes(),
+                b">",
+            ];
+            let mut buf = Vec::new();
+            let mut ranges = Vec::new();
+            for arg in args {
+                ranges.push(buf.len()..buf.len() + arg.len());
+                buf.extend_from_slice(arg);
+            }
+            let mut waiter = ctx.connect(-1).unwrap().session();
+            let mut out = Vec::new();
+            if let Reply::Block(b) = cmd::execute(
+                ctx,
+                &mut waiter,
+                ctx.store.now(),
+                &Args::new(&buf, &ranges),
+                &mut out,
+            ) {
+                blocked.push(b);
+            }
+            if served {
+                words(&["XADD", &x, "*", "f", &v])
+            } else {
+                Vec::new()
+            }
+        }
+        53 => words(&["XGROUP", "CREATE", &x, &g, "0", "MKSTREAM"]),
+        54 => words(&["XGROUP", "SETID", &x, &g, "$"]),
+        55 if rng.below(10) == 0 => words(&["XGROUP", "DESTROY", &x, &g]),
+        56 => words(&["XGROUP", "CREATECONSUMER", &x, &g, &who]),
+        57 if rng.below(10) == 0 => words(&["XGROUP", "DELCONSUMER", &x, &g, &who]),
+        58 | 59 => group_read(&["COUNT", "2", "STREAMS", &x, ">"]),
+        60 => group_read(&["NOACK", "COUNT", "1", "STREAMS", &x, ">"]),
+        61 => group_read(&["STREAMS", &x, "0"]),
+        // Nothing to read, most times: a consumer it makes must last anyway.
+        62 => {
+            let (a, b) = (k(rng, "x"), k(rng, "x"));
+            let mut read = group_read(&["STREAMS", &a, &b, ">", ">"]);
+            // Nobody else's, or a later command would make it again anyway.
+            read[0][3] = format!("once{}", rng.below(1_000_000));
+            read
+        }
+        63 => {
+            let id = pending_id(ctx, session, &x, &g);
+            words(&["XACK", &x, &g, &id])
+        }
+        64 => {
+            let id = pending_id(ctx, session, &x, &g);
+            words(&[
+                "XCLAIM",
+                &x,
+                &g,
+                &who,
+                "0",
+                &id,
+                "IDLE",
+                "5000",
+                "RETRYCOUNT",
+                "3",
+            ])
+        }
+        65 => words(&["XAUTOCLAIM", &x, &g, &who, "0", "0", "COUNT", "2"]),
+        66 => words(&["XSETID", &x, "99999999999999-0", "ENTRIESADDED", "5000"]),
         0 => vec![vec!["SET".into(), s, v]],
         1 => vec![vec!["SET".into(), s, v, "PX".into(), ms]],
         2 => vec![vec!["SET".into(), s, v, "PXAT".into(), at]],
@@ -366,6 +481,18 @@ fn step(
     }
     // Served by now, or given up on.
     blocked.clear();
+}
+
+/// The first ID pending in group `g` of stream `x`, or any ID.
+fn pending_id(ctx: &Context, session: &mut Session, x: &str, g: &str) -> String {
+    let reply = run(ctx, session, &[b"XPENDING", x.as_bytes(), g.as_bytes()]);
+    match common::parse(&reply) {
+        common::Value::Array(items) => match items.get(1) {
+            Some(common::Value::Bulk(id)) => String::from_utf8_lossy(id).into_owned(),
+            _ => "1-1".to_string(),
+        },
+        _ => "1-1".to_string(),
+    }
 }
 
 /// Runs `steps` random writes on a store with the log in `dir` (rewriting

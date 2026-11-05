@@ -581,7 +581,10 @@ fn matches_a_model() {
                         };
                         model.insert(key, (kind, value, deadline));
                     }
-                    (Update::Peek | Update::Object(_) | Update::Changed, _) => unreachable!(),
+                    (
+                        Update::Peek | Update::Object(_) | Update::Changed | Update::ChangedUnseen,
+                        _,
+                    ) => unreachable!(),
                 }
             }
             85..88 => {

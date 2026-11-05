@@ -1065,6 +1065,7 @@ fn mpop(
         }
     }
     Attempt::Wait {
+        on_change: false,
         keys,
         timeout,
         kind: Kind::ZSet,
@@ -1113,6 +1114,7 @@ fn blocking_pop(
         }
     }
     Attempt::Wait {
+        on_change: false,
         keys,
         timeout,
         kind: Kind::ZSet,

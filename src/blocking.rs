@@ -22,6 +22,13 @@
 //! threads, so one of them may take the data between the write and the
 //! serving. The waiter then just goes on waiting.
 //!
+//! `XREADGROUP` also waits for its key to change at all, because its group goes
+//! if the key does: it registers with the clients watching the key too
+//! ([`Store::wake_on_change`]), and it's run again, even if the key is gone or
+//! holds another kind now, to reply with the error. After a change by `GET` (an
+//! expiry) or `SET`, whose fast paths don't check for ready keys, that comes
+//! with the next command or from the expiry thread, within 100 ms.
+//!
 //! None of this costs commands anything while nothing is blocked: writes
 //! check for waiters only when they create a key and the key's shard has
 //! some, and commands check one flag for ready keys.
@@ -29,7 +36,7 @@
 use std::ops::Range;
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -57,6 +64,9 @@ pub(crate) enum Attempt {
         kind: Kind,
         nil_bulk: bool,
         args: Option<Vec<Vec<u8>>>,
+        /// It also runs again when a key changes in any way, even if it's gone
+        /// or now holds another kind (`XREADGROUP`, whose group may be gone).
+        on_change: bool,
     },
 }
 
@@ -101,11 +111,17 @@ pub struct Waiter {
     reply: Mutex<Vec<u8>>,
     /// Wakes its connection while it waits.
     waker: Mutex<Option<Wake>>,
+    /// With [`Attempt::Wait`]'s `on_change`: how the keys know it.
+    on_change: Option<Arc<AtomicBool>>,
 }
 
 impl Waiter {
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    pub(crate) fn wakes_on_change(&self) -> bool {
+        self.on_change.is_some()
     }
 
     fn keys(&self) -> impl Iterator<Item = &[u8]> {
@@ -299,6 +315,7 @@ pub(crate) fn block(
         kind,
         nil_bulk,
         args: rewritten,
+        on_change,
     } = attempt(ctx, session, now, args, out)
     else {
         return Reply::Written;
@@ -339,6 +356,7 @@ pub(crate) fn block(
         },
         reply: Mutex::new(Vec::new()),
         waker: Mutex::new(None),
+        on_change: on_change.then(|| Arc::new(AtomicBool::new(false))),
     });
     let store = &ctx.store;
     let blocked = Blocked {
@@ -348,6 +366,9 @@ pub(crate) fn block(
     };
     for key in blocked.waiter.keys() {
         store.wait_on(store.key(key), &blocked.waiter);
+        if let Some(flag) = &blocked.waiter.on_change {
+            store.wake_on_change(store.key(key), flag);
+        }
     }
     store.count_blocked(1);
     // Again, now that a write creating a key would see it (with what it
@@ -458,6 +479,9 @@ impl Drop for Blocked {
         self.waiter.give_up();
         for key in self.waiter.keys() {
             self.store.stop_waiting(self.store.key(key), &self.waiter);
+            if let Some(flag) = &self.waiter.on_change {
+                self.store.unwatch(self.store.key(key), flag);
+            }
         }
         self.store.count_blocked(-1);
     }
@@ -516,6 +540,7 @@ mod tests {
             socket: -1,
             reply: Mutex::new(Vec::new()),
             waker: Mutex::new(None),
+            on_change: None,
         }
     }
 

@@ -850,9 +850,14 @@ async fn randomkey_reaches_every_key() {
     for i in 0..8 {
         ask(&[b"SET", format!("k{i}").as_bytes(), b"v"]).await;
     }
+    // A key's chance goes by its gap in hash order, which can be small: any
+    // number of tries will do, as long as it gets there.
     let mut seen = std::collections::HashSet::new();
-    for _ in 0..2000 {
+    for _ in 0..200_000 {
         seen.insert(ask(&[b"RANDOMKEY"]).await);
+        if seen.len() == 8 {
+            break;
+        }
     }
     assert_eq!(seen.len(), 8, "{seen:?}");
 }

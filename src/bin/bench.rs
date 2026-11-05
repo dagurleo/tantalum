@@ -11,10 +11,12 @@
 //! - `hash_memory_per_field`: the same for a fill of hashes, per field.
 //!
 //! The string workloads run first and alone, as they did before hashes
-//! existed; the hashes come after them.
+//! existed; the hashes come after them, then a stream's consumer group
+//! (`group_p16_ns`: `XADD`, `XREADGROUP` and `XACK` in turn).
 //!
 //!   bench [--keys N] [--ops N] [--runs N]
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -87,6 +89,45 @@ fn hash_requests(hashes: usize, ops: usize, pipeline: usize, seed: u64) -> Vec<V
                 } else {
                     push_command(&mut buf, &[b"HGET", key.as_bytes(), field.as_bytes()]);
                 }
+            }
+            buf
+        })
+        .collect()
+}
+
+/// Requests of `pipeline` commands each, a worker's life over and over: an entry
+/// comes, is read through a consumer group and acknowledged. IDs go on from
+/// `next`, as each run adds to the same stream.
+fn group_requests(next: &Cell<u64>, ops: usize, pipeline: usize) -> Vec<Vec<u8>> {
+    let value = [b'g'; 16];
+    let mut step = 0;
+    (0..ops / pipeline)
+        .map(|_| {
+            let mut buf = Vec::new();
+            for _ in 0..pipeline {
+                let id = format!("{}-0", next.get());
+                match step {
+                    0 => push_command(&mut buf, &[b"XADD", b"s", id.as_bytes(), b"f", &value]),
+                    1 => push_command(
+                        &mut buf,
+                        &[
+                            b"XREADGROUP",
+                            b"GROUP",
+                            b"g",
+                            b"c",
+                            b"COUNT",
+                            b"1",
+                            b"STREAMS",
+                            b"s",
+                            b">",
+                        ],
+                    ),
+                    _ => {
+                        push_command(&mut buf, &[b"XACK", b"s", b"g", id.as_bytes()]);
+                        next.set(next.get() + 1);
+                    }
+                }
+                step = (step + 1) % 3;
             }
             buf
         })
@@ -238,6 +279,24 @@ fn main() {
         results.push(format!("\"hash_memory_per_field\":{per_field:.3}"));
         let reqs = |seed| hash_requests(hashes, ops, 16, seed);
         results.push(time("hash_p16_ns", runs, serve, reqs, 16));
+    });
+
+    // Consumer groups, likewise.
+    with_server(|_, serve| {
+        fill(
+            serve,
+            std::iter::once(command(&[
+                b"XGROUP",
+                b"CREATE",
+                b"s",
+                b"g",
+                b"0",
+                b"MKSTREAM",
+            ])),
+        );
+        let next = Cell::new(1);
+        let reqs = |_seed| group_requests(&next, ops, 16);
+        results.push(time("group_p16_ns", runs, serve, reqs, 16));
     });
     println!("{{{}}}", results.join(","));
 }

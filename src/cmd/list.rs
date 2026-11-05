@@ -721,6 +721,7 @@ fn blocking_move(
         Ok(Some(element)) => resp::write_bulk(out, &element),
         Ok(None) => {
             return Attempt::Wait {
+                on_change: false,
                 keys: 1..2,
                 timeout,
                 kind: Kind::List,
@@ -770,6 +771,7 @@ fn blocking_pop(
         }
     }
     Attempt::Wait {
+        on_change: false,
         keys,
         timeout,
         kind: Kind::List,
@@ -894,6 +896,7 @@ fn mpop(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, at: usiz
         }
     }
     Attempt::Wait {
+        on_change: false,
         keys,
         timeout,
         kind: Kind::List,

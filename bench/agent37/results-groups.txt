@@ -1,0 +1,123 @@
+# 2026-11-05, Agent37 VM (Xeon E-2388G). 0.22.0 on epoll, Redis 7.2.4 and Valkey.
+# One server core, all servers up. bench/agent37/groups.sh, memtier 3 x 80:
+#   fields after Totals: ops/s, hits/s, misses/s, avg ms, p50 ms, p99 ms, KB/s.
+# read and ack tests go through a fixed number of entries (5M in the stream),
+# the others run 4 s.
+round 1 valkey read1 P1 Totals         156255.35    156255.35         0.00         1.53508         1.40700         2.70300     27144.62 
+round 1 tantalum read1 P1 Totals         250897.42    250897.42         0.00         0.95606         0.95900         1.31100     43585.80 
+round 1 redis read1 P1 Totals         151493.30    151493.30         0.00         1.58341         1.51900         3.02300     26317.36 
+round 1 valkey read1 P16 Totals         312471.88    312471.88         0.00        12.27331        13.43900        17.15100     54621.52 
+round 1 tantalum read1 P16 Totals         677150.73    677150.73         0.00         5.65558         5.50300         7.93500    118369.07 
+round 1 redis read1 P16 Totals         296277.47    296277.47         0.00        12.94659        14.46300        16.51100     51790.67 
+round 1 valkey pending P1 Totals       226946.03         0.00         0.00         1.05700         0.99900         1.99100     21719.44 
+round 1 tantalum pending P1 Totals       350698.11         0.00         0.00         0.68395         0.61500         0.95900     33562.91 
+round 1 redis pending P1 Totals       234912.76         0.00         0.00         1.02116         0.95900         1.93500     22481.89 
+round 1 valkey pending P16 Totals       815068.27         0.00         0.00         4.69895         4.83100         7.03900     78004.58 
+round 1 tantalum pending P16 Totals      2581631.40         0.00         0.00         1.47758         1.46300         2.81500    247070.19 
+round 1 redis pending P16 Totals       910690.95         0.00         0.00         4.20404         4.31900         5.66300     87155.97 
+round 1 valkey pending10 P1 Totals       160533.92         0.00         0.00         1.49166         1.33500         2.47900     59573.14 
+round 1 tantalum pending10 P1 Totals       289491.27         0.00         0.00         0.82604         0.83900         1.11100    107428.40 
+round 1 redis pending10 P1 Totals       177169.16         0.00         0.00         1.35166         1.20700         2.38300     65746.37 
+round 1 valkey pending10 P16 Totals       327988.65         0.00         0.00        11.65570        11.71100        15.55100    121714.54 
+round 1 tantalum pending10 P16 Totals       813982.97         0.00         0.00         4.66715         4.57500         6.97500    302063.99 
+round 1 redis pending10 P16 Totals       400379.33         0.00         0.00         9.53834         9.53500        15.16700    148578.27 
+round 1 valkey groups P1 Totals     273309.31         0.00         0.00         0.87727         0.84700         1.70300     50444.78 
+round 1 tantalum groups P1 Totals     336201.08         0.00         0.00         0.71305         0.63900         0.99100     62052.74 
+round 1 redis groups P1 Totals     286496.82         0.00         0.00         0.83685         0.80700         1.63100     52878.81 
+round 1 valkey groups P16 Totals    1113664.77         0.00         0.00         3.43048         3.42300         5.21500    205549.46 
+round 1 tantalum groups P16 Totals    2094155.80         0.00         0.00         1.81715         1.79100         2.75100    386518.99 
+round 1 redis groups P16 Totals    1226552.83         0.00         0.00         3.11224         3.07100         5.63100    226385.24 
+round 1 valkey ack P1 Totals     298988.97         0.00         0.00         0.80286         0.78300         1.57500     12717.89 
+round 1 tantalum ack P1 Totals     370216.80         0.00         0.00         0.64843         0.63100         0.97500     15747.66 
+round 1 redis ack P1 Totals     313741.90         0.00         0.00         0.76514         0.75100         1.50300     13345.43 
+round 1 valkey ack P16 Totals    1451886.55         0.00         0.00         2.64182         2.70300         3.91900     66639.32 
+round 1 tantalum ack P16 Totals    2786067.43         0.00         0.00         1.37611         1.32700         2.14300    127876.14 
+round 1 redis ack P16 Totals    1602135.41         0.00         0.00         2.39376         2.35100         5.63100     73535.51 
+round 1 valkey read10 P1 Totals          63476.70     63476.70         0.00         3.77586         3.67900         6.62300     49370.63 
+round 1 tantalum read10 P1 Totals         159521.50    159521.50         0.00         1.50076         1.50300         2.15900    124071.94 
+round 1 redis read10 P1 Totals          85334.74     85334.74         0.00         2.80893         2.36700         5.21500     66371.28 
+round 1 valkey read10 P16 Totals          81665.90     81665.90         0.00        46.71761        48.38300        52.99100     63960.99 
+round 1 tantalum read10 P16 Totals         263991.55    263991.55         0.00        14.36915        14.46300        15.16700    206759.01 
+round 1 redis read10 P16 Totals         109443.44    109443.44         0.00        34.82189        35.32700        48.38300     85716.44 
+round 1 valkey add P1 Totals     266412.74    266412.74         0.00         0.90092         0.86300         1.74300     25389.96 
+round 1 tantalum add P1 Totals     339254.76    339254.76         0.00         0.70753         0.63900         1.00700     32360.68 
+round 1 redis add P1 Totals     268867.41    268867.41         0.00         0.89268         0.83900         1.69500     25626.29 
+round 1 valkey add P16 Totals     967794.98    967794.98         0.00         3.96407         3.98300         5.88700     92579.00 
+round 1 tantalum add P16 Totals    2013835.23   2013835.23         0.00         1.90377         1.67100         2.83100    193723.56 
+round 1 redis add P16 Totals     986020.74    986020.74         0.00         3.89064         3.85500         4.95900     94337.80 
+round 2 tantalum read1 P1 Totals         255686.55    255686.55         0.00         0.93814         0.94300         1.32700     44417.77 
+round 2 redis read1 P1 Totals         153850.04    153850.04         0.00         1.55901         1.45500         2.67100     26726.77 
+round 2 valkey read1 P1 Totals         154603.45    154603.45         0.00         1.55167         1.51900         3.02300     26857.65 
+round 2 tantalum read1 P16 Totals         710167.09    710167.09         0.00         5.39379         5.40700         5.79100    124140.48 
+round 2 redis read1 P16 Totals         298728.75    298728.75         0.00        12.83894        14.07900        16.12700     52219.16 
+round 2 valkey read1 P16 Totals         317043.01    317043.01         0.00        12.09725        13.37500        15.29500     55420.58 
+round 2 tantalum pending P1 Totals       347989.36         0.00         0.00         0.68933         0.62300         0.95900     33303.67 
+round 2 redis pending P1 Totals       232246.22         0.00         0.00         1.03294         0.96700         1.96700     22226.69 
+round 2 valkey pending P1 Totals       219972.89         0.00         0.00         1.09060         1.02300         2.07900     21052.09 
+round 2 tantalum pending P16 Totals      2680258.89         0.00         0.00         1.42306         1.42300         2.22300    256509.15 
+round 2 redis pending P16 Totals       910826.36         0.00         0.00         4.20210         4.25500         5.75900     87168.93 
+round 2 valkey pending P16 Totals       818402.03         0.00         0.00         4.68096         4.92700         6.33500     78323.63 
+round 2 tantalum pending10 P1 Totals       294321.30         0.00         0.00         0.81243         0.83100         1.14300    109220.80 
+round 2 redis pending10 P1 Totals       182940.65         0.00         0.00         1.30858         1.16700         2.15900     67888.13 
+round 2 valkey pending10 P1 Totals       163750.87         0.00         0.00         1.46229         1.33500         2.33500     60766.92 
+round 2 tantalum pending10 P16 Totals       823263.63         0.00         0.00         4.61432         4.54300         6.75100    305507.99 
+round 2 redis pending10 P16 Totals       405938.07         0.00         0.00         9.40238         9.34300        15.67900    150641.08 
+round 2 valkey pending10 P16 Totals       326237.71         0.00         0.00        11.71538        11.71100        18.55900    121064.78 
+round 2 tantalum groups P1 Totals     336115.39         0.00         0.00         0.71322         0.63900         0.99100     62036.92 
+round 2 redis groups P1 Totals     287356.16         0.00         0.00         0.83434         0.80700         1.61500     53037.42 
+round 2 valkey groups P1 Totals     273591.94         0.00         0.00         0.87635         0.84700         1.70300     50496.95 
+round 2 tantalum groups P16 Totals    2057271.96         0.00         0.00         1.84979         1.79100         3.59900    379711.33 
+round 2 redis groups P16 Totals    1237724.86         0.00         0.00         3.08512         3.05500         5.05500    228447.26 
+round 2 valkey groups P16 Totals    1107230.51         0.00         0.00         3.45091         3.40700         5.56700    204361.88 
+round 2 tantalum ack P1 Totals     361224.48         0.00         0.00         0.66459         0.63100         0.99900     15365.16 
+round 2 redis ack P1 Totals     309938.49         0.00         0.00         0.77450         0.75900         1.51900     13183.65 
+round 2 valkey ack P1 Totals     297873.48         0.00         0.00         0.80588         0.79100         1.57500     12670.44 
+round 2 tantalum ack P16 Totals    2858392.43         0.00         0.00         1.34096         1.27900         2.33500    131195.75 
+round 2 redis ack P16 Totals    1702850.86         0.00         0.00         2.25241         2.31900         3.00700     78158.19 
+round 2 valkey ack P16 Totals    1485203.44         0.00         0.00         2.58268         2.67100         3.42300     68168.52 
+round 2 tantalum read10 P1 Totals         168727.09    168727.09         0.00         1.41867         1.42300         1.82300    131231.82 
+round 2 redis read10 P1 Totals          86307.87     86307.87         0.00         2.77613         2.81500         4.07900     67128.16 
+round 2 valkey read10 P1 Totals          65492.23     65492.23         0.00         3.65954         3.79100         5.88700     50938.26 
+round 2 tantalum read10 P16 Totals         265331.05    265331.05         0.00        14.29961        14.39900        14.97500    207808.11 
+round 2 redis read10 P16 Totals         113244.47    113244.47         0.00        33.65927        34.81500        43.77500     88693.42 
+round 2 valkey read10 P16 Totals          78712.04     78712.04         0.00        48.46976        49.66300        64.51100     61647.52 
+round 2 tantalum add P1 Totals     342710.10    342710.10         0.00         0.70040         0.63100         1.01500     32690.99 
+round 2 redis add P1 Totals     273427.71    273427.71         0.00         0.87780         0.83900         1.68700     26060.62 
+round 2 valkey add P1 Totals     270506.52    270506.52         0.00         0.88725         0.86300         1.72700     25780.96 
+round 2 tantalum add P16 Totals    2386578.78   2386578.78         0.00         1.60594         1.49500         2.35100    229651.06 
+round 2 redis add P16 Totals    1049545.69   1049545.69         0.00         3.65496         3.74300         4.67100    100431.20 
+round 2 valkey add P16 Totals     997451.18    997451.18         0.00         3.84563         3.85500         6.52700     95429.28 
+
+# One client, redis-cli --pipe on CPU 1, 1M entries of a 32-byte value, 3 rounds.
+# Server CPU is the number to go by here: commands/s is held back by redis-cli
+# parsing replies and by how it paces itself (Redis was about 5% busy in read10).
+workload             redis        valkey      tantalum   (commands/s, median of rounds)
+add              1,242,525     1,185,203     3,713,870   valkey: -4.6% tantalum: +198.9%
+read1              306,807       314,677       809,252   valkey: +2.6% tantalum: +163.8%
+read10               5,450         5,376       287,335   valkey: -1.4% tantalum: +5172.5%
+read100              1,319         1,192         1,285   valkey: -9.7% tantalum: -2.6%
+ack              1,389,174     1,246,142     3,663,003   valkey: -10.3% tantalum: +163.7%
+claim              405,097       387,056     1,036,277   valkey: -4.5% tantalum: +155.8%
+autoclaim          237,685       191,464       510,199   valkey: -19.4% tantalum: +114.7%
+history              7,543         7,644        18,837   valkey: +1.3% tantalum: +149.7%
+pending          1,129,140       894,608       782,470   valkey: -20.8% tantalum: -30.7%
+pending10           64,223        66,862        50,265   valkey: +4.1% tantalum: -21.7%
+groups              79,253       990,836       162,886   valkey: +1150.2% tantalum: +105.5%
+cycle              640,988       682,576     1,840,987   valkey: +6.5% tantalum: +187.2%
+workload             redis        valkey      tantalum   (server CPU, us per command, median of rounds)
+add                  0.800         0.840         0.270   valkey: +5.0% tantalum: -66.3%
+read1                3.250         3.170         1.220   valkey: -2.5% tantalum: -62.5%
+read10               8.800        12.100         3.500   valkey: +37.5% tantalum: -60.2%
+read100             49.000       130.000        19.000   valkey: +165.3% tantalum: -61.2%
+ack                  0.710         0.800         0.270   valkey: +12.7% tantalum: -62.0%
+claim                2.470         2.580         0.960   valkey: +4.5% tantalum: -61.1%
+autoclaim            4.200         5.100         1.900   valkey: +21.4% tantalum: -54.8%
+history              6.100         5.400         2.200   valkey: -11.5% tantalum: -63.9%
+pending              0.880         1.120         0.210   valkey: +27.3% tantalum: -76.1%
+pending10            2.300         3.100         0.800   valkey: +34.8% tantalum: -65.2%
+groups               0.670         1.010         0.250   valkey: +50.7% tantalum: -62.7%
+cycle                1.510         1.470         0.540   valkey: -2.6% tantalum: -64.2%
+memory, bytes per entry (first round, on fresh servers):
+  redis: used_memory entries 42.7, pending on top 238.1; RSS entries 44.1, pending on top 242.4
+  valkey: used_memory entries 42.9, pending on top 124.1; RSS entries 44.4, pending on top 126.3
+  tantalum: used_memory entries 37.5, pending on top 112.0; RSS entries 53.9, pending on top 147.2

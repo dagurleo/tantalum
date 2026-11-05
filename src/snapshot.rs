@@ -3,7 +3,7 @@
 //! Redis' RDB files, though in a format of our own:
 //!
 //! ```text
-//! "TANTALUM SNAPSHOT 4\n"
+//! "TANTALUM SNAPSHOT 5\n"
 //! per key:  kind, key length, key, value length, value, expiry
 //! trailer:  0x00, key count (u64 LE), CRC32 of everything before it (u32 LE)
 //! ```
@@ -17,7 +17,8 @@
 //! on load.
 //!
 //! Version 1 has only strings, version 2 adds hashes, version 3 the other
-//! collections and version 4 streams. A save writes the lowest version that holds its data,
+//! collections, version 4 streams and version 5 streams' consumer groups (after
+//! a stream's chunks). A save writes the lowest version that holds its data,
 //! so a build from before a kind existed can still read a snapshot without
 //! it (after a rollback, say), and loading reads every version.
 //!
@@ -36,14 +37,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 
 use crate::store::{Expiry, Kind, NO_EXPIRY, Store};
+use crate::stream::BigStream;
 use crate::{collection, hash};
 
 /// The header, with the version in its next-to-last byte.
-const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 4\n";
+const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 5\n";
 const VERSION_AT: usize = MAGIC.len() - 2;
 const MAGIC_V1: &[u8] = b"TANTALUM SNAPSHOT 1\n";
 const MAGIC_V2: &[u8] = b"TANTALUM SNAPSHOT 2\n";
 const MAGIC_V3: &[u8] = b"TANTALUM SNAPSHOT 3\n";
+const MAGIC_V4: &[u8] = b"TANTALUM SNAPSHOT 4\n";
 const STRING: u8 = 1;
 const HASH: u8 = 2;
 const LIST: u8 = 3;
@@ -53,13 +56,14 @@ const STREAM: u8 = 6;
 const END: u8 = 0;
 
 /// A record's tag and the first format version that has it.
-fn tag_of(kind: Kind) -> (u8, u8) {
+fn tag_of(kind: Kind, value: &[u8]) -> (u8, u8) {
     match kind {
         Kind::String => (STRING, b'1'),
         Kind::Hash => (HASH, b'2'),
         Kind::List => (LIST, b'3'),
         Kind::Set => (SET, b'3'),
         Kind::ZSet => (ZSET, b'3'),
+        Kind::Stream if BigStream::compact_has_groups(value) => (STREAM, b'5'),
         Kind::Stream => (STREAM, b'4'),
     }
 }
@@ -165,7 +169,7 @@ fn write_file(
     for shard in 0..store.shard_count() {
         buf.clear();
         store.for_each_live(shard, now, |key, kind, value, deadline| {
-            let (tag, version) = tag_of(kind);
+            let (tag, version) = tag_of(kind, value);
             magic[VERSION_AT] = magic[VERSION_AT].max(version);
             buf.push(tag);
             put_varint(&mut buf, key.len() as u64);
@@ -249,7 +253,8 @@ fn load_file(
         MAGIC_V1 => 1,
         MAGIC_V2 => 2,
         MAGIC_V3 => 3,
-        MAGIC => 4,
+        MAGIC_V4 => 4,
+        MAGIC => 5,
         _ if magic.starts_with(&MAGIC[..VERSION_AT]) => {
             return Err(invalid(
                 "a snapshot from a newer Tantalum: upgrade to load it",
@@ -690,6 +695,133 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// A stream with groups, with what's in them at every stage of use.
+    fn stream_with_groups() -> crate::stream::BigStream {
+        use crate::stream::{BigStream, Group, StreamId, UNKNOWN_READS};
+        let id = |ms| StreamId { ms, seq: 0 };
+        let mut stream = BigStream::default();
+        for ms in 1..=250 {
+            stream.add(id(ms), &[(b"f", b"v")]);
+        }
+        stream.delete(id(2));
+        let mut group = Group::new(id(5), 5);
+        let (alice, _) = group.consumer(b"alice", 1_000);
+        let (bob, _) = group.consumer(b"b\xffb", 2_000);
+        group.assign(id(1), &alice, 3_000, 1);
+        group.assign(id(2), &alice, 3_001, 7);
+        group.assign(id(3), &bob, 3_002, i64::MAX);
+        group.consumers.get_mut(&alice).unwrap().active_time = 3_001;
+        stream.groups.insert((*b"g").into(), group);
+        stream
+            .groups
+            .insert((*b"never read").into(), Group::new(id(0), UNKNOWN_READS));
+        stream
+            .groups
+            .insert((*b"far").into(), Group::new(id(9), i64::MAX));
+        stream
+    }
+
+    #[test]
+    fn groups_roundtrip_in_version_5() {
+        use crate::collection::Collection;
+        use crate::store::{Entry, EntryValue, Update};
+        let path = temp_path("groups");
+        let s = Store::new(2);
+        let now = s.now();
+        let stream = stream_with_groups();
+        let bytes = stream.to_compact();
+        s.update_collection(s.key(b"groups"), now, true, |_| {
+            (Update::Object(Collection::Stream(stream.clone())), ())
+        })
+        .unwrap();
+        save(&s, &path).unwrap();
+        assert!(
+            fs::read(&path)
+                .unwrap()
+                .starts_with(b"TANTALUM SNAPSHOT 5\n")
+        );
+
+        let t = Store::new(2);
+        load(&t, &path).unwrap();
+        let back = t
+            .update_collection(t.key(b"groups"), now, false, |entry| match entry {
+                Some(Entry {
+                    value: EntryValue::Object(Collection::Stream(stream)),
+                    ..
+                }) => (Update::Peek, stream.clone()),
+                _ => panic!("not a stream"),
+            })
+            .unwrap();
+        assert_eq!(back.groups, stream.groups);
+        assert_eq!(back.to_compact(), bytes);
+        assert_eq!(back.first_id(), stream.first_id());
+
+        // Without its groups the stream goes back to what 0.21 reads.
+        t.update_collection(t.key(b"groups"), now, false, |entry| match entry {
+            Some(Entry {
+                value: EntryValue::Object(Collection::Stream(stream)),
+                ..
+            }) => {
+                stream.groups.clear();
+                (Update::Changed, ())
+            }
+            _ => panic!("not a stream"),
+        })
+        .unwrap();
+        save(&t, &path).unwrap();
+        assert!(
+            fs::read(&path)
+                .unwrap()
+                .starts_with(b"TANTALUM SNAPSHOT 4\n")
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A snapshot written by 0.21: version 4, with a stream as it had them.
+    #[test]
+    fn loads_streams_from_version_4_before_groups() {
+        use crate::stream::{BigStream, StreamId};
+        let path = temp_path("streams-v4");
+        let mut stream = BigStream::default();
+        stream.add(StreamId { ms: 7, seq: 1 }, &[(b"f", b"v")]);
+        let value = stream.to_compact();
+        assert!(!BigStream::compact_has_groups(&value));
+        let mut record = vec![STREAM];
+        put_varint(&mut record, 1);
+        record.push(b's');
+        put_varint(&mut record, value.len() as u64);
+        record.extend_from_slice(&value);
+        put_varint(&mut record, 0);
+        fs::write(&path, file_of(b"TANTALUM SNAPSHOT 4\n", &record, 1)).unwrap();
+        let s = Store::new(2);
+        assert_eq!(load(&s, &path).unwrap().unwrap().keys, 1);
+        assert_eq!(s.len(), 1);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Damaged groups are refused, not loaded or crashed on.
+    #[test]
+    fn damaged_groups_are_refused() {
+        use crate::stream::BigStream;
+        let bytes = stream_with_groups().to_compact();
+        let plain = {
+            let mut stream = stream_with_groups();
+            stream.groups.clear();
+            stream.to_compact().len()
+        };
+        for cut in plain + 1..bytes.len() {
+            assert!(BigStream::from_compact(&bytes[..cut]).is_none(), "{cut}");
+        }
+        for at in plain..bytes.len() {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0x55;
+            if let Some(stream) = BigStream::from_compact(&bad) {
+                // Whatever it took it for holds together.
+                stream.to_compact();
+            }
+        }
+    }
+
     #[test]
     fn streams_roundtrip_in_version_4() {
         use crate::collection::Collection;
@@ -718,7 +850,7 @@ mod tests {
             .unwrap();
         }
         assert_eq!(save(&s, &path).unwrap(), 2);
-        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V4));
         let t = Store::new(4);
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
         let mut reloaded = t
@@ -913,7 +1045,7 @@ mod tests {
             ),
             ("an empty hash", file_of(MAGIC, &record(HASH, b"\x00"), 1)),
             ("an unknown kind", file_of(MAGIC, &record(9, b"x"), 1)),
-            ("a newer version", file_of(b"TANTALUM SNAPSHOT 5\n", &[], 0)),
+            ("a newer version", file_of(b"TANTALUM SNAPSHOT 6\n", &[], 0)),
         ] {
             fs::write(&path, file).unwrap();
             let err = load(&Store::new(1), &path).unwrap_err();

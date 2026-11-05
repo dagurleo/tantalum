@@ -2,6 +2,7 @@
 
 mod bit;
 mod eval;
+mod group;
 mod hash;
 mod keys;
 mod list;
@@ -14,7 +15,7 @@ mod string;
 mod zset;
 
 use std::ops::Range;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 pub use crate::blocking::Blocked;
 use crate::context::{Context, Session};
@@ -309,6 +310,14 @@ static COMMANDS: &[Command] = &[
     Command { name: "xdel", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: stream::xdel },
     Command { name: "xtrim", arity: -4, flags: &["write"], keys: ONE_KEY, run: stream::xtrim },
     Command { name: "xread", arity: -4, flags: &["readonly", "blocking"], keys: NO_KEYS, run: stream::xread },
+    Command { name: "xreadgroup", arity: -7, flags: &["write", "blocking"], keys: NO_KEYS, run: group::xreadgroup },
+    Command { name: "xgroup", arity: -2, flags: &["write"], keys: NO_KEYS, run: group::xgroup },
+    Command { name: "xack", arity: -4, flags: &["write", "fast"], keys: ONE_KEY, run: group::xack },
+    Command { name: "xpending", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: group::xpending },
+    Command { name: "xclaim", arity: -6, flags: &["write", "fast"], keys: ONE_KEY, run: group::xclaim },
+    Command { name: "xautoclaim", arity: -6, flags: &["write", "fast"], keys: ONE_KEY, run: group::xautoclaim },
+    Command { name: "xinfo", arity: -2, flags: &["readonly"], keys: NO_KEYS, run: group::xinfo },
+    Command { name: "xsetid", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: group::xsetid },
     Command { name: "bzmpop", arity: -5, flags: &["write", "blocking"], keys: NO_KEYS, run: zset::bzmpop },
     Command { name: "zrandmember", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: zset::zrandmember },
     Command { name: "zscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: zset::zscan },
@@ -416,6 +425,30 @@ pub fn execute(
         serve_ready(ctx, now);
     }
     reply
+}
+
+/// Runs active expiry every `interval` until `ctx` is dropped. A client blocked
+/// in `XREADGROUP` on a key it removes hears at once that the group is gone, as
+/// nothing else may run for a while.
+pub fn spawn_expirer(
+    ctx: &Arc<Context>,
+    interval: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    let ctx = Arc::downgrade(ctx);
+    std::thread::Builder::new()
+        .name("tantalum-expire".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(interval);
+                let Some(ctx) = ctx.upgrade() else { break };
+                let now = ctx.store.now();
+                ctx.store.expire_cycle(now);
+                if ctx.store.has_ready() {
+                    serve_ready(&ctx, now);
+                }
+            }
+        })
+        .expect("spawn expiry thread")
 }
 
 /// Serves blocked clients whose keys are ready, after a command that isn't

@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tantalum::cmd;
 use tantalum::context::{Context, Settings};
 use tantalum::server;
-use tantalum::store::{self, Config, EvictionPolicy, Store};
+use tantalum::store::{Config, EvictionPolicy, Store};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -20,8 +21,9 @@ async fn start() -> SocketAddr {
 
 async fn start_with(config: Config) -> SocketAddr {
     let store = Arc::new(Store::with_config(config));
-    std::mem::forget(store::spawn_expirer(&store, Duration::from_millis(10)));
-    serve(Arc::new(Context::new(store, Settings::default()))).await
+    let ctx = Arc::new(Context::new(store, Settings::default()));
+    std::mem::forget(cmd::spawn_expirer(&ctx, Duration::from_millis(10)));
+    serve(ctx).await
 }
 
 /// A server that requires `AUTH` with `password`.
