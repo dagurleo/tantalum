@@ -695,6 +695,21 @@ pub(crate) fn record(name: &str, args: &Args<'_>, reply: &[u8]) {
     if !logging() || reply.first() == Some(&b'-') {
         return;
     }
+    // Without `STORE` it changed nothing.
+    if name == "sort" && reply.first() != Some(&b':') {
+        return;
+    }
+    if matches!(name, "incrbyfloat" | "hincrbyfloat") {
+        // What it came to, so a machine that rounds differently gets the same.
+        if let Some(Popped::One(value)) = resp_value(&mut { reply }) {
+            if name == "incrbyfloat" {
+                push([&b"SET"[..], args.get(1), &value, b"KEEPTTL"].into_iter());
+            } else {
+                push([&b"HSET"[..], args.get(1), args.get(2), &value].into_iter());
+            }
+        }
+        return;
+    }
     if name == "spop" {
         // What it popped, which was chance.
         let mut members = Vec::new();

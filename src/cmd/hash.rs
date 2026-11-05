@@ -1,9 +1,11 @@
 //! Hash commands. A hash is one entry (see `crate::hash`), so reads scan it
 //! and changes write it again whole.
 
+use super::set::random_below;
+use super::string::{FloatError, add_floats};
 use super::{
-    Args, INVALID_CURSOR, NOT_AN_INTEGER, OOM, Reply, Scan, ScanOptions, WRONGTYPE, parse_cursor,
-    wrong_arity,
+    Args, INVALID_CURSOR, NOT_AN_INTEGER, OOM, Reply, SYNTAX_ERROR, Scan, ScanOptions, WRONGTYPE,
+    parse_cursor, wrong_arity,
 };
 use crate::context::{Context, Session};
 use crate::hash::{self, Edit};
@@ -228,6 +230,145 @@ pub(super) fn hincrby(
         resp::write_integer(out, value);
     }
     Reply::Written
+}
+
+/// `HINCRBYFLOAT key field increment`: the new value. Logged as what it set
+/// (see `aof::record`).
+pub(super) fn hincrbyfloat(
+    ctx: &Context,
+    _: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let (field, incr) = (args.get(2), args.get(3));
+    match add_floats(None, incr) {
+        Err(FloatError::IncrementNotFinite) => {
+            resp::write_error(out, b"ERR value is NaN or Infinity");
+            return Reply::Written;
+        }
+        Err(_) => {
+            resp::write_error(out, b"ERR value is not a valid float");
+            return Reply::Written;
+        }
+        Ok(_) => {}
+    }
+    let store = &*ctx.store;
+    let result = store.update_key(args.key(store), now, |current| {
+        let old = match &current {
+            None => None,
+            Some(c) if c.value.kind() != Kind::Hash => return (Update::Peek, Err(WRONGTYPE)),
+            Some(c) => Some(c.value.as_bytes()),
+        };
+        let sum = match add_floats(old.and_then(|hash| hash::get(hash, field)), incr) {
+            Ok(sum) => sum,
+            Err(FloatError::BadCurrent) => {
+                return (Update::Peek, Err(&b"ERR hash value is not a float"[..]));
+            }
+            Err(_) => {
+                return (
+                    Update::Peek,
+                    Err(&b"ERR increment would produce NaN or Infinity"[..]),
+                );
+            }
+        };
+        let encoded = {
+            let mut edit = Edit::new(old, 1);
+            edit.set(field, &sum);
+            edit.encode()
+        };
+        (Update::Replace(Kind::Hash, encoded), Ok(sum))
+    });
+    match result {
+        Ok(Ok(sum)) => resp::write_bulk(out, &sum),
+        Ok(Err(message)) => resp::write_error(out, message),
+        Err(OutOfMemory) => resp::write_error(out, OOM),
+    }
+    Reply::Written
+}
+
+/// `HRANDFIELD key [count [WITHVALUES]]`: a positive count asks for distinct
+/// fields (all of them if there are fewer), a negative one allows repeats.
+pub(super) fn hrandfield(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let null = session.null();
+    if args.len() == 2 {
+        return read(ctx, session, now, args, out, |hash, out| match hash {
+            Some(hash) => {
+                let pairs: Vec<_> = hash::iter(hash).collect();
+                resp::write_bulk(out, pairs[random_below(pairs.len())].0);
+            }
+            None => out.extend_from_slice(null),
+        });
+    }
+    let Some(count) = resp::parse_int(args.get(2)) else {
+        resp::write_error(out, NOT_AN_INTEGER);
+        return Reply::Written;
+    };
+    if count == i64::MIN {
+        resp::write_error(
+            out,
+            b"ERR value is out of range, value must between -9223372036854775807 and 9223372036854775807",
+        );
+        return Reply::Written;
+    }
+    let with_values = match args.len() {
+        3 => false,
+        4 if args.get(3).eq_ignore_ascii_case(b"WITHVALUES") => {
+            if count.unsigned_abs() > i64::MAX as u64 / 2 {
+                resp::write_error(out, b"ERR value is out of range");
+                return Reply::Written;
+            }
+            true
+        }
+        _ => {
+            resp::write_error(out, SYNTAX_ERROR);
+            return Reply::Written;
+        }
+    };
+    let resp3 = session.resp3;
+    read(ctx, session, now, args, out, |hash, out| {
+        let pairs: Vec<_> = hash.map_or_else(Vec::new, |hash| hash::iter(hash).collect());
+        if pairs.is_empty() || count == 0 {
+            resp::write_array_header(out, 0);
+            return;
+        }
+        let n = count.unsigned_abs() as usize;
+        let header = |out: &mut Vec<u8>, n: usize| {
+            let flat = with_values && !resp3;
+            resp::write_array_header(out, if flat { n * 2 } else { n });
+        };
+        let one = |out: &mut Vec<u8>, (field, value): (&[u8], &[u8])| {
+            if with_values && resp3 {
+                resp::write_array_header(out, 2);
+            }
+            resp::write_bulk(out, field);
+            if with_values {
+                resp::write_bulk(out, value);
+            }
+        };
+        if count < 0 {
+            header(out, n);
+            for _ in 0..n {
+                one(out, pairs[random_below(pairs.len())]);
+            }
+        } else {
+            let n = n.min(pairs.len());
+            let mut picks = pairs;
+            header(out, n);
+            // The first n of a shuffle.
+            for i in 0..n {
+                let j = i + random_below(picks.len() - i);
+                picks.swap(i, j);
+                one(out, picks[i]);
+            }
+        }
+    })
 }
 
 /// `HGET key field`

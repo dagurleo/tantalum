@@ -15,7 +15,7 @@ use crate::set::{Compact, Finished, SetMut, SetView};
 use crate::store::{Entry, EntryValue, Key, Kind, Millis, OutOfMemory, Store, Update, View};
 
 /// A random number below `n`, from a per-thread xorshift seeded at random.
-fn random_below(n: usize) -> usize {
+pub(super) fn random_below(n: usize) -> usize {
     thread_local! {
         static STATE: Cell<u64> = Cell::new(foldhash::fast::RandomState::default().hash_one(0u64) | 1);
     }
