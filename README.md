@@ -150,8 +150,8 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   on every request. Without pipelining, where each request is tiny work between two
   syscalls, that overhead decided the race: per-thread was 19% faster and
   overtook memcached. The trade-off: a few very busy connections can't be
-  rebalanced across threads. A connection that ran a single command doesn't
-  send its reply: it copies it to the thread's outbox and goes back to waiting,
+  rebalanced across threads. A connection that ran up to 16 commands doesn't
+  send its replies: it copies them to the thread's outbox and goes back to waiting,
   and the thread's flusher task, once the other ready connections have run,
   sends what's there in one tight loop, as Redis sends replies just before it
   waits for more. Waking a client took the kernel more time than the request
@@ -163,8 +163,8 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   mostly accepted together, so its replies come in one run, where in arrival
   order they alternated with those of its other threads. That took wakes per
   request from 0.22 to 0.017 (Redis: 0.08, io_uring: 0.03). And before a batch
-  of 8 or more goes, the flusher looks at the reactor once more, so what came
-  in meanwhile joins it: the clients served last last time answer just too late
+  of 8 or more goes, the flusher looks at the reactor once more (twice if the
+  first found anything), so what came in meanwhile joins it: the clients served last last time answer just too late
   for the look that started a cycle, and would wait all of it out (p99 at twice
   the median; with the look, just above it, and every connection is served
   once per cycle wherever it comes in the order). The buffers a connection
@@ -172,8 +172,10 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   freed and allocated per request. Paired against 0.19.0, on EC2: +11–13% at 1
   to 4 threads with p50 and p99 both down about 10%; at 8 threads (30 clients
   each) +6–7% with p50 down 5%, but p99 up from 0.38–0.43 to 0.49–0.52 ms.
-  Pipelined batches send at once: they already carry many replies, and
-  deferring them measured 0.7–2% slower at 4–8 threads.
+  Holding short batches' replies too gained 9–15% on one thread (Agent37: SET
+  at pipeline 4 and 16, and the 1:10 mix at 16), and about nothing at two, with
+  SET's p99 at pipeline 16 from 2.76 to 4.14 ms. Longer batches send at once:
+  held, 32 commands gained 2–4% with a p99 worse than Redis'.
 - **io_uring** (`--io uring`, the default where the kernel and container
   allow it): per-thread loops on [monoio](https://github.com/bytedance/monoio).
   On a 32-core EPYC it beat the epoll loop at every thread count (+17–25%
@@ -793,6 +795,22 @@ before the flusher's look), one-command requests went from 3% behind Redis to
 thread, and p99 at 8 epoll threads with the 1:10 mix (Valkey, 0.37 against 0.49
 ms). io_uring wins both.
 
+0.19.2 holds the replies of batches up to 16 commands as well. On one Agent37
+core (4 paired rounds, memtier 3 x 80, `bench/agent37/results-outbox.txt`),
+ops/s, then p99 in ms:
+
+| One server core | SET P1 | 1:10 P1 | SET P4 | SET P16 | 1:10 P16 | SET P64 |
+|---|---|---|---|---|---|---|
+| **Tantalum 0.19.2, io_uring** | **323k**, 0.97 | **347k**, 0.90 | **1.01M**, 1.15 | **1.89M**, 2.86 | **2.98M**, 1.88 | **2.52M**, 8.08 |
+| **Tantalum 0.19.2, epoll** | **313k**, 1.36 | **336k**, 1.34 | **970k**, 1.72 | **1.83M**, 4.14 | **2.88M**, 2.58 | **2.33M**, 9.34 |
+| Tantalum 0.19.1, epoll | 305k, 1.52 | 334k, 1.39 | 843k, 1.40 | 1.72M, 2.76 | 2.63M, 2.56 | 2.35M, 8.93 |
+| Valkey 9.1.3 | 274k, 1.69 | 284k, 1.63 | 759k, 2.24 | 1.44M, 3.93 | 1.70M, 3.62 | 1.87M, 10.88 |
+| Redis 8.10.3 | 270k, 1.73 | 282k, 1.65 | 765k, 2.26 | 1.45M, 4.54 | 1.69M, 3.30 | 1.90M, 10.11 |
+
+At 2 server threads (2 client cores, which likely limit it): −1.5% to +0.8%
+against 0.19.1. More threads, where deferring pipelined replies once cost
+0.7–2%, and the EC2 tables above, are yet to be measured with this.
+
 ### io_uring (Docker Desktop, November 2026)
 
 Railway blocks io_uring, so this ran in Docker Desktop on an Apple M1 Pro
@@ -948,9 +966,12 @@ hit rates share the seeding flaw described above.
   (where that wait now lands) was the top function at ~10%, then parsing
   (~10%), the lookup itself (~6%) and reply headers (~5%, since sped up).
   Prefetching across connections' batches could hide more.
-- **Pipelined SET on one epoll thread** trails Valkey by 11% and Redis by 4%
-  on EC2 (818k against 915k and 853k; io_uring: 983k). At 2 threads and up
-  Tantalum leads.
+- **Pipelined SET on one epoll thread** trailed Valkey by 11% and Redis by 4%
+  on EC2 with 0.19.1 (818k against 915k and 853k; io_uring: 983k), though it led
+  by 18% on the Agent37 VM. 0.19.2 is meant for it, sparing clients wakes, and
+  gained 9% on the VM; it hasn't been measured on EC2 yet.
+- **p99 of pipelined SET on epoll**, held since 0.19.2: at pipeline 16 about
+  Redis' and Valkey's (4.14 ms against 4.54 and 3.93), where io_uring has 2.86.
 - **p99 at 8 epoll threads** rose with replies sent together (0.38–0.43 to
   0.49–0.52 ms, for 6–7% more throughput and a lower median). More looks at the
   reactor before sending didn't help; io_uring is at 0.35–0.38 ms.
