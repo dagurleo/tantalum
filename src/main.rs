@@ -1,3 +1,5 @@
+use std::alloc::{GlobalAlloc, Layout};
+use std::ffi::c_void;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,10 +14,51 @@ use tantalum::store::{self, EvictionPolicy};
 use tokio::net::TcpListener;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: Allocator = Allocator;
 
 unsafe extern "C" {
     fn mi_collect(force: bool);
+    fn mi_malloc(size: usize) -> *mut c_void;
+    fn mi_zalloc(size: usize) -> *mut c_void;
+}
+
+/// mimalloc, asked for an alignment only when one is needed. `MiMalloc` always asks,
+/// and when the size's bin has no block ready, unless its blocks are a power of two,
+/// that adds `align - 1` to the size: 320 bytes aligned to 8 take a 384-byte block,
+/// and the bin stays empty, so the next asks the same way, on a slower path. Every
+/// block is aligned to a word anyway.
+struct Allocator;
+
+// SAFETY: as `MiMalloc`, whose functions these are, with a plain allocation only where
+// its block is aligned enough; `mi_free` and `mi_realloc_aligned` take either.
+unsafe impl GlobalAlloc for Allocator {
+    #[inline]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.align() <= align_of::<usize>() {
+            unsafe { mi_malloc(layout.size()).cast() }
+        } else {
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if layout.align() <= align_of::<usize>() {
+            unsafe { mi_zalloc(layout.size()).cast() }
+        } else {
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+    }
 }
 
 /// Hands back to the OS what the allocator has had free for a while. It would do

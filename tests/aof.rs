@@ -282,7 +282,15 @@ fn step(
     let words = |parts: &[&str]| -> Vec<Vec<String>> {
         vec![parts.iter().map(|a| a.to_string()).collect()]
     };
-    let commands: Vec<Vec<String>> = match rng.below(69) {
+    let commands: Vec<Vec<String>> = match rng.below(71) {
+        // Past a packed hash's limits by bytes, then changed and shrunk in place.
+        69 => words(&[
+            "HSET",
+            &h,
+            &format!("long{}", rng.below(8)),
+            &"l".repeat(3_000),
+        ]),
+        70 => words(&["HDEL", &h, &format!("long{}", rng.below(8))]),
         // A consumer blocked on a stream, served by the entry that follows
         // (run again by the writer, and logged then); or still waiting when it
         // gives up, which leaves only the consumer it made.

@@ -1,5 +1,7 @@
-//! Hash commands. A hash is one entry (see `crate::hash`), so reads scan it
-//! and changes write it again whole.
+//! Hash commands. A small hash is one entry, which reads scan and changes write
+//! again whole; a big one is an object, changed in place (see `crate::hash`).
+
+use std::collections::HashMap;
 
 use super::set::random_below;
 use super::string::{FloatError, add_floats};
@@ -7,87 +9,137 @@ use super::{
     Args, INVALID_CURSOR, NOT_AN_INTEGER, OOM, Reply, SYNTAX_ERROR, Scan, ScanOptions, WRONGTYPE,
     parse_cursor, wrong_arity,
 };
+use crate::collection::Collection;
 use crate::context::{Context, Session};
-use crate::hash::{self, Edit};
+use crate::hash::{self, BigHash, Edit, HashEdit, HashView};
 use crate::resp;
-use crate::store::{COPY_UNDER_LOCK_MAX, Kind, Millis, OutOfMemory, Store, Update};
+use crate::store::{Entry, EntryValue, Kind, Millis, OutOfMemory, Store, Update, View};
+
+/// The hash a value of its kind holds.
+pub(super) fn view(value: View<'_>) -> HashView<'_> {
+    match value {
+        View::Bytes(bytes) => HashView::Packed(bytes),
+        View::Object(Collection::Hash(hash)) => HashView::Big(hash),
+        View::Object(_) => unreachable!("a hash's object is a hash"),
+    }
+}
 
 /// Runs `f` on the hash at the key (`None` if there's none) to write the
-/// reply: under the shard lock when the hash is small, and on a shared
-/// reference after it when it's big. Replies `WRONGTYPE` to other kinds.
+/// reply, under the shard lock. Replies `WRONGTYPE` to other kinds.
 fn read(
     ctx: &Context,
     session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
-    f: impl FnOnce(Option<&[u8]>, &mut Vec<u8>),
+    f: impl FnOnce(Option<HashView<'_>>, &mut Vec<u8>),
 ) -> Reply {
     let store = &*ctx.store;
     let mut f = Some(f);
-    let mut run = |hash: Option<&[u8]>, out: &mut Vec<u8>| f.take().expect("runs once")(hash, out);
-    let (big, hit) = store.get_key(args.key(store), now, |value| match value {
+    let mut run =
+        |hash: Option<HashView<'_>>, out: &mut Vec<u8>| f.take().expect("runs once")(hash, out);
+    let hit = store.get_key(args.key(store), now, |value| match value {
         None => {
             run(None, out);
-            (None, false)
+            false
         }
         Some(v) if v.kind() != Kind::Hash => {
             resp::write_error(out, WRONGTYPE);
-            (None, true)
+            true
         }
-        Some(v) if v.as_bytes().len() <= COPY_UNDER_LOCK_MAX => {
-            run(Some(v.as_bytes()), out);
-            (None, true)
+        Some(v) => {
+            run(Some(view(v.view())), out);
+            true
         }
-        Some(v) => (Some(v.share()), true),
     });
     session.count_lookup(hit);
-    if let Some(value) = big {
-        run(Some(value.as_bytes()), out);
-    }
     Reply::Written
 }
 
+/// How to store a hash after an edit: packed, big, or deleted when empty.
+#[inline]
+fn finish(edit: HashEdit<'_, '_>, existed: bool) -> Update {
+    let unchanged = || if existed { Update::Touch } else { Update::Peek };
+    match edit {
+        HashEdit::Big { changed: false, .. } => unchanged(),
+        HashEdit::Big { hash, .. } if hash.is_empty() => Update::Delete,
+        HashEdit::Big { .. } => Update::Changed,
+        HashEdit::Packed(edit) if !edit.changed() => unchanged(),
+        HashEdit::Packed(edit) if edit.is_empty() => Update::Delete,
+        HashEdit::Packed(edit) => {
+            let encoded = edit.encode();
+            if hash::fits_packed(&encoded) {
+                Update::Replace(Kind::Hash, encoded)
+            } else {
+                Update::Object(Collection::Hash(BigHash::from_packed(&encoded)))
+            }
+        }
+    }
+}
+
 /// Changes the hash at the key with `f`, creating it if there's none and
-/// deleting it if it ends up empty. `f` gets an [`Edit`] of it, expecting
+/// deleting it if it ends up empty. `f` gets a [`HashEdit`] of it, expecting
 /// about `lookups` field lookups, the arguments and a buffer for formatting
-/// numbers; an `Err` from `f` is the error reply and changes nothing. Writes
-/// `WRONGTYPE` or the OOM error itself, returning `None`.
+/// numbers; an `Err` from `f`, before it has changed anything, is the error
+/// reply. With `grows` (commands that may add data) it may refuse with the OOM
+/// error. Writes `WRONGTYPE` or the OOM error itself, returning `None`.
 fn write<R>(
     store: &Store,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
     lookups: usize,
-    mut f: impl for<'v> FnMut(
-        &mut Edit<'v>,
+    grows: bool,
+    f: impl for<'v> FnMut(
+        &mut HashEdit<'_, 'v>,
         &Args<'v>,
         &'v mut itoa::Buffer,
     ) -> Result<R, &'static [u8]>,
 ) -> Option<R> {
-    let result = store.update_key(args.key(store), now, |current| {
-        let old = match &current {
-            None => None,
-            Some(c) if c.value.kind() != Kind::Hash => return (Update::Peek, Err(WRONGTYPE)),
-            Some(c) => Some(c.value.as_bytes()),
-        };
-        let mut digits = itoa::Buffer::new();
-        let mut edit = Edit::new(old, lookups);
-        let reply = match f(&mut edit, args, &mut digits) {
-            Ok(reply) => reply,
-            Err(msg) => return (Update::Peek, Err(msg)),
-        };
-        let update = if !edit.changed() {
-            match current {
-                Some(_) => Update::Touch,
-                None => Update::Peek,
+    write_with(store, now, args, out, lookups, grows, f)
+}
+
+/// [`write`] with a `B` for what `f` works out to put in the hash, there until the
+/// hash is stored.
+fn write_with<B: Default, R>(
+    store: &Store,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    lookups: usize,
+    grows: bool,
+    mut f: impl for<'v> FnMut(&mut HashEdit<'_, 'v>, &Args<'v>, &'v mut B) -> Result<R, &'static [u8]>,
+) -> Option<R> {
+    let result = store.update_collection(args.key(store), now, grows, |entry| {
+        let existed = entry.is_some();
+        let mut scratch = B::default();
+        let mut packed;
+        let mut edit = match entry {
+            None => {
+                packed = Edit::new(None, lookups);
+                HashEdit::Packed(&mut packed)
             }
-        } else if edit.is_empty() {
-            Update::Delete
-        } else {
-            Update::Replace(Kind::Hash, edit.encode())
+            Some(Entry {
+                kind: Kind::Hash,
+                value,
+                ..
+            }) => match value {
+                EntryValue::Bytes(bytes) => {
+                    packed = Edit::new(Some(bytes), lookups);
+                    HashEdit::Packed(&mut packed)
+                }
+                EntryValue::Object(Collection::Hash(hash)) => HashEdit::Big {
+                    hash,
+                    changed: false,
+                },
+                EntryValue::Object(_) => unreachable!("a hash's object is a hash"),
+            },
+            Some(_) => return (Update::Peek, Err(WRONGTYPE)),
         };
-        (update, Ok(reply))
+        match f(&mut edit, args, &mut scratch) {
+            Ok(reply) => (finish(edit, existed), Ok(reply)),
+            Err(msg) => (Update::Peek, Err(msg)),
+        }
     });
     match result {
         Ok(Ok(reply)) => Some(reply),
@@ -147,6 +199,7 @@ fn set_pairs(
         args,
         out,
         (args.len() - 2) / 2,
+        true,
         |edit, args, _| {
             let mut added = 0;
             for i in (2..args.len()).step_by(2) {
@@ -165,7 +218,7 @@ pub(super) fn hsetnx(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let set = write(&ctx.store, now, args, out, 1, |edit, args, _| {
+    let set = write(&ctx.store, now, args, out, 1, true, |edit, args, _| {
         Ok(edit.get(args.get(2)).is_none() && edit.set(args.get(2), args.get(3)))
     });
     if let Some(set) = set {
@@ -188,6 +241,7 @@ pub(super) fn hdel(
         args,
         out,
         args.len() - 2,
+        false,
         |edit, args, _| {
             Ok((2..args.len())
                 .filter(|&i| edit.delete(args.get(i)))
@@ -212,7 +266,7 @@ pub(super) fn hincrby(
         resp::write_error(out, NOT_AN_INTEGER);
         return Reply::Written;
     };
-    let value = write(&ctx.store, now, args, out, 1, |edit, args, digits| {
+    let value = write(&ctx.store, now, args, out, 1, true, |edit, args, digits| {
         let field = args.get(2);
         let old = match edit.get(field) {
             None => 0,
@@ -241,8 +295,7 @@ pub(super) fn hincrbyfloat(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let (field, incr) = (args.get(2), args.get(3));
-    match add_floats(None, incr) {
+    match add_floats(None, args.get(3)) {
         Err(FloatError::IncrementNotFinite) => {
             resp::write_error(out, b"ERR value is NaN or Infinity");
             return Reply::Written;
@@ -253,38 +306,49 @@ pub(super) fn hincrbyfloat(
         }
         Ok(_) => {}
     }
-    let store = &*ctx.store;
-    let result = store.update_key(args.key(store), now, |current| {
-        let old = match &current {
-            None => None,
-            Some(c) if c.value.kind() != Kind::Hash => return (Update::Peek, Err(WRONGTYPE)),
-            Some(c) => Some(c.value.as_bytes()),
-        };
-        let sum = match add_floats(old.and_then(|hash| hash::get(hash, field)), incr) {
-            Ok(sum) => sum,
-            Err(FloatError::BadCurrent) => {
-                return (Update::Peek, Err(&b"ERR hash value is not a float"[..]));
-            }
-            Err(_) => {
-                return (
-                    Update::Peek,
-                    Err(&b"ERR increment would produce NaN or Infinity"[..]),
-                );
-            }
-        };
-        let encoded = {
-            let mut edit = Edit::new(old, 1);
-            edit.set(field, &sum);
-            edit.encode()
-        };
-        (Update::Replace(Kind::Hash, encoded), Ok(sum))
+    let reply = write_with::<Vec<u8>, _>(&ctx.store, now, args, out, 1, true, |edit, args, sum| {
+        let field = args.get(2);
+        *sum = add_floats(edit.get(field), args.get(3)).map_err(|e| match e {
+            FloatError::BadCurrent => &b"ERR hash value is not a float"[..],
+            _ => &b"ERR increment would produce NaN or Infinity"[..],
+        })?;
+        let sum: &[u8] = sum;
+        edit.set(field, sum);
+        Ok(sum.to_vec())
     });
-    match result {
-        Ok(Ok(sum)) => resp::write_bulk(out, &sum),
-        Ok(Err(message)) => resp::write_error(out, message),
-        Err(OutOfMemory) => resp::write_error(out, OOM),
+    if let Some(sum) = reply {
+        resp::write_bulk(out, &sum);
     }
     Reply::Written
+}
+
+/// A hash's fields by position: what a packed hash can't do without a list of them.
+enum Fields<'a> {
+    Packed(Vec<(&'a [u8], &'a [u8])>),
+    Big(&'a BigHash),
+}
+
+impl<'a> Fields<'a> {
+    fn new(hash: HashView<'a>) -> Self {
+        match hash {
+            HashView::Packed(bytes) => Fields::Packed(hash::iter(bytes).collect()),
+            HashView::Big(hash) => Fields::Big(hash),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Fields::Packed(pairs) => pairs.len(),
+            Fields::Big(hash) => hash.len(),
+        }
+    }
+
+    fn at(&self, i: usize) -> (&'a [u8], &'a [u8]) {
+        match self {
+            Fields::Packed(pairs) => pairs[i],
+            Fields::Big(hash) => hash.get_index(i),
+        }
+    }
 }
 
 /// `HRANDFIELD key [count [WITHVALUES]]`: a positive count asks for distinct
@@ -300,8 +364,8 @@ pub(super) fn hrandfield(
     if args.len() == 2 {
         return read(ctx, session, now, args, out, |hash, out| match hash {
             Some(hash) => {
-                let pairs: Vec<_> = hash::iter(hash).collect();
-                resp::write_bulk(out, pairs[random_below(pairs.len())].0);
+                let fields = Fields::new(hash);
+                resp::write_bulk(out, fields.at(random_below(fields.len())).0);
             }
             None => out.extend_from_slice(null),
         });
@@ -333,8 +397,11 @@ pub(super) fn hrandfield(
     };
     let resp3 = session.resp3;
     read(ctx, session, now, args, out, |hash, out| {
-        let pairs: Vec<_> = hash.map_or_else(Vec::new, |hash| hash::iter(hash).collect());
-        if pairs.is_empty() || count == 0 {
+        let Some(fields) = hash.map(Fields::new) else {
+            resp::write_array_header(out, 0);
+            return;
+        };
+        if count == 0 {
             resp::write_array_header(out, 0);
             return;
         }
@@ -355,17 +422,19 @@ pub(super) fn hrandfield(
         if count < 0 {
             header(out, n);
             for _ in 0..n {
-                one(out, pairs[random_below(pairs.len())]);
+                one(out, fields.at(random_below(fields.len())));
             }
         } else {
-            let n = n.min(pairs.len());
-            let mut picks = pairs;
+            let n = n.min(fields.len());
             header(out, n);
-            // The first n of a shuffle.
+            // The first n of a shuffle, noting only what's moved: a big hash
+            // needn't be listed for a few of its fields.
+            let mut moved = HashMap::new();
             for i in 0..n {
-                let j = i + random_below(picks.len() - i);
-                picks.swap(i, j);
-                one(out, picks[i]);
+                let j = i + random_below(fields.len() - i);
+                let pick = moved.get(&j).copied().unwrap_or(j);
+                moved.insert(j, moved.get(&i).copied().unwrap_or(i));
+                one(out, fields.at(pick));
             }
         }
     })
@@ -381,7 +450,7 @@ pub(super) fn hget(
 ) -> Reply {
     let null = session.null();
     read(ctx, session, now, args, out, |hash, out| {
-        match hash.and_then(|hash| hash::get(hash, args.get(2))) {
+        match hash.and_then(|hash| hash.get(args.get(2))) {
             Some(value) => resp::write_bulk(out, value),
             None => out.extend_from_slice(null),
         }
@@ -400,14 +469,14 @@ pub(super) fn hmget(
     read(ctx, session, now, args, out, |hash, out| {
         let fields = 2..args.len();
         resp::write_array_header(out, fields.len());
-        // One pass over the hash for any number of fields, beyond a few.
+        // One pass over a packed hash for any number of fields, beyond a few.
         let found: Vec<Option<&[u8]>> = match hash {
             None => vec![None; fields.len()],
-            Some(hash) if fields.len() > 8 => {
-                let edit = Edit::new(Some(hash), fields.len());
+            Some(HashView::Packed(bytes)) if fields.len() > 8 => {
+                let edit = Edit::new(Some(bytes), fields.len());
                 fields.map(|i| edit.get(args.get(i))).collect()
             }
-            Some(hash) => fields.map(|i| hash::get(hash, args.get(i))).collect(),
+            Some(hash) => fields.map(|i| hash.get(args.get(i))).collect(),
         };
         for value in found {
             match value {
@@ -432,8 +501,8 @@ pub(super) fn hgetall(
             resp::write_map_header(out, 0, resp3);
             return;
         };
-        resp::write_map_header(out, hash::len(hash), resp3);
-        for (field, value) in hash::iter(hash) {
+        resp::write_map_header(out, hash.len(), resp3);
+        for (field, value) in hash.iter() {
             resp::write_bulk(out, field);
             resp::write_bulk(out, value);
         }
@@ -469,15 +538,15 @@ pub(super) fn hvals(
 /// An array of one part of each field.
 fn write_each<'a>(
     out: &mut Vec<u8>,
-    hash: Option<&'a [u8]>,
+    hash: Option<HashView<'a>>,
     part: impl Fn((&'a [u8], &'a [u8])) -> &'a [u8],
 ) {
     let Some(hash) = hash else {
         resp::write_array_header(out, 0);
         return;
     };
-    resp::write_array_header(out, hash::len(hash));
-    for pair in hash::iter(hash) {
+    resp::write_array_header(out, hash.len());
+    for pair in hash.iter() {
         resp::write_bulk(out, part(pair));
     }
 }
@@ -491,7 +560,7 @@ pub(super) fn hlen(
     out: &mut Vec<u8>,
 ) -> Reply {
     read(ctx, session, now, args, out, |hash, out| {
-        resp::write_integer(out, hash.map_or(0, hash::len) as i64)
+        resp::write_integer(out, hash.map_or(0, HashView::len) as i64)
     })
 }
 
@@ -504,7 +573,7 @@ pub(super) fn hexists(
     out: &mut Vec<u8>,
 ) -> Reply {
     read(ctx, session, now, args, out, |hash, out| {
-        let found = hash.is_some_and(|hash| hash::get(hash, args.get(2)).is_some());
+        let found = hash.is_some_and(|hash| hash.get(args.get(2)).is_some());
         resp::write_integer(out, i64::from(found))
     })
 }
@@ -519,7 +588,7 @@ pub(super) fn hstrlen(
 ) -> Reply {
     read(ctx, session, now, args, out, |hash, out| {
         let len = hash
-            .and_then(|hash| hash::get(hash, args.get(2)))
+            .and_then(|hash| hash.get(args.get(2)))
             .map_or(0, <[u8]>::len);
         resp::write_integer(out, len as i64)
     })
@@ -527,10 +596,10 @@ pub(super) fn hstrlen(
 
 /// `HSCAN key cursor [MATCH pattern] [COUNT count] [NOVALUES]`. A hash
 /// Redis keeps as a listpack comes whole, with cursor 0, as from Redis. One
-/// it would keep as a hash table (over 128 fields, or a field or value over
+/// it would keep as a hash table (over 512 fields, or a field or value over
 /// 64 bytes) comes `COUNT` fields at a time, as Redis pages those, from the
-/// end of the fields' order: removing a field keeps the others' order, so
-/// nothing there all along is skipped.
+/// end of the fields' order: removing a field moves the others up, or the last
+/// into its place, so nothing there all along is skipped.
 pub(super) fn hscan(
     ctx: &Context,
     session: &mut Session,
@@ -551,20 +620,19 @@ pub(super) fn hscan(
         let Some(options) = ScanOptions::parse(args, 3, Scan::Hash, out) else {
             return;
         };
-        let fields: Vec<_> = hash::iter(hash).collect();
-        let big = fields.len() > 128 || fields.iter().any(|(f, v)| f.len() > 64 || v.len() > 64);
-        let (page, next) = if big {
+        let fields = Fields::new(hash);
+        let (start, end, next) = if hash.fits_listpack() {
+            (0, fields.len(), 0)
+        } else {
             let end = match cursor {
                 0 => fields.len(),
                 c => usize::try_from(c).unwrap_or(usize::MAX).min(fields.len()),
             };
             let start = end.saturating_sub(options.count);
-            (&fields[start..end], start)
-        } else {
-            (&fields[..], 0)
+            (start, end, start)
         };
-        let found: Vec<_> = page
-            .iter()
+        let found: Vec<_> = (start..end)
+            .map(|i| fields.at(i))
             .filter(|(field, _)| options.matches(field))
             .collect();
         out.extend_from_slice(b"*2\r\n");

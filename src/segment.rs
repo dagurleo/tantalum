@@ -80,11 +80,14 @@ impl Kind {
         }
     }
 
-    /// Lists, sets, sorted sets and streams: when too big to stay packed
-    /// (streams always), an `EXTERNAL` entry of these kinds is an object
+    /// Hashes, lists, sets, sorted sets and streams: when too big to stay
+    /// packed (streams always), an `EXTERNAL` entry of these kinds is an object
     /// (`collection.rs`) rather than bytes in an `entry.rs` allocation.
     pub fn is_collection(self) -> bool {
-        matches!(self, Kind::List | Kind::Set | Kind::ZSet | Kind::Stream)
+        matches!(
+            self,
+            Kind::Hash | Kind::List | Kind::Set | Kind::ZSet | Kind::Stream
+        )
     }
 }
 

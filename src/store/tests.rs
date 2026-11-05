@@ -543,6 +543,16 @@ fn matches_a_model() {
                     5..8 => Update::Replace(kind, random_value(&mut rng, step)),
                     _ => Update::Touch,
                 };
+                // These bytes aren't a hash: one too long to pack would be read as
+                // one, to become an object.
+                let update = match update {
+                    Update::Replace(Kind::Hash, value)
+                        if key.len() + value.len() + 20 > INLINE_MAX =>
+                    {
+                        Update::Replace(Kind::String, value)
+                    }
+                    other => other,
+                };
                 let shown = s
                     .update_key(s.key(&key), now, |current| {
                         let shown = current
@@ -588,13 +598,16 @@ fn matches_a_model() {
                 }
             }
             85..88 => {
-                // As snapshots load keys.
-                let kind = if rng.below(2) == 0 {
-                    Kind::String
+                // As snapshots load keys. A hash must be one, as this reads it, and
+                // short enough to stay packed, as the model holds bytes.
+                let bytes = random_value(&mut rng, step);
+                let (kind, value) = if rng.below(2) == 0 || bytes.len() > 4_000 {
+                    (Kind::String, bytes)
                 } else {
-                    Kind::Hash
+                    let mut edit = crate::hash::Edit::new(None, 1);
+                    edit.set(b"f", &bytes);
+                    (Kind::Hash, edit.encode())
                 };
-                let value = random_value(&mut rng, step);
                 let (expiry, deadline) = match rng.below(2) {
                     0 => (Expiry::Never, 0),
                     _ => {
@@ -1097,6 +1110,31 @@ fn memory_budget() {
     assert!(
         per_key <= 60.0,
         "{per_key:.2} bytes per key, over the 60 budget"
+    );
+}
+
+/// Bytes a big hash's fields are accounted for as it loads, buffers exact, with its
+/// table just past a doubling. Redis takes 70-80 for these and Valkey 70-80, in RSS.
+#[test]
+fn big_hash_memory_budget() {
+    use crate::hash::BigHash;
+    // Just past the table's doubling, where its share is largest.
+    let fields = 240_000;
+    let mut names = Vec::with_capacity(fields);
+    for i in 0..fields {
+        names.push(format!("f{i:015}").into_bytes());
+    }
+    let pairs: Vec<(&[u8], &[u8])> = names.iter().map(|n| (&n[..], &[b'v'; 32][..])).collect();
+    let mut edit = crate::hash::Edit::new(None, fields);
+    for &(field, value) in &pairs {
+        edit.set(field, value);
+    }
+    let big = BigHash::from_packed(&edit.encode());
+    let per_field = big.allocation_size() as f64 / fields as f64;
+    println!("memory per big hash field: {per_field:.2} bytes");
+    assert!(
+        per_field <= 72.0,
+        "{per_field:.2} bytes per field, over the 72 budget"
     );
 }
 

@@ -1,0 +1,201 @@
+# 2026-11-06, Agent37 VM (Xeon E-2388G), one server core. 0.22.2 against 0.22.3, whose
+# big hashes change in place.
+
+# One big hash of 16-byte fields and 32-byte values: the growth of RSS per field, 3 s
+# after each size, and the longest a batch of 500 took (its longest stop to grow).
+# setsizes.py hash, a fresh server each.
+# tantalum   0.5M  72.7  1M  69.2  2M  67.3  3M  63.2  4M  66.2  6M  62.5  8M  65.8   longest batch 614 ms
+# redis      0.5M  75.6  1M  77.4  2M  73.0  3M  80.0  4M  70.8  6M  78.5  8M  70.7   longest batch 5 ms
+# valkey     0.5M  80.5  1M  80.2  2M  80.0  3M  70.2  4M  79.9  6M  70.2  8M  79.9   longest batch 8 ms
+
+# A big set, 0.22.2 and 0.22.3: the same but for about 300 KB fixed, which is the
+# allocator's own, not per member.
+# old        0.5M  53.2  1M  49.9  2M  49.5  3M  45.2  4M  48.1  6M  44.4  8M  47.8   longest batch 840 ms
+# new        0.5M  53.9  1M  50.2  2M  49.6  3M  45.3  4M  48.2  6M  44.4  8M  47.8   longest batch 817 ms
+
+# Right after a fill, and for a big hash before it has given back its old buffers
+# (its 111.5 is 65.3 three seconds later), each type on 0.22.3, 3M items, memtypes.py.
+string      new       used_memory/item   56.5  RSS/item   56.8   slope: used   57.1  RSS   57.2
+list        new       used_memory/item   38.4  RSS/item   34.5   slope: used   38.4  RSS   34.2
+set         new       used_memory/item   58.7  RSS/item   44.6   slope: used   63.4  RSS   38.9
+zset        new       used_memory/item   75.2  RSS/item   67.4   slope: used   81.4  RSS   65.2
+hash        new       used_memory/item  105.5  RSS/item  111.5   slope: used  116.1  RSS  130.1
+small-hash  new       used_memory/item   51.6  RSS/item   53.6   slope: used   50.6  RSS   51.1
+small-list  new       used_memory/item   49.2  RSS/item   51.1   slope: used   48.0  RSS   48.9
+small-set   new       used_memory/item   47.8  RSS/item   49.6   slope: used   46.8  RSS   47.9
+small-zset  new       used_memory/item   52.9  RSS/item   54.8   slope: used   52.2  RSS   52.7
+
+# Stream entries, 0.22.2 then 0.22.3, memslope.py.
+tantalum-purge1: entries, slope per entry: used_memory 36.8 B, RSS 38.2 B; fixed RSS 1.2 M
+tantalum-h6: entries, slope per entry: used_memory 36.8 B, RSS 38.2 B; fixed RSS 1.2 MB; R
+
+# Small hashes: user instructions and cycles per command under perf stat, 4 rounds in
+# alternating order, 100k hashes of ten fields (mid: one of 300). tantalum-purge1 is
+# 0.22.2. hgetall's cycles swing between rounds on any build, so go by its instructions.
+redis SET P1 ops/s: 296224.60
+redis SET P1 ops/s: 291050.39
+count hget       tantalum-purge1     2071     819
+count hset-same  tantalum-purge1     4366    1836
+count hset-grow  tantalum-purge1     4636    1859
+count hincrby    tantalum-purge1     5059    1989
+count hgetall    tantalum-purge1     5320    2052
+count hmget      tantalum-purge1     3852    1220
+count hdel-hset  tantalum-purge1     5525    2547
+count mid-hset   tantalum-purge1    56782   19924
+count mid-hget   tantalum-purge1    11232    2894
+count hget       tantalum-h6         1912     915
+count hset-same  tantalum-h6         4071    1492
+count hset-grow  tantalum-h6         4339    1716
+count hincrby    tantalum-h6         4802    1845
+count hgetall    tantalum-h6         4923    3311
+count hmget      tantalum-h6         3274    1039
+count hdel-hset  tantalum-h6         5265    2415
+count mid-hset   tantalum-h6        47717   13737
+count mid-hget   tantalum-h6         7283    2742
+count hget       tantalum-h6         1912     795
+count hset-same  tantalum-h6         4071    1487
+count hset-grow  tantalum-h6         4340    1706
+count hincrby    tantalum-h6         4801    1836
+count hgetall    tantalum-h6         4913    1696
+count hmget      tantalum-h6         3274    1040
+count hdel-hset  tantalum-h6         5260    2392
+count mid-hset   tantalum-h6        47715   13873
+count mid-hget   tantalum-h6         7286    2745
+count hget       tantalum-purge1     2071     823
+count hset-same  tantalum-purge1     4366    1641
+count hset-grow  tantalum-purge1     4635    1865
+count hincrby    tantalum-purge1     5062    2000
+count hgetall    tantalum-purge1     5317    2040
+count hmget      tantalum-purge1     3851    1186
+count hdel-hset  tantalum-purge1     5526    2541
+count mid-hset   tantalum-purge1    56751   20050
+count mid-hget   tantalum-purge1    11201    2813
+count hget       tantalum-purge1     2071     824
+count hset-same  tantalum-purge1     4366    1681
+count hset-grow  tantalum-purge1     4636    1889
+count hincrby    tantalum-purge1     5062    1992
+count hgetall    tantalum-purge1     5221    1803
+count hmget      tantalum-purge1     3852    1190
+count hdel-hset  tantalum-purge1     5528    2523
+count mid-hset   tantalum-purge1    56757   20164
+count mid-hget   tantalum-purge1    11207    2871
+count hget       tantalum-h6         1913     804
+count hset-same  tantalum-h6         4071    1489
+count hset-grow  tantalum-h6         4341    1717
+count hincrby    tantalum-h6         4801    1830
+count hgetall    tantalum-h6         4907    1668
+count hmget      tantalum-h6         3275    1044
+count hdel-hset  tantalum-h6         5262    2381
+count mid-hset   tantalum-h6        47705   13738
+count mid-hget   tantalum-h6         7271    2744
+count hget       tantalum-h6         1912     799
+count hset-same  tantalum-h6         4071    1486
+count hset-grow  tantalum-h6         4340    1711
+count hincrby    tantalum-h6         4802    1838
+count hgetall    tantalum-h6         4914    1694
+count hmget      tantalum-h6         3274    1045
+count hdel-hset  tantalum-h6         5267    2401
+count mid-hset   tantalum-h6        47717   13867
+count mid-hget   tantalum-h6         7283    2746
+count hget       tantalum-purge1     2071     851
+count hset-same  tantalum-purge1     4366    1674
+count hset-grow  tantalum-purge1     4636    1871
+count hincrby    tantalum-purge1     5063    2011
+count hgetall    tantalum-purge1     5231    2048
+count hmget      tantalum-purge1     3852    1674
+count hdel-hset  tantalum-purge1     5530    2547
+count mid-hset   tantalum-purge1    56792   20076
+count mid-hget   tantalum-purge1    11242    2865
+
+# 0.22.2 (old) against 0.22.3 (new), memtier 3 x 80 on the other three cores, in rounds of
+# alternating order. Fields: ops/s, p50 ms, p99 ms. big-values: 64 KB values over 2,000
+# keys. reconnect: clients reconnecting every 20 requests.
+redis SET P1 ops/s: 296084.92
+redis SET P1 ops/s: 289282.87
+ab 1 old set-P1 343133.84 0.63100 0.99100
+ab 1 new set-P1 339094.38 0.63900 1.03900
+ab 1 old mix-P1 349531.55 0.62300 0.96700
+ab 1 new mix-P1 346362.76 0.63100 0.99900
+ab 1 old set-P16 2661735.29 1.38300 2.20700
+ab 1 new set-P16 2656925.68 1.38300 2.22300
+ab 1 old mix-P16 3231152.44 1.14300 1.71100
+ab 1 new mix-P16 3210769.61 1.14300 1.69500
+ab 1 old big-values 40320.02 5.85500 10.94300
+ab 1 new big-values 41583.32 5.59900 9.53500
+ab 1 old reconnect 250837.65 0.89500 1.51900
+ab 1 new reconnect 256790.32 0.87100 1.48700
+ab 2 new set-P1 326056.17 0.67900 1.05500
+ab 2 old set-P1 322042.09 0.67100 1.11100
+ab 2 new mix-P1 345604.03 0.63100 0.98300
+ab 2 old mix-P1 343467.48 0.63900 1.01500
+ab 2 new set-P16 2376089.15 1.57500 2.41500
+ab 2 old set-P16 2309877.63 1.56700 2.52700
+ab 2 new mix-P16 3102347.31 1.17500 1.87100
+ab 2 old mix-P16 2934347.65 1.27100 2.31900
+ab 2 new big-values 40353.19 5.98300 9.34300
+ab 2 old big-values 40079.13 5.95100 9.27900
+ab 2 new reconnect 258177.57 0.89500 1.49500
+ab 2 old reconnect 258961.60 0.89500 1.47100
+ab 3 old set-P1 331588.45 0.66300 1.04700
+ab 3 new set-P1 332584.29 0.66300 1.03900
+ab 3 old mix-P1 338309.63 0.63900 1.01500
+ab 3 new mix-P1 340386.05 0.63100 1.02300
+ab 3 old set-P16 2358078.59 1.56700 2.39900
+ab 3 new set-P16 2372777.98 1.57500 2.39900
+ab 3 old mix-P16 3158934.36 1.16700 1.91900
+ab 3 new mix-P16 3098058.73 1.18300 2.03100
+ab 3 old big-values 40116.86 5.98300 8.95900
+ab 3 new big-values 40100.82 5.91900 9.53500
+ab 3 old reconnect 254158.92 0.90300 1.57500
+ab 3 new reconnect 255241.03 0.91100 1.52700
+ab 4 new set-P1 326029.01 0.67900 1.07100
+ab 4 old set-P1 321550.41 0.67900 1.07100
+ab 4 new mix-P1 334359.89 0.64700 1.03100
+ab 4 old mix-P1 331605.84 0.65500 1.03100
+ab 4 new set-P16 2306434.80 1.60700 2.78300
+ab 4 old set-P16 2365085.16 1.55900 2.41500
+ab 4 new mix-P16 3119598.74 1.19100 1.91900
+ab 4 old mix-P16 3124669.42 1.17500 2.11100
+ab 4 new big-values 39760.09 5.98300 9.15100
+ab 4 old big-values 39173.48 6.01500 11.19900
+ab 4 new reconnect 255503.20 0.90300 1.51100
+ab 4 old reconnect 255177.86 0.89500 1.50300
+
+# One big hash of 1M fields: Redis 7.2.4, Valkey and 0.22.3, each round in a different
+# order, memtier's Totals line.
+round 1 valkey hget P1 Totals     294395.08    294395.08         0.00         0.81527         0.77500         1.56700     21529.41
+round 1 tantalum hget P1 Totals     323490.57    323490.57         0.00         0.74195         0.65500         1.35900     23657.42
+round 1 redis hget P1 Totals     307335.23    307335.23         0.00         0.78097         0.75900         1.51900     22475.63
+round 1 valkey hget P16 Totals    1681476.49   1681476.49         0.00         2.28018         2.28700         3.51900    122968.81
+round 1 tantalum hget P16 Totals    2408183.97   2408183.97         0.00         1.59146         1.61500         2.36700    176112.05
+round 1 redis hget P16 Totals    1842213.47   1842213.47         0.00         2.08128         2.12700         2.87900    134723.94
+round 1 valkey hset P1 Totals     287203.24         0.00         0.00         0.83580         0.81500         1.62300     22125.50
+round 1 tantalum hset P1 Totals     327322.76         0.00         0.00         0.73340         0.67100         1.06300     25216.38
+round 1 redis hset P1 Totals     302258.56         0.00         0.00         0.79418         0.76700         1.54300     23285.13
+round 1 valkey hset P16 Totals    1435140.70         0.00         0.00         2.67361         2.71900         3.47100    110557.96
+round 1 tantalum hset P16 Totals    2230770.49         0.00         0.00         1.71927         1.73500         2.60700    171851.35
+round 1 redis hset P16 Totals    1655550.79         0.00         0.00         2.31739         2.36700         3.08700    127539.87
+round 2 tantalum hget P1 Totals     331911.09    331911.09         0.00         0.72316         0.65500         1.04700     24273.47
+round 2 redis hget P1 Totals     304082.93    304082.93         0.00         0.78930         0.76700         1.54300     22237.85
+round 2 valkey hget P1 Totals     294262.60    294262.60         0.00         0.81563         0.79100         1.58300     21519.73
+round 2 tantalum hget P16 Totals    2362105.90   2362105.90         0.00         1.62231         1.58300         2.55900    172742.39
+round 2 redis hget P16 Totals    1754075.92   1754075.92         0.00         2.18593         2.19100         3.77500    128278.09
+round 2 valkey hget P16 Totals    1681677.18   1681677.18         0.00         2.28000         2.31900         3.64700    122983.48
+round 2 tantalum hset P1 Totals     324407.43         0.00         0.00         0.73996         0.66300         1.14300     24991.73
+round 2 redis hset P1 Totals     286921.22         0.00         0.00         0.83659         0.78300         1.58300     22103.80
+round 2 valkey hset P1 Totals     277720.92         0.00         0.00         0.86430         0.82300         1.64700     21395.01
+round 2 tantalum hset P16 Totals    2193828.32         0.00         0.00         1.74819         1.73500         2.75100    169005.43
+round 2 redis hset P16 Totals    1517267.41         0.00         0.00         2.52856         2.47900         4.57500    116885.48
+round 2 valkey hset P16 Totals    1416540.56         0.00         0.00         2.70855         2.76700         3.72700    109124.93
+round 3 redis hget P1 Totals     300210.43    300210.43         0.00         0.79945         0.75900         1.54300     21954.65
+round 3 valkey hget P1 Totals     293137.22    293137.22         0.00         0.81875         0.78300         1.57500     21437.45
+round 3 tantalum hget P1 Totals     328615.10    328615.10         0.00         0.73040         0.65500         1.16700     24032.33
+round 3 redis hget P16 Totals    1805401.32   1805401.32         0.00         2.12364         2.15900         3.34300    132031.57
+round 3 valkey hget P16 Totals    1358584.07   1358584.07         0.00         2.82089         2.54300         6.62300     99353.26
+round 3 tantalum hget P16 Totals    1774207.69   1774207.69         0.00         2.15929         1.91100         5.31100    129750.39
+round 3 redis hset P1 Totals     291971.31         0.00         0.00         0.82210         0.79100         1.59100     22492.72
+round 3 valkey hset P1 Totals     279141.08         0.00         0.00         0.85989         0.80700         1.63100     21504.40
+round 3 tantalum hset P1 Totals     324354.32         0.00         0.00         0.74007         0.67100         1.11100     24987.60
+round 3 redis hset P16 Totals    1619673.51         0.00         0.00         2.36864         2.38300         3.93500    124775.73
+round 3 valkey hset P16 Totals    1343344.56         0.00         0.00         2.85631         2.78300         4.57500    103486.32
+round 3 tantalum hset P16 Totals    2212918.20         0.00         0.00         1.73311         1.74300         2.65500    170476.05

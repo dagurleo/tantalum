@@ -12,7 +12,8 @@
 //!
 //! The string workloads run first and alone, as they did before hashes
 //! existed; the hashes come after them, then a stream's consumer group
-//! (`group_p16_ns`: `XADD`, `XREADGROUP` and `XACK` in turn).
+//! (`group_p16_ns`: `XADD`, `XREADGROUP` and `XACK` in turn) and one big hash
+//! (`big_hash_p16_ns`: 1 `HSET` for every 10 `HGET`s).
 //!
 //!   bench [--keys N] [--ops N] [--runs N]
 
@@ -128,6 +129,27 @@ fn group_requests(next: &Cell<u64>, ops: usize, pipeline: usize) -> Vec<Vec<u8>>
                     }
                 }
                 step = (step + 1) % 3;
+            }
+            buf
+        })
+        .collect()
+}
+
+/// Requests of `pipeline` commands each on one big hash: 1 HSET for every 10 HGETs,
+/// over random fields of its `fields`.
+fn big_hash_requests(fields: usize, ops: usize, pipeline: usize, seed: u64) -> Vec<Vec<u8>> {
+    let mut rng = Rng(seed);
+    let value = [b'b'; 16];
+    (0..ops / pipeline)
+        .map(|_| {
+            let mut buf = Vec::new();
+            for _ in 0..pipeline {
+                let field = format!("field:{}", rng.below(fields));
+                if rng.below(11) == 0 {
+                    push_command(&mut buf, &[b"HSET", b"big", field.as_bytes(), &value]);
+                } else {
+                    push_command(&mut buf, &[b"HGET", b"big", field.as_bytes()]);
+                }
             }
             buf
         })
@@ -297,6 +319,21 @@ fn main() {
         let next = Cell::new(1);
         let reqs = |_seed| group_requests(&next, ops, 16);
         results.push(time("group_p16_ns", runs, serve, reqs, 16));
+    });
+
+    // One big hash, likewise.
+    with_server(|_, serve| {
+        let fields = keys.min(1_000_000);
+        let value = [b'b'; 16];
+        fill(
+            serve,
+            (0..fields).map(|i| {
+                let field = format!("field:{i}");
+                command(&[b"HSET", b"big", field.as_bytes(), &value])
+            }),
+        );
+        let reqs = |seed| big_hash_requests(fields, ops, 16, seed);
+        results.push(time("big_hash_p16_ns", runs, serve, reqs, 16));
     });
     println!("{{{}}}", results.join(","));
 }

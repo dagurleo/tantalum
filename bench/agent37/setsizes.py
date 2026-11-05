@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""A big set at several sizes, settled: a hash table's cost rises and falls as it
-doubles, so one size could flatter anyone. A fresh server for each, on Linux (it
-reads /proc). setsizes.py NAME PORT PID. Results: results-sets.txt."""
+"""A big set or hash at several sizes, settled: a hash table's cost rises and falls
+as it doubles, so one size could flatter anyone. Also the longest a batch took, which
+is the longest it stopped to grow. A fresh server for each, on Linux (it reads /proc).
+setsizes.py NAME PORT PID [hash]. Results: results-sets.txt, results-hashes.txt."""
 import socket, sys, time
 
 NAME, PORT, PID = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+HASH = sys.argv[4:] == ["hash"]
 BATCH = 500
 SIZES = [500_000, 1_000_000, 2_000_000, 3_000_000, 4_000_000, 6_000_000, 8_000_000]
 
@@ -37,11 +39,17 @@ def rss():
 base = rss()
 at = 0
 row = []
+worst = 0.0
 for size in SIZES:
     while at < size:
-        s.sendall(b"".join(cmd(b"SADD", b"s", b"m%031d" % i) for i in range(at, at + BATCH)))
+        started = time.monotonic()
+        if HASH:
+            s.sendall(b"".join(cmd(b"HSET", b"h", b"f%015d" % i, b"v" * 32) for i in range(at, at + BATCH)))
+        else:
+            s.sendall(b"".join(cmd(b"SADD", b"s", b"m%031d" % i) for i in range(at, at + BATCH)))
         replies(BATCH)
+        worst = max(worst, time.monotonic() - started)
         at += BATCH
     time.sleep(3)
     row.append(f"{size // 1_000_000 if size >= 1_000_000 else size / 1e6:g}M {(rss() - base) / size:5.1f}")
-print(f"{NAME:<10} " + "  ".join(row), flush=True)
+print(f"{NAME:<10} " + "  ".join(row) + f"   longest batch {worst * 1000:.0f} ms", flush=True)
