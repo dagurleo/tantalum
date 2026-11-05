@@ -15,11 +15,31 @@ use tantalum::cmd::{self, Args, Reply};
 use tantalum::context::{Context, Session, Settings};
 use tantalum::store::{Config, EvictionPolicy, Store};
 
-fn temp_dir(name: &str) -> PathBuf {
+/// A directory for one test, removed when the test ends. A test that fails
+/// leaves it, to look at.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+fn temp_dir(name: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("tantalum-aof-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    TempDir(dir)
 }
 
 fn options(dir: &Path) -> Options {
@@ -379,7 +399,7 @@ fn rewrites_keep_everything() {
         Config::default(),
     );
     // Only the last base and log are left.
-    let mut names: Vec<_> = std::fs::read_dir(&dir)
+    let mut names: Vec<_> = std::fs::read_dir(&*dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();

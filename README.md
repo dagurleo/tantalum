@@ -45,8 +45,11 @@ key as `TLS_CERT` and `TLS_KEY` variables, a TCP proxy to port 6380, a
 drain time of 15 s (so the final snapshot has time), and the start command
 
 ```sh
-/bin/sh -c "printenv TLS_CERT > /tmp/cert.pem && printenv TLS_KEY > /tmp/key.pem && chmod 600 /tmp/key.pem && exec tantalum --bind :: --port 6379 --tls-port 6380 --tls-cert-file /tmp/cert.pem --tls-key-file /tmp/key.pem --maxmemory 256mb --maxmemory-policy noeviction --snapshot /data/tantalum.snapshot"
+/bin/sh -c "printenv TLS_CERT > /tmp/cert.pem && printenv TLS_KEY > /tmp/key.pem && chmod 600 /tmp/key.pem && exec tantalum --bind :: --port 6379 --tls-port 6380 --tls-cert-file /tmp/cert.pem --tls-key-file /tmp/key.pem --maxmemory 256mb --maxmemory-policy noeviction --snapshot /data/tantalum.snapshot --aof /data/aof"
 ```
+
+Railway's redeploy reuses the old deployment's start command; to change it,
+deploy the commit again.
 
 Services on the private network use `redis://default:<password>@<service>.railway.internal:6379`
 (with ioredis, add `?family=0` for IPv6); outside clients use
@@ -488,7 +491,9 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   again, and until a write works, commands that write (and `PING`) get
   Redis' `-MISCONF Errors writing to the AOF file: ...`. With `--snapshot`
   too, snapshots are still saved, but a log, once there, is what loads; the
-  first start with `--aof` writes what the snapshot loaded as the base.
+  first start with `--aof` writes what the snapshot loaded as the base. To
+  stop using the log, delete DIR too: if `--aof` comes back with an old log
+  still there, that log loads and anything written since is gone.
 - **Lock hygiene**: hashing and big-value allocations happen before locking.
   Values ≤ 16 KB are copied out under the lock; larger ones are shared by
   refcount and written with `writev` after unlocking. Freed big values are
