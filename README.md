@@ -176,6 +176,12 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   at pipeline 4 and 16, and the 1:10 mix at 16), and about nothing at two, with
   SET's p99 at pipeline 16 from 2.76 to 4.14 ms. Longer batches send at once:
   held, 32 commands gained 2–4% with a p99 worse than Redis'.
+  On a busy thread (the last send had 8 replies or more), connections read
+  and start loading their first keys' buckets, then run once all that are
+  ready have read. The lookups saved about pay for the second poll, so
+  throughput stays where it was, but p99 fell 6–23% (Agent37, one thread; SET at
+  pipeline 16 about even). Loading the entries too moved the wait rather than
+  saved it, and came out up to 3% slower.
 - **io_uring** (`--io uring`, the default where the kernel and container
   allow it): per-thread loops on [monoio](https://github.com/bytedance/monoio).
   On a 32-core EPYC it beat the epoll loop at every thread count (+17–25%

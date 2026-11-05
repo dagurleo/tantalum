@@ -1530,7 +1530,11 @@ fn held_replies_go_to_their_own_connections() {
                     let message = format!("{client}:{round}:{}", "y".repeat(client));
                     let one = request(&["ECHO", &message]);
                     let batch = 1 + (client + round) % 4;
-                    stream.write_all(&one.repeat(batch)).unwrap();
+                    let requests = one.repeat(batch);
+                    // And some split across writes.
+                    let (start, rest) = requests.split_at(requests.len() / (1 + round % 3));
+                    stream.write_all(start).unwrap();
+                    stream.write_all(rest).unwrap();
                     let expected = format!("${}\r\n{message}\r\n", message.len()).repeat(batch);
                     let mut reply = vec![0; expected.len()];
                     stream.read_exact(&mut reply).unwrap();
