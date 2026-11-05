@@ -121,3 +121,229 @@ memory, bytes per entry (first round, on fresh servers):
   redis: used_memory entries 42.7, pending on top 238.1; RSS entries 44.1, pending on top 242.4
   valkey: used_memory entries 42.9, pending on top 124.1; RSS entries 44.4, pending on top 126.3
   tantalum: used_memory entries 37.5, pending on top 112.0; RSS entries 53.9, pending on top 147.2
+
+# 2026-11-05, 0.22.1 (old = 0.22.0, new = 0.22.1). The same memtier run, Redis SET
+# on this VM 265-281k/s before and after (its usual speed: an earlier run, at
+# 76k/s and 31-45% stolen CPU, was thrown out). In these two rounds new always ran
+# straight after old.
+round 1 valkey read1 P1 Totals         147810.04    147810.04         0.00         1.62301         1.58300         3.16700     25677.50 
+round 1 old read1 P1 Totals         235396.60    235396.60         0.00         1.01898         0.99900         1.40700     40893.00 
+round 1 new read1 P1 Totals         252581.48    252581.48         0.00         0.94962         0.95100         1.46300     43878.36 
+round 1 redis read1 P1 Totals         141209.87    141209.87         0.00         1.69897         1.63100         3.26300     24530.92 
+round 1 valkey read1 P16 Totals         303988.73    303988.73         0.00        12.61762        14.27100        18.68700     53138.63 
+round 1 old read1 P16 Totals         676655.17    676655.17         0.00         5.66165         5.56700         7.80700    118282.44 
+round 1 new read1 P16 Totals         760573.34    760573.34         0.00         5.03387         5.02300         5.85500    132951.73 
+round 1 redis read1 P16 Totals         289930.04    289930.04         0.00        13.23050        15.10300        17.15100     50681.11 
+round 1 valkey pending P1 Totals       188015.10         0.00         0.00         1.27599         1.24700         2.49500     17993.63 
+round 1 old pending P1 Totals       318295.91         0.00         0.00         0.75356         0.67900         1.09500     30461.91 
+round 1 new pending P1 Totals       311238.91         0.00         0.00         0.77065         0.68700         1.16700     29786.54 
+round 1 redis pending P1 Totals       202693.91         0.00         0.00         1.18351         1.12700         2.23900     19398.44 
+round 1 valkey pending P16 Totals       798095.73         0.00         0.00         4.80138         5.21500         6.59100     76380.26 
+round 1 old pending P16 Totals      2412750.72         0.00         0.00         1.58110         1.59900         2.19100    230907.78 
+round 1 new pending P16 Totals      2421029.72         0.00         0.00         1.57558         1.58300         2.27100    231700.11 
+round 1 redis pending P16 Totals       890310.71         0.00         0.00         4.30318         4.63900         5.66300     85205.52 
+round 1 valkey pending10 P1 Totals       154560.34         0.00         0.00         1.54961         1.37500         2.71900     57356.38 
+round 1 old pending10 P1 Totals       267521.99         0.00         0.00         0.89388         0.94300         1.33500     99275.74 
+round 1 new pending10 P1 Totals       245801.49         0.00         0.00         0.97307         0.96700         1.54300     91215.40 
+round 1 redis pending10 P1 Totals       163268.81         0.00         0.00         1.46681         1.31100         2.76700     60588.04 
+round 1 valkey pending10 P16 Totals       309377.98         0.00         0.00        12.35880        12.47900        15.93500    117829.50 
+round 1 old pending10 P16 Totals       719076.02         0.00         0.00         5.28307         5.11900         9.15100    273866.84 
+round 1 new pending10 P16 Totals       721699.30         0.00         0.00         5.26432         5.11900         9.40700    274865.94 
+round 1 redis pending10 P16 Totals       383591.20         0.00         0.00         9.95743         9.98300        13.43900    146094.31 
+round 1 valkey groups P1 Totals     250457.83         0.00         0.00         0.95725         0.91100         1.85500     46227.08 
+round 1 old groups P1 Totals     295018.83         0.00         0.00         0.81256         0.80700         1.28700     54451.72 
+round 1 new groups P1 Totals     309011.02         0.00         0.00         0.77575         0.69500         1.11100     57034.26 
+round 1 redis groups P1 Totals     264403.10         0.00         0.00         0.90674         0.87100         1.75900     48800.96 
+round 1 valkey groups P16 Totals    1071024.43         0.00         0.00         3.56778         3.55100         4.99100    197679.31 
+round 1 old groups P16 Totals    1879976.87         0.00         0.00         2.02437         1.99900         3.10300    346987.92 
+round 1 new groups P16 Totals    1839422.48         0.00         0.00         2.06901         2.01500         3.50300    339502.78 
+round 1 redis groups P16 Totals    1208197.24         0.00         0.00         3.16074         3.13500         4.57500    222997.34 
+round 1 valkey ack P1 Totals     283551.87         0.00         0.00         0.84654         0.83100         1.66300     12061.26 
+round 1 old ack P1 Totals     343064.75         0.00         0.00         0.69972         0.66300         1.11100     14592.71 
+round 1 new ack P1 Totals     346856.70         0.00         0.00         0.69210         0.67100         1.03900     14754.01 
+round 1 redis ack P1 Totals     278347.75         0.00         0.00         0.86231         0.83900         1.69500     11839.89 
+round 1 valkey ack P16 Totals    1474197.56         0.00         0.00         2.60164         2.70300         3.59900     67663.36 
+round 1 old ack P16 Totals    2601762.24         0.00         0.00         1.47356         1.36700         2.86300    119416.82 
+round 1 new ack P16 Totals    2473327.19         0.00         0.00         1.55009         1.57500         2.17500    113521.85 
+round 1 redis ack P16 Totals    1650977.62         0.00         0.00         2.32333         2.44700         3.23100     75777.29 
+round 1 valkey read10 P1 Totals          63513.04     63513.04         0.00         3.77495         3.31100         6.49500     49398.90 
+round 1 old read10 P1 Totals         156022.34    156022.34         0.00         1.53469         1.52700         2.11100    121350.37 
+round 1 new read10 P1 Totals         199310.71    199310.71         0.00         1.20075         1.22300         1.75100    155019.01 
+round 1 redis read10 P1 Totals          82643.23     82643.23         0.00         2.90046         2.52700         4.95900     64277.89 
+round 1 valkey read10 P16 Totals          80058.33     80058.33         0.00        47.68695        49.40700        53.75900     62701.93 
+round 1 old read10 P16 Totals         249378.42    249378.42         0.00        15.19679        15.03900        19.96700    195313.96 
+round 1 new read10 P16 Totals         305069.96    305069.96         0.00        12.42438        12.09500        21.37500    238931.74 
+round 1 redis read10 P16 Totals          91166.23     91166.23         0.00        41.87386        42.23900        64.25500     71401.68 
+round 1 valkey add P1 Totals     244250.48    244250.48         0.00         0.98260         0.94300         1.90300     23269.63 
+round 1 old add P1 Totals     309845.00    309845.00         0.00         0.77464         0.71100         1.15900     29545.73 
+round 1 new add P1 Totals     301088.45    301088.45         0.00         0.79715         0.71100         1.41500     28708.01 
+round 1 redis add P1 Totals     243500.44    243500.44         0.00         0.98563         0.95100         1.92700     23197.10 
+round 1 valkey add P16 Totals     964739.74    964739.74         0.00         3.97723         4.31900         6.33500     92291.97 
+round 1 old add P16 Totals    2100107.89   2100107.89         0.00         1.82458         1.66300         4.28700    201995.99 
+round 1 new add P16 Totals    2251270.19   2251270.19         0.00         1.70243         1.53500         3.21500    216590.86 
+round 1 redis add P16 Totals     978635.30    978635.30         0.00         3.92051         4.15900         7.10300     93636.59 
+round 2 old read1 P1 Totals         240346.38    240346.38         0.00         0.99797         0.99900         1.35100     41752.88 
+round 2 new read1 P1 Totals         250776.34    250776.34         0.00         0.95648         0.95900         1.43900     43564.77 
+round 2 redis read1 P1 Totals         143826.15    143826.15         0.00         1.66805         1.63900         3.27900     24985.42 
+round 2 valkey read1 P1 Totals         146286.67    146286.67         0.00         1.63993         1.60700         3.21500     25412.86 
+round 2 old read1 P16 Totals         685648.93    685648.93         0.00         5.58743         5.59900         6.49500    119854.59 
+round 2 new read1 P16 Totals         761943.66    761943.66         0.00         5.02673         5.02300         5.91900    133191.26 
+round 2 redis read1 P16 Totals         288240.86    288240.86         0.00        13.30760        15.10300        17.40700     50385.83 
+round 2 valkey read1 P16 Totals         306519.89    306519.89         0.00        12.51332        14.14300        17.27900     53581.09 
+round 2 old pending P1 Totals       316706.18         0.00         0.00         0.75733         0.67900         1.14300     30309.77 
+round 2 new pending P1 Totals       316957.38         0.00         0.00         0.75673         0.67900         1.14300     30333.81 
+round 2 redis pending P1 Totals       202756.39         0.00         0.00         1.18319         1.08700         2.14300     19404.42 
+round 2 valkey pending P1 Totals       203785.75         0.00         0.00         1.17718         1.10300         2.19100     19502.93 
+round 2 old pending P16 Totals      2449867.90         0.00         0.00         1.55688         1.56700         2.35100    234460.01 
+round 2 new pending P16 Totals      2417257.41         0.00         0.00         1.57804         1.55900         2.99100    231339.09 
+round 2 redis pending P16 Totals       869294.47         0.00         0.00         4.40742         4.73500         5.95100     83194.20 
+round 2 valkey pending P16 Totals       803361.66         0.00         0.00         4.76891         5.11900         6.43100     76884.22 
+round 2 old pending10 P1 Totals       269061.58         0.00         0.00         0.88878         0.95100         1.22300     99847.07 
+round 2 new pending10 P1 Totals       256104.41         0.00         0.00         0.93383         0.93500         1.39100     95038.75 
+round 2 redis pending10 P1 Totals       164326.94         0.00         0.00         1.45730         1.27900         2.62300     60980.70 
+round 2 valkey pending10 P1 Totals       152935.64         0.00         0.00         1.56611         1.39100         2.71900     56753.46 
+round 2 old pending10 P16 Totals       723181.30         0.00         0.00         5.25308         5.11900         7.87100    275430.38 
+round 2 new pending10 P16 Totals       745720.35         0.00         0.00         5.09436         5.02300         7.71100    284014.59 
+round 2 redis pending10 P16 Totals       375789.36         0.00         0.00        10.16539        10.11100        18.68700    143122.90 
+round 2 valkey pending10 P16 Totals       318065.49         0.00         0.00        12.02119        12.09500        15.29500    121138.22 
+round 2 old groups P1 Totals     313050.11         0.00         0.00         0.76571         0.67900         1.10300     57779.76 
+round 2 new groups P1 Totals     312592.43         0.00         0.00         0.76683         0.68700         1.07900     57695.28 
+round 2 redis groups P1 Totals     263292.97         0.00         0.00         0.91056         0.87100         1.76700     48596.07 
+round 2 valkey groups P1 Totals     257869.03         0.00         0.00         0.92974         0.90300         1.82300     47594.97 
+round 2 old groups P16 Totals    1821736.71         0.00         0.00         2.08902         2.03100         3.64700    336238.51 
+round 2 new groups P16 Totals    1828426.22         0.00         0.00         2.08140         2.03100         3.39100    337473.20 
+round 2 redis groups P16 Totals    1177784.37         0.00         0.00         3.24248         3.19900         5.11900    217384.03 
+round 2 valkey groups P16 Totals    1072730.37         0.00         0.00         3.56168         3.55100         4.99100    197994.18 
+round 2 old ack P1 Totals     354160.95         0.00         0.00         0.67775         0.64700         1.07100     15064.71 
+round 2 new ack P1 Totals     349768.77         0.00         0.00         0.68630         0.66300         1.05500     14877.88 
+round 2 redis ack P1 Totals     284180.93         0.00         0.00         0.84459         0.83100         1.67100     12088.01 
+round 2 valkey ack P1 Totals     284976.20         0.00         0.00         0.84229         0.82300         1.66300     12121.84 
+round 2 old ack P16 Totals    2838690.63         0.00         0.00         1.35049         1.30300         2.04700    130291.46 
+round 2 new ack P16 Totals    2578293.00         0.00         0.00         1.48677         1.43900         2.99100    118339.62 
+round 2 redis ack P16 Totals    1659823.77         0.00         0.00         2.31075         2.41500         3.24700     76183.32 
+round 2 valkey ack P16 Totals    1469590.39         0.00         0.00         2.61031         2.79900         3.48700     67451.90 
+round 2 old read10 P1 Totals         166059.06    166059.06         0.00         1.44185         1.41500         1.85500    129156.69 
+round 2 new read10 P1 Totals         201685.15    201685.15         0.00         1.18656         1.21500         1.72700    156865.80 
+round 2 redis read10 P1 Totals          82217.50     82217.50         0.00         2.91532         2.52700         4.95900     63946.77 
+round 2 valkey read10 P1 Totals          63767.43     63767.43         0.00         3.75998         3.24700         6.39900     49596.75 
+round 2 old read10 P16 Totals         255257.89    255257.89         0.00        14.86558        14.97500        15.29500    199918.77 
+round 2 new read10 P16 Totals         379505.20    379505.20         0.00         9.97145        10.04700        10.87900    297229.66 
+round 2 redis read10 P16 Totals         114999.68    114999.68         0.00        33.17167        34.04700        39.67900     90068.11 
+round 2 valkey read10 P16 Totals          80515.86     80515.86         0.00        47.41790        48.89500        53.50300     63060.27 
+round 2 old add P1 Totals     311201.11    311201.11         0.00         0.77123         0.70300         1.13500     29675.52 
+round 2 new add P1 Totals     307671.33    307671.33         0.00         0.78010         0.70300         1.16700     29337.70 
+round 2 redis add P1 Totals     246674.40    246674.40         0.00         0.97291         0.94300         1.88700     23500.08 
+round 2 valkey add P1 Totals     249290.30    249290.30         0.00         0.96273         0.93500         1.87900     23750.65 
+round 2 old add P16 Totals    2261271.87   2261271.87         0.00         1.69497         1.53500         3.53500    217541.73 
+round 2 new add P16 Totals    2350037.34   2350037.34         0.00         1.63087         1.49500         2.39900    226117.28 
+round 2 redis add P16 Totals    1017345.45   1017345.45         0.00         3.77112         4.03100         5.59900     97350.48 
+round 2 valkey add P16 Totals     996421.85    996421.85         0.00         3.85057         4.19100         5.11900     95332.73 
+
+# Real memory: each server fresh and alone, memslope.py, the growth of RSS per entry
+# between the first and last checkpoint. Redis and Valkey, same method: entries of a
+# 32-byte value 44.0 and 44.2, of an 8-byte value 21.6 and 21.7, pending 242.3 and
+# 126.2. 0.22.0: 53.8, 21.4 and 147.3.
+== one consumer, 32-byte values
+0.22.1: entries, slope per entry: used_memory 37.1 B, RSS 38.3 B; fixed RSS 1.1 MB; RSS at each million, 
+0.22.1: pending, slope per entry: used_memory 57.0 B, RSS 61.2 B; RSS at each million, MB: 202 264 325 38
+== ten consumers, 32-byte values
+0.22.1: entries, slope per entry: used_memory 36.8 B, RSS 38.2 B; fixed RSS 1.3 MB; RSS at each million, 
+0.22.1: pending, slope per entry: used_memory 57.0 B, RSS 61.3 B; RSS at each million, MB: 125 187 248 30
+== one consumer, 8-byte values
+0.22.1: entries, slope per entry: used_memory 12.8 B, RSS 13.8 B; fixed RSS 0.1 MB; RSS at each million, 
+0.22.1: pending, slope per entry: used_memory 57.0 B, RSS 61.2 B; RSS at each million, MB: 51 112 174 235
+
+# Each type, 3M items of a 32-byte value, memtypes.py (no big hash for Tantalum).
+string      tantalum  used_memory/item   56.6  RSS/item   56.8   slope: used   57.1  RSS   57.2
+string      redis     used_memory/item   93.6  RSS/item   96.6   slope: used   97.7  RSS   98.2
+string      valkey    used_memory/item   77.4  RSS/item   79.6   slope: used   75.8  RSS   78.0
+list        tantalum  used_memory/item   38.4  RSS/item   34.5   slope: used   38.4  RSS   34.2
+list        redis     used_memory/item   34.3  RSS/item   34.9   slope: used   34.3  RSS   34.9
+list        valkey    used_memory/item   34.3  RSS/item   35.0   slope: used   34.3  RSS   34.9
+set         tantalum  used_memory/item   58.7  RSS/item   73.6   slope: used   63.4  RSS   82.7
+set         redis     used_memory/item   61.9  RSS/item   63.9   slope: used   65.8  RSS   66.3
+set         valkey    used_memory/item   53.7  RSS/item   54.2   slope: used   47.0  RSS   49.2
+zset        tantalum  used_memory/item   75.2  RSS/item   67.4   slope: used   81.4  RSS   67.8
+zset        redis     used_memory/item  107.3  RSS/item  108.4   slope: used  111.2  RSS  109.0
+zset        valkey    used_memory/item   99.1  RSS/item  100.0   slope: used   97.1  RSS   96.6
+hash        redis     used_memory/item   77.9  RSS/item   78.5   slope: used   81.8  RSS   79.2
+hash        valkey    used_memory/item   69.7  RSS/item   70.2   slope: used   63.0  RSS   65.2
+small-hash  tantalum  used_memory/item   51.6  RSS/item   53.6   slope: used   50.6  RSS   51.1
+small-hash  redis     used_memory/item   49.8  RSS/item   51.1   slope: used   49.9  RSS   51.6
+small-hash  valkey    used_memory/item   49.5  RSS/item   50.2   slope: used   49.6  RSS   50.3
+small-list  tantalum  used_memory/item   49.2  RSS/item   51.2   slope: used   48.0  RSS   49.0
+small-list  redis     used_memory/item   43.4  RSS/item   45.2   slope: used   43.5  RSS   45.9
+small-list  valkey    used_memory/item   43.1  RSS/item   43.9   slope: used   43.2  RSS   44.1
+small-set   tantalum  used_memory/item   47.8  RSS/item   49.6   slope: used   46.8  RSS   48.0
+small-set   redis     used_memory/item   43.4  RSS/item   45.2   slope: used   43.5  RSS   45.9
+small-set   valkey    used_memory/item   43.1  RSS/item   43.9   slope: used   43.2  RSS   44.1
+small-zset  tantalum  used_memory/item   52.8  RSS/item   54.7   slope: used   52.1  RSS   52.5
+small-zset  redis     used_memory/item   49.8  RSS/item   51.0   slope: used   49.9  RSS   51.6
+small-zset  valkey    used_memory/item   49.5  RSS/item   50.1   slope: used   49.6  RSS   50.3
+
+# What a command does on x86-64, perf stat: user instructions and cycles per command,
+# which stolen CPU can't change. One client, redis-cli --pipe.
+add        0.22.0 user insn    3507 cycles    1241 | kernel insn    155 cycles    182
+read1      0.22.0 user insn   17174 cycles    5375 | kernel insn    272 cycles    334
+pending    0.22.0 user insn    3075 cycles     912 | kernel insn     49 cycles     63
+claim      0.22.0 user insn   15656 cycles    4301 | kernel insn    101 cycles    139
+autoclaim  0.22.0 user insn   28673 cycles    8950 | kernel insn    151 cycles    229
+ack        0.22.0 user insn    3738 cycles    1219 | kernel insn     53 cycles     65
+scatter    0.22.0 user insn    4077 cycles    1580 | kernel insn     56 cycles     79
+read10     0.22.0 user insn   41725 cycles   13660 | kernel insn    497 cycles    761
+add        0.22.1 user insn    3510 cycles    1115 | kernel insn    151 cycles    157
+read1      0.22.1 user insn   15904 cycles    4841 | kernel insn    186 cycles    255
+pending    0.22.1 user insn    3106 cycles     923 | kernel insn     50 cycles     68
+claim      0.22.1 user insn   14912 cycles    3972 | kernel insn    101 cycles    133
+autoclaim  0.22.1 user insn   26587 cycles    9009 | kernel insn    153 cycles    230
+ack        0.22.1 user insn    3329 cycles    1040 | kernel insn     53 cycles     65
+scatter    0.22.1 user insn    4145 cycles    1502 | kernel insn     58 cycles     78
+read10     0.22.1 user insn   29376 cycles    9325 | kernel insn    911 cycles   1055
+add        0.22.0 user insn    3507 cycles    1216 | kernel insn    155 cycles    178
+read1      0.22.0 user insn   17174 cycles    5393 | kernel insn    275 cycles    340
+pending    0.22.0 user insn    3075 cycles     914 | kernel insn     49 cycles     66
+claim      0.22.0 user insn   15656 cycles    4300 | kernel insn    101 cycles    140
+autoclaim  0.22.0 user insn   28673 cycles    9829 | kernel insn    154 cycles    263
+ack        0.22.0 user insn    3738 cycles    1206 | kernel insn     53 cycles     65
+scatter    0.22.0 user insn    4077 cycles    1803 | kernel insn     56 cycles     92
+read10     0.22.0 user insn   41725 cycles   14548 | kernel insn    703 cycles    945
+add        0.22.1 user insn    3493 cycles    1114 | kernel insn    141 cycles    156
+read1      0.22.1 user insn   15904 cycles    4940 | kernel insn    184 cycles    254
+pending    0.22.1 user insn    3089 cycles     907 | kernel insn     49 cycles     61
+claim      0.22.1 user insn   14895 cycles    3957 | kernel insn    100 cycles    128
+autoclaim  0.22.1 user insn   26570 cycles    8951 | kernel insn    153 cycles    235
+ack        0.22.1 user insn    3312 cycles    1028 | kernel insn     53 cycles     63
+scatter    0.22.1 user insn    4128 cycles    1495 | kernel insn     58 cycles     76
+read10     0.22.1 user insn   29348 cycles   11486 | kernel insn    893 cycles   1176
+# ack3: blocks of 80 IDs, each three times over, as memtier's 3 threads go. miss: all gone.
+ack3     0.22.0  user insn   3175 cycles    964 | kernel insn    63 cycles    63
+miss     0.22.0  user insn   2922 cycles    843 | kernel insn    51 cycles    48
+ack3     0.22.1    user insn   2981 cycles    918 | kernel insn    58 cycles    60
+miss     0.22.1    user insn   2807 cycles    842 | kernel insn    51 cycles    49
+ack3     0.22.0  user insn   3158 cycles    967 | kernel insn    63 cycles    66
+miss     0.22.0  user insn   2905 cycles    846 | kernel insn    51 cycles    49
+ack3     0.22.1    user insn   2981 cycles    921 | kernel insn    55 cycles    58
+miss     0.22.1    user insn   2807 cycles    845 | kernel insn    50 cycles    49
+ack3     0.22.0  user insn   3175 cycles    976 | kernel insn    64 cycles    66
+miss     0.22.0  user insn   2922 cycles    851 | kernel insn    51 cycles    49
+ack3     0.22.1    user insn   2981 cycles    914 | kernel insn    59 cycles    60
+miss     0.22.1    user insn   2807 cycles    840 | kernel insn    51 cycles    49
+# ackmid and ackmid3: the same far from the front of the list. pending10: 10 rows.
+pending10  0.22.0  user insn  12032 cycles   3244 | kernel insn   161 cycles   229
+ackmid3    0.22.0  user insn   3501 cycles   1047 | kernel insn    58 cycles    67
+ackmid     0.22.0  user insn   3887 cycles   1234 | kernel insn   136 cycles    93
+pending10  0.22.1    user insn  11216 cycles   3290 | kernel insn   163 cycles   239
+ackmid3    0.22.1    user insn   3421 cycles   1062 | kernel insn    56 cycles    64
+ackmid     0.22.1    user insn   3816 cycles   1188 | kernel insn    62 cycles    71
+pending10  0.22.0  user insn  12049 cycles   3979 | kernel insn   167 cycles   294
+ackmid3    0.22.0  user insn   3518 cycles   1079 | kernel insn    55 cycles    66
+ackmid     0.22.0  user insn   3904 cycles   1245 | kernel insn    63 cycles    75
+pending10  0.22.1    user insn  11234 cycles   3300 | kernel insn   164 cycles   245
+ackmid3    0.22.1    user insn   3438 cycles   1064 | kernel insn    55 cycles    64
+ackmid     0.22.1    user insn   3833 cycles   1188 | kernel insn    62 cycles    69
+pending10  0.22.0  user insn  12049 cycles   3260 | kernel insn   161 cycles   231
+ackmid3    0.22.0  user insn   3518 cycles   1048 | kernel insn    54 cycles    62
+ackmid     0.22.0  user insn   3904 cycles   1244 | kernel insn    55 cycles    65
+pending10  0.22.1    user insn  11217 cycles   3296 | kernel insn   161 cycles   247
+ackmid3    0.22.1    user insn   3422 cycles   1056 | kernel insn    61 cycles    65
+ackmid     0.22.1    user insn   3816 cycles   1184 | kernel insn    62 cycles    69

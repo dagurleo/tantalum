@@ -9,6 +9,7 @@ pub mod context;
 mod entry;
 mod glob;
 mod hash;
+mod id_map;
 mod list;
 mod pages;
 pub mod pubsub;
