@@ -81,6 +81,9 @@ const MANIFEST: &str = "tantalum.aof.manifest";
 const MANIFEST_HEADER: &str = "TANTALUM AOF MANIFEST 1";
 /// The time the commands after it ran at, in Unix milliseconds.
 const TIME: &[u8] = b"TANTALUM.TIME";
+/// The biggest log buffer kept for the next write, so a burst doesn't hold
+/// memory for good.
+const MAX_SPARE: usize = 16 * 1024 * 1024;
 const WRITE_EVERY: Duration = Duration::from_millis(10);
 const SYNC_EVERY: Duration = Duration::from_secs(1);
 
@@ -96,6 +99,9 @@ fn incr_name(n: u64) -> String {
 #[derive(Default)]
 struct Pending {
     buf: Vec<u8>,
+    /// The buffer the last write finished with, to fill next: one grown from
+    /// nothing every `WRITE_EVERY` was copied again and again as it grew.
+    spare: Vec<u8>,
     /// The last time written to the current log (0: none yet).
     time: Millis,
 }
@@ -421,13 +427,20 @@ impl Aof {
             // Taken before the turn goes, so a rewrite can't switch logs
             // between the two.
             let files = self.files.lock();
-            (std::mem::take(&mut pending.buf), files)
+            let spare = std::mem::take(&mut pending.spare);
+            (std::mem::replace(&mut pending.buf, spare), files)
         };
         files.write(data)?;
         let due = self.options.fsync == Fsync::EverySec && files.synced.elapsed() >= SYNC_EVERY;
         if sync || due {
             files.current.sync_data()?;
             files.synced = Instant::now();
+        }
+        let spare = std::mem::take(&mut files.unwritten);
+        // (Not holding the files: a write's turn comes first, as above.)
+        drop(files);
+        if spare.capacity() <= MAX_SPARE {
+            self.pending.lock().spare = spare;
         }
         Ok(())
     }
