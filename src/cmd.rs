@@ -7,7 +7,9 @@ mod list;
 mod multi;
 mod pubsub;
 mod set;
+mod sort;
 mod stream;
+mod string;
 mod zset;
 
 use std::ops::Range;
@@ -147,6 +149,15 @@ static COMMANDS: &[Command] = &[
     Command { name: "setex", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: setex },
     Command { name: "psetex", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: psetex },
     Command { name: "setnx", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: setnx },
+    Command { name: "strlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: string::strlen },
+    Command { name: "append", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: string::append },
+    Command { name: "getrange", arity: 4, flags: &["readonly"], keys: ONE_KEY, run: string::getrange },
+    Command { name: "substr", arity: 4, flags: &["readonly"], keys: ONE_KEY, run: string::getrange },
+    Command { name: "setrange", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: string::setrange },
+    Command { name: "getset", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: string::getset },
+    Command { name: "incrbyfloat", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: string::incrbyfloat },
+    Command { name: "msetnx", arity: -3, flags: &["write", "denyoom"], keys: (1, -1, 2), run: string::msetnx },
+    Command { name: "lcs", arity: -3, flags: &["readonly"], keys: (1, 1, 1), run: string::lcs },
     Command { name: "getdel", arity: 2, flags: &["write", "fast"], keys: ONE_KEY, run: getdel },
     Command { name: "getex", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: getex },
     Command { name: "expireat", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: expireat },
@@ -197,12 +208,20 @@ static COMMANDS: &[Command] = &[
     Command { name: "keys", arity: 2, flags: &["readonly"], keys: NO_KEYS, run: keys::keys },
     Command { name: "rename", arity: 3, flags: &["write"], keys: (1, 2, 1), run: keys::rename },
     Command { name: "renamenx", arity: 3, flags: &["write", "fast"], keys: (1, 2, 1), run: keys::renamenx },
+    Command { name: "touch", arity: -2, flags: &["readonly", "fast"], keys: ALL_KEYS, run: keys::touch },
+    Command { name: "randomkey", arity: 1, flags: &["readonly"], keys: NO_KEYS, run: keys::randomkey },
+    Command { name: "sort", arity: -2, flags: &["write", "denyoom"], keys: ONE_KEY, run: sort::sort },
+    Command { name: "sort_ro", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: sort::sort_ro },
+    Command { name: "copy", arity: -3, flags: &["write", "denyoom"], keys: (1, 2, 1), run: keys::copy },
+    Command { name: "object", arity: -2, flags: &[], keys: NO_KEYS, run: keys::object },
     Command { name: "hget", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hget },
     Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hset },
     Command { name: "hgetall", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hgetall },
     Command { name: "hdel", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: hash::hdel },
     Command { name: "hmget", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hmget },
     Command { name: "hincrby", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hincrby },
+    Command { name: "hincrbyfloat", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hincrbyfloat },
+    Command { name: "hrandfield", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: hash::hrandfield },
     Command { name: "hexists", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hexists },
     Command { name: "hlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hlen },
     Command { name: "hmset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hmset },
@@ -454,7 +473,7 @@ fn logged(
 ) -> Reply {
     // Scripts and transactions log their commands' writes, and MSET its
     // pairs, as a group.
-    let grouped = !command.writes() || command.name == "mset";
+    let grouped = !command.writes() || matches!(command.name, "mset" | "msetnx");
     let mut turn = aof.turn(grouped);
     let now = turn.now;
     let start = out.len();

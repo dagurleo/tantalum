@@ -58,6 +58,8 @@ fn main() {
     build
         .file("vendor/lua/redis_random.c")
         .file("vendor/fpconv/fpconv_dtoa.c")
+        .file("src/long_double.c")
         .compile("redis_lua");
     println!("cargo:rerun-if-changed=vendor");
+    println!("cargo:rerun-if-changed=src/long_double.c");
 }

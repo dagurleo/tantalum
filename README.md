@@ -73,9 +73,17 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` `key time [NX\|XX\|GT\|LT]` | A time already passed deletes the key |
 | `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `PERSIST` | |
 | `INCR`, `DECR`, `INCRBY`, `DECRBY` | 64-bit, keep the key's TTL |
+| `INCRBYFLOAT key n` | In C's `long double`, as Redis, and logged as what it came to |
+| `STRLEN`, `APPEND key value`, `GETRANGE key start end`, `SUBSTR`, `SETRANGE key offset value`, `GETSET key value` | A big string is one allocation: `APPEND` and `SETRANGE` copy it |
+| `MSETNX key value [key value ...]` | Atomic: all or none, with nothing else running meanwhile |
+| `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN]` | |
+| `COPY source destination [DB 0] [REPLACE]`, `TOUCH key [key ...]`, `RANDOMKEY` | `COPY` is atomic, TTL included; there is one database. `RANDOMKEY` is about uniform |
+| `OBJECT ENCODING\|FREQ\|IDLETIME\|REFCOUNT key`, `OBJECT HELP` | `ENCODING` is what Redis would use for what's held now, built from nothing (see "Not there yet"). `IDLETIME` is always 0: no last-access time is kept per key. `FREQ` is Redis' error without an LFU policy, as there's none |
+| `SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC\|DESC] [ALPHA] [STORE destination]`, `SORT_RO` | Atomic. Lists, sets and sorted sets, `*->field` for hashes |
 | `HSET key field value [field value ...]`, `HSETNX`, `HMSET` | Hashes keep their fields in the order they were added (as Redis does for small hashes) and keep the key's TTL |
 | `HGET key field`, `HMGET key field [field ...]`, `HGETALL`, `HKEYS`, `HVALS` | `HGETALL` is a map in RESP3 |
-| `HDEL key field [field ...]`, `HEXISTS`, `HLEN`, `HSTRLEN`, `HINCRBY key field n` | `HDEL` of the last field deletes the key |
+| `HDEL key field [field ...]`, `HEXISTS`, `HLEN`, `HSTRLEN`, `HINCRBY key field n`, `HINCRBYFLOAT key field n` | `HDEL` of the last field deletes the key |
+| `HRANDFIELD key [count [WITHVALUES]]` | A negative count may repeat fields |
 | `HSCAN key cursor [MATCH pattern] [COUNT n] [NOVALUES]` | Every match at once, with cursor 0, as Redis does for a hash it keeps as a listpack; `COUNT` fields at a time for one it would keep as a hash table (over 128 fields, or a field or value over 64 bytes), as Redis pages those. Patterns as in Redis: `*`, `?`, `[a-z]`, `[^a]`, `\` |
 | `SADD key member [member ...]`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SCARD`, `SMEMBERS` | Small sets reply in Redis' order: integers sorted, others in the order added. `SMEMBERS` is a set in RESP3 |
 | `SPOP key [count]`, `SRANDMEMBER key [count]` | Random members; a negative `SRANDMEMBER` count may repeat them. A count covering the whole set gives it in Redis' order |
@@ -1005,7 +1013,7 @@ hit rates share the seeding flaw described above.
   at thousands; Redis switches to a hash table past 128 fields), and reads
   scan it. `HGET` costs about 1.7× a `GET` at pipeline 16 (235 against 145 ns
   in the in-process benchmark, 10 fields), mostly in the cache lines the
-  scan touches. No `HRANDFIELD`, `HINCRBYFLOAT` or field TTLs (`HEXPIRE`).
+  scan touches. No field TTLs (`HEXPIRE`).
 - **`SCAN` on very big stores**: each call reads a whole shard's table, so
   at 100M keys (390k per shard) a call holds a lock for ~165 µs, which
   commands on that shard wait out, and a whole scan reads each table up to
@@ -1020,8 +1028,14 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- Replication, ACL users, `COPY`, `RANDOMKEY`, `OBJECT`, `INCRBYFLOAT`,
-  `DUMP`/`RESTORE`.
+- Replication, ACL users, `DUMP`/`RESTORE`, bitmaps (`SETBIT` and the like),
+  HyperLogLog, geo commands, and `WAITAOF`.
+- **`APPEND` and `SETRANGE` copy the string**, which is one allocation: O(n) per
+  call, where Redis grows it in place. Fine at the sizes caches keep; appending
+  a little at a time to a string of many MB is slow.
+- **`OBJECT ENCODING` doesn't know a value's past**: a short string `APPEND` made
+  is `raw` in Redis and `embstr` here, and a collection that grew past a limit
+  and shrank back stays big in Redis.
 - **Append-only log gaps**: no `appendfsync always`. A rewrite writes its
   base while writes wait (reads go on), where Redis forks: about 30 ms per
   million small keys. The files are Tantalum's own: Redis can't load them,

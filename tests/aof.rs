@@ -245,7 +245,7 @@ fn step(
     let v = n(rng, 1000);
     let ms = (1 + rng.below(60)).to_string();
     let at = (ctx.store.now() + rng.below(80)).to_string();
-    let commands: Vec<Vec<String>> = match rng.below(40) {
+    let commands: Vec<Vec<String>> = match rng.below(49) {
         0 => vec![vec!["SET".into(), s, v]],
         1 => vec![vec!["SET".into(), s, v, "PX".into(), ms]],
         2 => vec![vec!["SET".into(), s, v, "PXAT".into(), at]],
@@ -315,6 +315,15 @@ fn step(
             x,
             ms,
         ]],
+        40 => vec![vec!["APPEND".into(), s, v]],
+        41 => vec![vec!["SETRANGE".into(), s, n(rng, 8), v]],
+        42 => vec![vec!["GETSET".into(), s, v]],
+        43 => vec![vec!["INCRBYFLOAT".into(), s, "0.5".into()]],
+        44 => vec![vec!["MSETNX".into(), s, v, s2, ms]],
+        45 => vec![vec!["COPY".into(), s, s2]],
+        46 => vec![vec!["COPY".into(), l, l2, "REPLACE".into()]],
+        47 => vec![vec!["SORT".into(), l, "ALPHA".into(), "STORE".into(), l2]],
+        48 => vec![vec!["HINCRBYFLOAT".into(), h, n(rng, 5), "0.25".into()]],
         36 => {
             // A client blocked on a list, served by the push that follows.
             let mut buf = Vec::new();
@@ -842,4 +851,30 @@ fn blocked_clients_served_after_a_read_are_logged() {
     assert_eq!(started.failed, 0);
     assert_same(&before, &dump(again, 0));
     close(&log2);
+}
+
+/// `INCRBYFLOAT` and `HINCRBYFLOAT` are logged as what they came to, so a
+/// machine that rounds differently gets the same.
+#[test]
+fn float_increments_are_logged_as_what_they_set() {
+    let dir = temp_dir("floats");
+    let (ctx, log, _) = open(&dir, Config::default());
+    let mut session = ctx.connect(-1).unwrap().session();
+    run(ctx, &mut session, &[b"INCRBYFLOAT", b"f", b"1.5"]);
+    run(ctx, &mut session, &[b"HINCRBYFLOAT", b"h", b"a", b"2.5"]);
+    // A plain sort changes nothing, so it isn't logged.
+    run(ctx, &mut session, &[b"RPUSH", b"l", b"1"]);
+    run(ctx, &mut session, &[b"SORT", b"l"]);
+    close(&log);
+    let text = String::from_utf8_lossy(&std::fs::read(log_file(&dir)).unwrap()).into_owned();
+    assert!(
+        text.contains("$3\r\nSET\r\n$1\r\nf\r\n$3\r\n1.5\r\n$7\r\nKEEPTTL\r\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("$4\r\nHSET\r\n$1\r\nh\r\n$1\r\na\r\n$3\r\n2.5\r\n"),
+        "{text}"
+    );
+    assert!(!text.contains("INCRBYFLOAT"), "{text}");
+    assert!(!text.contains("SORT"), "{text}");
 }
