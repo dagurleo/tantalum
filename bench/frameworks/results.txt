@@ -128,9 +128,20 @@ cycles -0.31%. So that row's -4.7% was the run's, not the build's.
   SET P16, epoll    user instr 2336.9 -> 2348.7 (+0.50%)  user cycles  974.6 ->  977.8 (+0.33%)
   GET P16, uring    user instr 1484.3 -> 1496.1 (+0.79%)  user cycles  594.4 ->  585.8 (-1.45%)
 
-Kernel instructions unchanged. About 12 instructions a command: a comparison for its database, and one
-for each shard lock it takes. An earlier build took 30, as its lock guard had grown to three words and
+Kernel instructions unchanged. An earlier build took 30, as its lock guard had grown to three words and
 no longer came back in registers.
+
+Where they are, line by line under callgrind, for a GET at pipeline 16, instructions a command:
+
+   +6  `match &self.base` in Store::lock and try_lock: 3 each, and a GET takes 2 locks
+   +5  `if session.db == 0` in Context::db, and around it
+   +3  `&self.shards[index]` and the try_lock line, passing the shard to the helper
+   +5  in store.rs, which callgrind counts but doesn't put on a line
+   -6  the guard: no `match` to reach the data (-3), and shorter unlocking (-3)
+   -1  small moves elsewhere
+
+At pipeline 1 it's 17: `ctx.db(&session)` in the connection loop runs once a batch, which is then once a
+command. SET is 12 too, with `sync_usage` no longer inlined, which moves its lines about.
 
 == Raw rounds
 

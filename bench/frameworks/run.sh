@@ -6,7 +6,8 @@
 #   run.sh setup SUITE            once: builds the image, installs what it needs
 #   run.sh SUITE SERVER           SERVER is tantalum or redis
 #
-# SUITE: sidekiq, rails, celery, kombu, laravel, bullmq. Needs git clones of each under
+# SUITE: sidekiq, rails, celery, kombu, laravel, bullmq, or a client library: redis-py,
+# ioredis, node-redis, redis-rb, predis, phpredis. Needs git clones of each under
 # $FW (fetch.sh makes them), and a Tantalum and a redis-server binary.
 set -uo pipefail
 
@@ -18,10 +19,10 @@ REDIS=${REDIS:-/root/redis-724}
 
 image_of() {
   case $1 in
-    sidekiq | rails) echo fw-ruby ;;
-    celery | kombu) echo fw-python ;;
-    laravel) echo fw-php ;;
-    bullmq) echo fw-node ;;
+    sidekiq | rails | redis-rb) echo fw-ruby ;;
+    celery | kombu | redis-py) echo fw-python ;;
+    laravel | predis | phpredis) echo fw-php ;;
+    bullmq | ioredis | node-redis) echo fw-node ;;
     *) echo "no such suite: $1" >&2; exit 2 ;;
   esac
 }

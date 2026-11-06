@@ -88,6 +88,8 @@ pub struct Context {
     pub pubsub: Arc<PubSub>,
     /// The most memory seen in use, as `INFO` reports it.
     memory_peak: AtomicUsize,
+    /// Forty hex digits, different each time the server starts.
+    run_id: String,
     /// Lua scripts and their interpreter, made on the first one.
     pub(crate) scripting: Scripting,
     started: Instant,
@@ -111,6 +113,7 @@ impl Context {
         Context {
             pubsub: Arc::new(PubSub::new(store.clone())),
             memory_peak: AtomicUsize::new(0),
+            run_id: new_run_id(),
             scripting: Scripting::default(),
             store,
             settings,
@@ -136,6 +139,11 @@ impl Context {
         } else {
             self.store.db(session.db as usize)
         }
+    }
+
+    /// What identifies this run of the server, in `INFO`.
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
     }
 
     /// Takes note of how much memory is in use now, as Redis does on a timer:
@@ -461,6 +469,17 @@ pub(crate) struct Registered {
     pub(crate) db: u32,
     /// Subscribed to something, as `CLIENT LIST` and `CLIENT KILL` go by.
     pub(crate) pubsub: bool,
+}
+
+fn new_run_id() -> String {
+    use std::hash::BuildHasher;
+    let random = std::collections::hash_map::RandomState::new();
+    let mut id = String::with_capacity(48);
+    for i in 0..3u8 {
+        id.push_str(&format!("{:016x}", random.hash_one(i)));
+    }
+    id.truncate(40);
+    id
 }
 
 /// What `CLIENT KILL` goes by.

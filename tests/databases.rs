@@ -626,3 +626,51 @@ async fn client_kill_reads_its_options_as_redis_does() {
         ":0\r\n"
     );
 }
+
+#[tokio::test]
+async fn info_gives_the_sections_asked_for() {
+    let (addr, _ctx) = start(Mode::PerThread).await;
+    let mut c = Client::connect(addr).await;
+    c.call(&["SET", "a", "1"]).await;
+    let info = c.call(&["INFO"]).await;
+    for header in [
+        "# Server\r\n",
+        "# Clients\r\n",
+        "# Memory\r\n",
+        "# Persistence\r\n",
+        "# Stats\r\n",
+        "# Replication\r\n",
+        "# CPU\r\n",
+        "# Modules\r\n",
+        "# Errorstats\r\n",
+        "# Cluster\r\n",
+        "# Keyspace\r\n",
+    ] {
+        assert!(info.contains(header), "{header} in {info}");
+    }
+    assert!(!info.contains("# Commandstats\r\n"), "only when asked for");
+    // What clients read when they connect.
+    for field in [
+        "arch_bits:64\r\n",
+        "cluster_enabled:0\r\n",
+        "role:master\r\n",
+        "run_id:",
+    ] {
+        assert!(info.contains(field), "{field} in {info}");
+    }
+    let keyspace = c.call(&["INFO", "keyspace"]).await;
+    assert!(keyspace.contains("# Keyspace\r\ndb0:keys=1,"), "{keyspace}");
+    assert!(!keyspace.contains("# Server"), "{keyspace}");
+    // Any case, several, and none known.
+    let two = c.call(&["INFO", "SERVER", "cLuStEr"]).await;
+    assert!(
+        two.contains("# Server") && two.contains("# Cluster") && !two.contains("# Memory"),
+        "{two}"
+    );
+    assert_eq!(c.call(&["INFO", "nothing"]).await, "$0\r\n\r\n");
+    let all = c.call(&["INFO", "everything"]).await;
+    assert!(
+        all.contains("# Commandstats\r\n") && all.contains("# Server\r\n"),
+        "{all}"
+    );
+}

@@ -1438,7 +1438,7 @@ async fn snapshot_commands_when_snapshots_are_off() {
             req(&[b"BGSAVE", b"SCHEDULE"]),
         ]
         .concat(),
-        &[off, off, b"-ERR syntax error\r\n"].concat(),
+        &[off, off, off].concat(),
     )
     .await;
     let lastsave = integer(&mut c, &req(&[b"LASTSAVE"])).await;
@@ -1450,9 +1450,17 @@ async fn snapshot_commands_when_snapshots_are_off() {
     c.write_all(&req(&[b"INFO"])).await.unwrap();
     let info = String::from_utf8(read_reply(&mut c).await).unwrap();
     assert!(
-        info.contains("# Persistence\r\nloading:0\r\nsnapshots:off\r\n"),
+        info.contains("# Persistence\r\nloading:0\r\nasync_loading:0\r\nsnapshots:off\r\n"),
         "{info}"
     );
+    for field in [
+        "rdb_changes_since_last_save:0\r\n",
+        "rdb_last_save_time:",
+        "rdb_bgsave_in_progress:0\r\n",
+    ] {
+        assert!(info.contains(field), "{field} in {info}");
+    }
+    check(&mut c, &req(&[b"BGSAVE", b"NOW"]), b"-ERR syntax error\r\n").await;
 }
 
 /// A blocking connection for the tests of held replies below, sending each

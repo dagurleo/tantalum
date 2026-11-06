@@ -129,7 +129,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
 | `BGREWRITEAOF` | With `--aof`: rewrites the log on another thread (a new base of the data as it is, and a new, empty log after it). Without `--aof` it's an error, where Redis would write a log anyway |
-| `INFO`, `DBSIZE` | `INFO` has the fields monitoring tools read: `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line |
+| `INFO [section ...]`, `DBSIZE` | `INFO` gives the sections asked for, as Redis does, with the fields clients and monitoring tools read: `arch_bits`, `run_id`, `role`, `cluster_enabled`, `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line |
 | `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE channel\|pattern [...]`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `SUNSUBSCRIBE [...]` | Messages are pushes in RESP3. Subscribed in RESP2, a client may only run these, `PING`, `QUIT` and `RESET`, as in Redis. Shard channels are a namespace of their own (one server is one shard) |
 | `PUBLISH channel message`, `SPUBLISH` | Replies how many got it; a client subscribed both by channel and by pattern gets it twice. One publishing to its own channel gets the reply, then the message, as from Redis 7.2 |
 | `PUBSUB CHANNELS [pattern]\|NUMSUB [channel ...]\|NUMPAT\|SHARDCHANNELS\|SHARDNUMSUB\|HELP` | |
@@ -170,6 +170,23 @@ sharding 6), `CLIENT KILL` and the `INFO` fields Sidekiq's dashboard reads.
 To run them, on a machine with Docker: `bench/frameworks/fetch.sh`, then
 `bench/frameworks/run.sh setup SUITE` once, `run.sh SUITE redis`, `run.sh SUITE tantalum`
 and `compare.py` on the two result folders.
+
+Client libraries' own suites try far more commands, and show what's still missing. Tests that
+pass on Redis 7.2.4 and fail on Tantalum, by library (`bench/frameworks/results-clients.txt`):
+
+| Suite | Pass on Redis | Lost on Tantalum |
+|---|---|---|
+| redis-py 7.4.0 | 2,336 | 240 |
+| Predis 3.6.1 | 4,525 | 107 |
+| node-redis 6.3.1 | 1,486 | 80 |
+| redis-rb 6.0.0 | 893 | 85 |
+| ioredis 5.11.0 | 566 | 13 |
+| phpredis 6.3.0 | 203 | 14 |
+
+Most of those looked at come down to something that isn't here, listed under "Not there yet".
+A few are answers that differ from Redis': `COMMAND`'s entries have no ACL categories, key
+specifications or tips, and `SAVE`, `BGSAVE` and `BGREWRITEAOF` refuse unless a file or directory
+was given at the start, where Redis saves to its default.
 
 ## Design
 
@@ -291,7 +308,8 @@ and `compare.py` on the two result folders.
   database 0's shard locks: what holds a shard holds that shard of every database, so
   `EXEC`, scripts, `MOVE` and `SWAPDB` hold just what they did, however the databases are
   used, and can't deadlock between them. A command on database 0 pays one comparison for
-  its database and one for each lock, about 12 instructions a command, which doesn't show in
+  its database and one for each lock, about 12 instructions a command (17 at pipeline 1, which
+  also checks once a batch; line by line in `bench/frameworks/results.txt`), which doesn't show in
   its cycles or throughput; a key takes the same in any database (60 bytes of RSS with a 32-byte
   value, either way), and is as fast. They share one memory limit, and eviction takes from
   any of them, as in Redis. A snapshot marks where each database other than 0 starts,
@@ -1121,6 +1139,15 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
+- **Missing, by how many client library tests need it** (see above; 539 of 10,509): geo commands
+  (155), `ACL` (89), `CONFIG SET`, `CONFIG RESETSTAT` and most of `CONFIG GET` (47), `MONITOR` (43),
+  `FUNCTION` and `FCALL` (43), HyperLogLog (29), client-side caching with `CLIENT TRACKING` (25),
+  `CLIENT PAUSE`, `UNPAUSE`, `UNBLOCK`, `NO-EVICT`, `NO-TOUCH` and `REPLY` (19), `DUMP`, `RESTORE` and
+  `MIGRATE` (19), `DEBUG` (13), `MEMORY` (12), `COMMAND GETKEYS` and `DOCS` (11), `ROLE`, `REPLICAOF`,
+  `LOLWUT` and `MODULE` (9), `LATENCY` (4), `SLOWLOG` (3), `WAIT` and `WAITAOF` (3), `INFO commandstats`
+  (1), `OBJECT IDLETIME` (1), and Unix sockets, without which redis-rb's tests won't start. Answers
+  that differ: `COMMAND`'s entries (no ACL categories, key specifications or tips), and `SAVE`,
+  `BGSAVE` and `BGREWRITEAOF` refusing without `--snapshot` or `--aof`.
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out

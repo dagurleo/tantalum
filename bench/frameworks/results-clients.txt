@@ -1,0 +1,45 @@
+Client libraries' own test suites on Tantalum 0.23.1, 2026-11-06, against Redis 7.2.4 as the control.
+
+redis-py 7.4.0 (sync and asyncio; no cluster, modules, TLS, replicas or cloud), Predis 3.6.1 (phpunit's
+default groups), redis-rb 6.0.0 (redis and distributed), ioredis 5.11.0 (unit and functional), phpredis 6.3.0
+(its Redis class, a test at a time), node-redis 6.3.1 (the client package, started by node-redis-shim.py at
+version 7.2). Agent37 VMs, as in results.txt. go-redis, Jedis and Lettuce aren't here: they expect clusters
+and sentinels up first. A test counts as lost when it passes on Redis and fails on Tantalum.
+
+Lost tests by the feature they need, sorted by the name or error each one failed on, so roughly:
+
+suite totals: {'redis-py': (240, 2336), 'predis': (107, 4525), 'redis-rb': (85, 893), 'ioredis': (13, 566), 'phpredis': (14, 203), 'node-redis': (80, 1486)}
+                                                      redis-py    predis  redis-rb   ioredis  phpredis node-redi    all
+Geo                                                         59        44        47                   5              155
+ACL                                                         69         7         3         1                   9     89
+CONFIG SET / RESETSTAT / more CONFIG GET                    15        21         4                             7     47
+MONITOR                                                     24         3                  12                   4     43
+FUNCTION / FCALL                                            11        20                                      12     43
+HyperLogLog                                                  9         4        15                   1               29
+Client-side caching (TRACKING)                               3                                       1        21     25
+CLIENT PAUSE, UNBLOCK, NO-EVICT, NO-TOUCH, REPLY            13         3                                       3     19
+DUMP / RESTORE / MIGRATE                                    12         3         2                   1         1     19
+DEBUG                                                                           10                             3     13
+MEMORY USAGE and friends                                     7                                                 5     12
+COMMAND GETKEYS, DOCS, full table                            6         1         2                   1         1     11
+ROLE / REPLICAOF / LOLWUT / MODULE                           5                                                 4      9
+other                                                                            1                             8      9
+LATENCY                                                      3                                                 1      4
+cmd= in CLIENT LIST                                          3                                                        3
+SLOWLOG                                                                1         1                   1                3
+WAIT / WAITAOF                                                                                       2         1      3
+BGSAVE SCHEDULE                                              1                                                        1
+INFO commandstats and fields                                                                         1                1
+OBJECT IDLETIME                                                                                      1                1
+
+Tests of Redis 7.4 and 8 commands (HEXPIRE and the like) fail on the control too, so they aren't here.
+redis-rb won't start without a Unix socket, so its Tantalum run has socat in front of the port: Tantalum
+has no Unix sockets, and that's in no count above. node-redis's server options are dropped for Tantalum
+but for --requirepass.
+
+Most of the lost tests looked at come down to a command or a setting that isn't there: the pub/sub test that
+kills a connection looks for cmd=subscribe in CLIENT LIST; XADD's LIMIT test reads a setting with CONFIG GET;
+TOUCH's reads OBJECT IDLETIME; scan's are DEBUG POPULATE; and a node-redis pool test is CLIENT TRACKING. Not
+every lost test was read one by one. Answers that do differ from Redis': COMMAND's entries have no ACL
+categories, key specifications or tips (COMMAND DOCS is empty); SAVE, BGSAVE and BGREWRITEAOF refuse without
+--snapshot or --aof, where Redis saves to its default.
