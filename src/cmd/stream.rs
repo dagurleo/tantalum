@@ -9,7 +9,7 @@ use crate::collection::Collection;
 use crate::context::{Context, Session};
 use crate::resp;
 use crate::store::{Entry, EntryValue, Key, Kind, Millis, Store, Update, View};
-use crate::stream::{self, AddError, BigStream, IdForm, StreamId, Trim};
+use crate::stream::{self, AddError, BigStream, IdForm, NodeLimits, StreamId, Trim};
 
 pub(super) const INVALID_ID: &[u8] = b"ERR Invalid stream ID specified as stream command argument";
 
@@ -104,7 +104,7 @@ struct TrimArgs {
 }
 
 impl TrimArgs {
-    fn parse(args: &Args<'_>, xadd: bool) -> Result<TrimArgs, &'static [u8]> {
+    fn parse(args: &Args<'_>, xadd: bool, limits: NodeLimits) -> Result<TrimArgs, &'static [u8]> {
         const INCOMPATIBLE: &[u8] =
             b"ERR syntax error, MAXLEN and MINID options at the same time are not compatible";
         let mut parsed = TrimArgs {
@@ -178,8 +178,7 @@ impl TrimArgs {
                 return Err(b"ERR syntax error, LIMIT cannot be used without the special ~ option");
             }
             Some(limit) => limit,
-            // Redis' default: 100 * stream-node-max-entries.
-            None if parsed.approx => 10_000,
+            None if parsed.approx => limits.default_trim_limit(),
             None => 0,
         };
         parsed.at = i;
@@ -195,7 +194,8 @@ pub(super) fn xadd(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let parsed = match TrimArgs::parse(args, true) {
+    let limits = ctx.stream_limits();
+    let parsed = match TrimArgs::parse(args, true, limits) {
         Ok(parsed) => parsed,
         Err(msg) => return reply_error(out, msg),
     };
@@ -217,7 +217,7 @@ pub(super) fn xadd(
     let now_ms = ctx.store.unix_ms(now);
     let add = |stream: &mut BigStream| -> Result<StreamId, AddError> {
         let id = stream.next_id(parsed.id, now_ms)?;
-        stream.add(id, &pairs);
+        stream.add(id, &pairs, limits);
         if let Some(how) = parsed.trim {
             stream.trim(how, parsed.approx, parsed.limit);
         }
@@ -447,7 +447,7 @@ pub(super) fn xtrim(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let parsed = match TrimArgs::parse(args, false) {
+    let parsed = match TrimArgs::parse(args, false, ctx.stream_limits()) {
         Ok(parsed) => parsed,
         Err(msg) => return reply_error(out, msg),
     };

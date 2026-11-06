@@ -85,7 +85,7 @@ fn run(ctx: &Context, session: &mut Session, args: &[&[u8]]) -> Vec<u8> {
         &mut out,
     ) {
         Reply::Bulk(value) => tantalum::resp::write_bulk(&mut out, value.as_bytes()),
-        Reply::Written | Reply::Close | Reply::Block(_) => {}
+        Reply::Written | Reply::Close | Reply::Block(_) | Reply::Paused => {}
     }
     out
 }

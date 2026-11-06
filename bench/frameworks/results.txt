@@ -267,3 +267,9 @@ redis db1 P16 0:1 2060557
 RSS KB: at start 8616, with 15 more databases made 11016, each 160
 1M keys of 32 bytes in database 0: 60 B of RSS a key
 1M keys of 32 bytes in database 1: 60 B of RSS a key
+
+== 0.24.0, the admin batch
+
+All six again, side by side with Redis 7.2.4, on the build before its last lint fixes: Sidekiq 749 runs, Rails 725 names,
+Laravel 1,363 passed and 19 skipped, Kombu 123, BullMQ 1,101 names of 1,114 tests with 3 skipped, Celery 394 passed and
+the same 5 failing. No test lost in any of them. tools/db-diff.py: 19,995 commands, no differences.

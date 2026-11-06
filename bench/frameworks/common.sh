@@ -15,9 +15,9 @@ start_server() {
   case $SERVER in
     tantalum)
       # shellcheck disable=SC2086
-      tantalum --port "$port" $TANTALUM_ARGS >/out/server.log 2>&1 &
+      tantalum --port "$port" --enable-debug-command yes $TANTALUM_ARGS >/out/server.log 2>&1 &
       ;;
-    redis) redis-server --port "$port" --save '' --appendonly no "$@" >/out/server.log 2>&1 & ;;
+    redis) redis-server --port "$port" --save '' --appendonly no --enable-debug-command yes "$@" >/out/server.log 2>&1 & ;;
     *) echo "no such server: $SERVER"; exit 2 ;;
   esac
   for _ in $(seq 1 100); do

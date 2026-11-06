@@ -108,7 +108,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `ZUNION`, `ZINTER`, `ZDIFF numkeys key ... [WEIGHTS ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]`, their `STORE` forms, `ZINTERCARD` | Sets count as sorted sets with scores of 1, as in Redis. Each key is read on its own |
 | `ZSCAN key cursor [MATCH pattern] [COUNT n]` | As `SSCAN` |
 | `SSCAN key cursor [MATCH pattern] [COUNT n]` | Small sets come whole with cursor 0, as in Redis; big ones `COUNT` at a time, each member there throughout returned at least once |
-| `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] threshold [LIMIT n]] *\|id field value ...` | IDs as Redis makes and reads them (`ms-*` included). Trimming with `~` removes whole nodes where Redis' end, so it removes what Redis does |
+| `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] threshold [LIMIT n]] *\|id field value ...` | IDs as Redis makes and reads them (`ms-*` included). Trimming with `~` removes whole nodes where Redis' end, so it removes what Redis does, with `stream-node-max-entries` and `-bytes` as set |
 | `XLEN`, `XRANGE key start end [COUNT n]`, `XREVRANGE`, `XDEL key id ...`, `XTRIM key MAXLEN\|MINID [=\|~] threshold [LIMIT n]` | `(` for exclusive ends. An emptied stream stays, keeping its last ID, as in Redis |
 | `XREAD [COUNT n] [BLOCK ms] STREAMS key ... id ...` | `$` for new entries only. Blocked readers are all served by an entry that's new to them (reading takes nothing), and `$` means the last ID when the command came |
 | `XGROUP CREATE key group id\|$ [MKSTREAM] [ENTRIESREAD n]`, `XGROUP SETID key group id\|$ [ENTRIESREAD n]`, `XGROUP DESTROY key group`, `XGROUP CREATECONSUMER key group consumer`, `XGROUP DELCONSUMER key group consumer`, `XGROUP HELP` | As in Redis, what these do to a stream's groups isn't a change to clients watching the key, unless `MKSTREAM` makes it |
@@ -126,7 +126,18 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `CLIENT SETNAME\|GETNAME\|ID\|SETINFO` | What client libraries send on connect |
 | `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, database, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and how many subscriptions) reads as 0, `N` or `NULL` |
 | `CLIENT KILL addr:port`, `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port] [LADDR addr:port] [SKIPME yes\|no]` | Closes other connections at once, and the caller's own after its reply. The only user is `default` |
-| `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
+| `COMMAND [COUNT\|INFO\|LIST\|DOCS\|GETKEYS\|GETKEYSANDFLAGS]` | Each entry is Redis 7.2.4's own, ACL categories, key specifications, tips and documentation included (`tools/command-table.py`). `COUNT` and `LIST` say what's here, not what Redis has |
+| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`). The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started, `save` with `--snapshot`, `notify-keyspace-events`, and LFU and random policies. `CONFIG REWRITE` says there's no config file |
+| `MONITOR` | Every command run, as Redis' lines show them: what's secret `(redacted)`, a script's own commands as `lua`, admin commands left out. It costs commands nothing until someone runs it (see Design) |
+| `SLOWLOG GET [count]\|LEN\|RESET\|HELP` | As Redis', with what's secret `(redacted)`, and the commands inside `EXEC` and scripts too. At its default of 10 ms and above, durations are in 5 ms ticks, and commands Redis flags `fast` aren't timed (see Design); below that, a real clock as in Redis |
+| `LATENCY LATEST\|HISTORY\|RESET\|GRAPH\|DOCTOR\|HELP`, `LATENCY HISTOGRAM` | With `latency-monitor-threshold`, spikes in `command` and `fast-command`, as Redis keeps them. `HISTOGRAM` is empty: no per-command statistics are kept |
+| `MEMORY USAGE key [SAMPLES n]\|STATS\|DOCTOR\|PURGE\|MALLOC-STATS\|HELP` | `STATS` has Redis' fields; the allocator's are what's in use and the process's RSS |
+| `WAIT numreplicas timeout`, `WAITAOF numlocal numreplicas timeout` | There are no replicas: `WAIT` for any waits its time out and says 0, as Redis does. `WAITAOF 1` syncs the log at once with `--aof`, and is refused without |
+| `ROLE`, `REPLICAOF NO ONE`, `SLAVEOF NO ONE` | Always a master. Following another server is refused |
+| `DEBUG POPULATE\|SLEEP\|ERROR\|OBJECT` | With `--enable-debug-command yes` or `local`, as in Redis |
+| `LOLWUT`, `MODULE LIST` | No modules |
+| `CLIENT PAUSE timeout [WRITE\|ALL]`, `CLIENT UNPAUSE` | Holds back what Redis holds back, for as long, and those it holds run after in order. Nothing expires by itself meanwhile |
+| `CLIENT UNBLOCK id [TIMEOUT\|ERROR]`, `CLIENT REPLY ON\|OFF\|SKIP`, `CLIENT NO-EVICT`, `CLIENT NO-TOUCH`, `CLIENT GETREDIR`, `CLIENT TRACKINGINFO` | `NO-EVICT` and `NO-TOUCH` are shown in the client list and do nothing else: clients aren't evicted, and keys hold no access times to protect |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
 | `BGREWRITEAOF` | With `--aof`: rewrites the log on another thread (a new base of the data as it is, and a new, empty log after it). Without `--aof` it's an error, where Redis would write a log anyway |
 | `INFO [section ...]`, `DBSIZE` | `INFO` gives the sections asked for, as Redis does, with the fields clients and monitoring tools read: `arch_bits`, `run_id`, `role`, `cluster_enabled`, `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line |
@@ -176,20 +187,30 @@ pass on Redis 7.2.4 and fail on Tantalum, by library (`bench/frameworks/results-
 
 | Suite | Pass on Redis | Lost on Tantalum |
 |---|---|---|
-| redis-py 7.4.0 | 2,336 | 240 |
-| Predis 3.6.1 | 4,525 | 107 |
-| node-redis 6.3.1 | 1,486 | 80 |
-| redis-rb 6.0.0 | 893 | 85 |
-| ioredis 5.11.0 | 566 | 13 |
-| phpredis 6.3.0 | 203 | 14 |
+| redis-py 7.4.0 | 2,357 | 152 |
+| Predis 3.6.1 | 4,525 | 83 |
+| node-redis 6.3.1 | 1,486 | 49 |
+| redis-rb 6.0.0 | 893 | 69 |
+| ioredis 5.11.0 | 566 | 1 |
+| phpredis 6.3.0 | 203 | 10 |
 
-Most of those looked at come down to something that isn't here, listed under "Not there yet".
-A few are answers that differ from Redis': `COMMAND`'s entries have no ACL categories, key
-specifications or tips, and `SAVE`, `BGSAVE` and `BGREWRITEAOF` refuse unless a file or directory
-was given at the start, where Redis saves to its default.
+That's 364 of 10,530, and 346 of them need something that isn't here: geo commands, `ACL`,
+`FUNCTION`, HyperLogLog, `CLIENT TRACKING`, or `DUMP` and `RESTORE`. The other 18 are listed under
+"Not there yet". `tools/admin-diff.py` compares the admin commands with Redis 7.2.4 directly:
+3,278 commands and checks, every command's `COMMAND` entries and every setting among them, no
+differences.
 
 ## Design
 
+- **Watching commands** (`Context::special`, `src/slowlog.rs`, `src/latency.rs`): `MONITOR`,
+  `CLIENT PAUSE`, the latency monitor and a `SLOWLOG` threshold under 10 ms all need something
+  done around every command. Connections read one flag once a batch, beside the numbered
+  database check, and while it's on, their commands take the restricted path, where those
+  checks are. So they cost nothing until someone asks for them. At the default of 10 ms the
+  slow log doesn't need that: commands Redis flags `fast` aren't timed, and the others read a
+  clock a thread ticks every 5 ms, which is two loads, so a command is logged once it has
+  surely taken that long, with its time in ticks. That thread takes about 0.5% of a core while
+  commands run, and stops when none has for a second, so an idle server isn't woken for it.
 - **Network** (`src/server.rs`): Tokio, one task per connection, `TCP_NODELAY`.
   Each read is parsed for *every* complete command (pipelining) and all
   replies go out in one write. Without pipelining, syscalls and the kernel's
@@ -373,7 +394,7 @@ was given at the start, where Redis saves to its default.
   `shrink_to_fit` had left every chunk in a 5,120-byte one and `used_memory` a
   third below what the process really took), and the next starts about that
   size. In real memory, the growth of RSS over 5M entries, an entry of one
-  32-byte value takes 38.3 bytes (Redis 7.2.4 44.0, Valkey 44.2), of one 8-byte
+  32-byte value takes 38.3 bytes (Redis 8.10.3 44.0, Valkey 9.1.3 44.2), of one 8-byte
   value 13.8 (21.6, 21.7). A stream is always an object (`collection.rs`);
   string entries pay nothing for it.
 - **Consumer groups** (`src/stream.rs`, `src/cmd/group.rs`) keep groups and
@@ -395,7 +416,7 @@ was given at the start, where Redis saves to its default.
   3 x 80 clients, all servers up, in commands per second (raw rows and how:
   `bench/agent37/results-groups.txt`):
 
-  | | Pipeline | Redis 7.2.4 | Valkey | Tantalum | vs Redis | p99, Redis / Tantalum |
+  | | Pipeline | Redis 8.10.3 | Valkey 9.1.3 | Tantalum | vs Redis | p99, Redis / Tantalum |
   |---|---|---|---|---|---|---|
   | `XADD` | 1 | 245,087 | 246,770 | 304,380 | +24% | 1.91 / 1.29 ms |
   | | 16 | 997,990 | 980,581 | 2,300,654 | +131% | 6.35 / 2.81 ms |
@@ -1139,15 +1160,13 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
-- **Missing, by how many client library tests need it** (see above; 539 of 10,509): geo commands
-  (155), `ACL` (89), `CONFIG SET`, `CONFIG RESETSTAT` and most of `CONFIG GET` (47), `MONITOR` (43),
-  `FUNCTION` and `FCALL` (43), HyperLogLog (29), client-side caching with `CLIENT TRACKING` (25),
-  `CLIENT PAUSE`, `UNPAUSE`, `UNBLOCK`, `NO-EVICT`, `NO-TOUCH` and `REPLY` (19), `DUMP`, `RESTORE` and
-  `MIGRATE` (19), `DEBUG` (13), `MEMORY` (12), `COMMAND GETKEYS` and `DOCS` (11), `ROLE`, `REPLICAOF`,
-  `LOLWUT` and `MODULE` (9), `LATENCY` (4), `SLOWLOG` (3), `WAIT` and `WAITAOF` (3), `INFO commandstats`
-  (1), `OBJECT IDLETIME` (1), and Unix sockets, without which redis-rb's tests won't start. Answers
-  that differ: `COMMAND`'s entries (no ACL categories, key specifications or tips), and `SAVE`,
-  `BGSAVE` and `BGREWRITEAOF` refusing without `--snapshot` or `--aof`.
+- **Missing, by how many client library tests need it** (see above; 364 of 10,530): geo commands
+  (156), `ACL` (81), `FUNCTION` and `FCALL` (39), HyperLogLog (29), client-side caching with `CLIENT
+  TRACKING` (22), `DUMP`, `RESTORE` and `MIGRATE` (19), turning the log on with `CONFIG SET appendonly`
+  (5), `LATENCY HISTOGRAM` (5), `INFO commandstats` (3), `OBJECT IDLETIME` (1), and Unix sockets,
+  without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
+  refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
+  the 209 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1178,7 +1197,12 @@ hit rates share the seeding flaw described above.
   might remove them.
 - **Table resizes still rebuild a whole shard's table** (25% at a time, without reading
   keys): sub-millisecond at today's sizes, but a few ms per shard at 100M keys.
-- No `instantaneous_ops_per_sec`, latency histograms or a slow log.
+- No `instantaneous_ops_per_sec` or per-command statistics (`INFO commandstats`, `LATENCY
+  HISTOGRAM`): counting every command costs every command, so it needs measuring first.
+- **The slow log at its default**: a `fast` command that's slow (a `GET` of a huge value on a
+  busy machine, say) isn't logged, and a command's time is in 5 ms ticks. Set the threshold
+  under 10 ms for what Redis logs, at the cost of a clock read per command. A blocked command
+  is logged when it blocks, where Redis logs it when it's served.
 - The server binds to `127.0.0.1` by default. If you expose it, set a password,
   and use TLS outside a private network. No client certificates, no
   certificate reloading without a restart.
@@ -1201,21 +1225,24 @@ hit rates share the seeding flaw described above.
   `SDIFF`, `ZUNION`, `ZINTER`, `ZDIFF` and their stores), as `MGET` reads
   and `MSET` writes one at a time, so a transaction or script can run
   between two of their keys; `SMOVE`, `LMOVE` and `RENAME` are atomic.
-- **Blocking gaps**: no `WAIT`, `CLIENT UNBLOCK`, or `b` flag in a client
-  list.
+- **Blocking gaps**: no `b` flag in a client list.
 - **Writes to a small collection decode it whole**: a list, set or sorted
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- Replication, ACL users, `DUMP`/`RESTORE`, HyperLogLog, geo commands, and
-  `WAITAOF`.
+- Replication, ACL users, `DUMP`/`RESTORE`, HyperLogLog and geo commands.
+- **Settings with a syntax of their own aren't checked**: `client-output-buffer-limit`,
+  `latency-tracking-info-percentiles`, `oom-score-adj-values`, `locale-collate` and
+  `proc-title-template` take anything, as none of them does anything here.
 - **`OBJECT ENCODING` doesn't know a value's past**: a short string `APPEND` made
   is `raw` in Redis and `embstr` here, and a collection that grew past a limit
   and shrank back stays big in Redis.
 - **Append-only log gaps**: no `appendfsync always`. A rewrite writes its
   base while writes wait (reads go on), where Redis forks: about 30 ms per
   million small keys. The files are Tantalum's own: Redis can't load them,
-  nor Tantalum Redis'. No `CONFIG SET appendonly`, and no `aof_rewrites`,
+  nor Tantalum Redis'. `CONFIG SET appendonly` can't turn it on or off, `WAITAOF`'s tests that
+  need that can't run, and `stream-node-max-entries` and `-bytes` can't change with it on, as
+  what `~` trims depends on them and the log's commands run again with the default. No `aof_rewrites`,
   `aof_delayed_fsync` and the rest of Redis' AOF counters in `INFO`. With
   the log on, writes take turns across threads, so they don't scale with
   `--threads` (reads do), and pipelined SETs lose about 30% (see Benchmarks),
@@ -1253,7 +1280,7 @@ hit rates share the seeding flaw described above.
   own memory (channel names and their subscriber tables) isn't in
   `used_memory`; subscribers' unsent messages are. `PUBSUB CHANNELS` and multiple patterns' messages come in
   an order of Tantalum's own (Redis' depends on its random hash seed).
-- LFU and random eviction policies, `CONFIG SET` at runtime.
+- LFU and random eviction policies.
 
 ## Development
 

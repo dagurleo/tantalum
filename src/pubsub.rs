@@ -278,6 +278,27 @@ struct Outbox {
 }
 
 impl Subscriber {
+    /// An outbox with no subscriptions, for `MONITOR`.
+    pub(crate) fn alone(id: u64, store: Arc<Store>) -> Arc<Subscriber> {
+        Arc::new(Subscriber {
+            id,
+            resp3: AtomicBool::new(false),
+            outbox: Mutex::default(),
+            store,
+        })
+    }
+
+    /// Puts bytes in the outbox as they are.
+    pub(crate) fn deliver_line(&self, line: &[u8]) {
+        self.deliver(
+            &Kind {
+                resp2: b"",
+                resp3: b"",
+            },
+            line,
+        );
+    }
+
     fn deliver(&self, kind: &Kind<'_>, body: &[u8]) {
         let header = if self.resp3.load(Relaxed) {
             kind.resp3

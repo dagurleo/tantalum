@@ -80,7 +80,15 @@ fn subscribe_to(
 ) -> Reply {
     let resp3 = session.resp3;
     if !session.is_subscribed() {
-        ctx.update_client(session.id, |client| client.pubsub = true);
+        let last_command = match to {
+            To::Channels => "subscribe",
+            To::Patterns => "psubscribe",
+            To::ShardChannels => "ssubscribe",
+        };
+        ctx.update_client(session.id, |client| {
+            client.pubsub = true;
+            client.last_command = Some(last_command);
+        });
     }
     let subscriptions = session.subscriptions(&ctx.pubsub);
     for i in 1..args.len() {
@@ -317,6 +325,11 @@ pub(super) fn reset(
     session.end_subscriptions(true);
     session.multi = None;
     session.select(ctx, 0);
+    session.monitor = None;
+    session.reply = crate::context::ReplyMode::On;
+    session.no_evict = false;
+    session.no_touch = false;
+    session.refresh();
     session.watching = None;
     session.name = None;
     session.set_resp3(false);
@@ -324,6 +337,7 @@ pub(super) fn reset(
         client.name = None;
         client.resp3 = false;
         client.pubsub = false;
+        client.monitor = false;
     });
     session.set_authenticated(!ctx.has_password());
     out.extend_from_slice(b"+RESET\r\n");

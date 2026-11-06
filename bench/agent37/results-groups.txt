@@ -1,4 +1,4 @@
-# 2026-11-05, Agent37 VM (Xeon E-2388G). 0.22.0 on epoll, Redis 7.2.4 and Valkey.
+# 2026-11-05, Agent37 VM (Xeon E-2388G). 0.22.0 on epoll, Redis 8.10.3 and Valkey.
 # One server core, all servers up. bench/agent37/groups.sh, memtier 3 x 80:
 #   fields after Totals: ops/s, hits/s, misses/s, avg ms, p50 ms, p99 ms, KB/s.
 # read and ack tests go through a fixed number of entries (5M in the stream),

@@ -3,7 +3,7 @@
 //!
 //! Entries live in chunks, as Redis keeps them in listpack nodes, and a new
 //! chunk starts exactly where Redis would start a new node: after 100
-//! entries, or when its listpack would pass 4 KB (the defaults of
+//! entries, or when its listpack would pass 4 KB (by default: see
 //! `stream-node-max-entries` and `stream-node-max-bytes`). Each chunk
 //! counts the bytes Redis' listpack would take, by Redis' encoding rules, so
 //! trimming with `~`, which removes whole nodes, removes what Redis does.
@@ -20,9 +20,40 @@ use std::sync::Arc;
 
 use crate::id_map::IdMap;
 
-/// Redis' defaults for `stream-node-max-entries` and `-max-bytes`.
-const NODE_MAX_ENTRIES: usize = 100;
-const NODE_MAX_BYTES: usize = 4096;
+/// What starts a new chunk: `stream-node-max-entries` (0: no limit) and
+/// `stream-node-max-bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeLimits {
+    pub entries: usize,
+    pub bytes: usize,
+}
+
+impl Default for NodeLimits {
+    /// Redis' defaults.
+    fn default() -> Self {
+        NodeLimits {
+            entries: 100,
+            bytes: 4096,
+        }
+    }
+}
+
+impl NodeLimits {
+    /// `stream-node-max-bytes` as it acts: 0 and what's beyond a listpack's limit mean that limit.
+    pub fn bytes_from_setting(bytes: usize) -> usize {
+        const MOST: usize = 1 << 30;
+        if bytes == 0 { MOST } else { bytes.min(MOST) }
+    }
+
+    /// How many entries `~` removes at most when not told: 100 nodes' worth, within limits.
+    pub fn default_trim_limit(self) -> usize {
+        match self.entries.saturating_mul(100) {
+            0 => 10_000,
+            limit => limit.min(1_000_000),
+        }
+    }
+}
+
 /// A whole entry in a chunk takes its fields from the chunk's first.
 const SAME_FIELDS: u8 = 1;
 /// A group's `entries_read` when it isn't known.
@@ -921,13 +952,14 @@ impl BigStream {
     }
 
     /// Adds an entry under `id` (from [`BigStream::next_id`]).
-    pub fn add(&mut self, id: StreamId, pairs: &[(&[u8], &[u8])]) {
+    pub fn add(&mut self, id: StreamId, pairs: &[(&[u8], &[u8])], limits: NodeLimits) {
         let raw: usize = pairs.iter().map(|(f, v)| f.len() + v.len()).sum();
         let starts_chunk = match self.chunks.back() {
             None => true,
             Some(chunk) => {
-                chunk.lp_bytes + raw >= NODE_MAX_BYTES
-                    || (chunk.live + chunk.deleted) as usize >= NODE_MAX_ENTRIES
+                chunk.lp_bytes + raw >= limits.bytes
+                    || (limits.entries != 0
+                        && (chunk.live + chunk.deleted) as usize >= limits.entries)
             }
         };
         if starts_chunk {
@@ -1337,7 +1369,6 @@ impl BigStream {
         for chunk in &self.chunks {
             assert_eq!(chunk.entries().count(), chunk.live as usize, "chunk count");
             assert!(chunk.first <= chunk.last && chunk.last <= self.last_id);
-            assert!((chunk.live + chunk.deleted) as usize <= NODE_MAX_ENTRIES);
             for (_, _, entry) in chunk.entries() {
                 assert!(previous.is_none_or(|p| entry.id > p), "ids in order");
                 assert!(entry.id >= chunk.first && entry.id <= chunk.last);
@@ -1382,7 +1413,7 @@ mod tests {
     fn groups_keep_their_books_and_come_back_from_their_bytes() {
         let mut stream = BigStream::default();
         for ms in 1..=5 {
-            stream.add(id(ms, 0), &[(b"f", b"v")]);
+            stream.add(id(ms, 0), &[(b"f", b"v")], NodeLimits::default());
         }
         assert!(!BigStream::compact_has_groups(&stream.to_compact()));
         let mut group = Group::new(id(3, 0), 3);
@@ -1435,7 +1466,7 @@ mod tests {
         for value in [&b"v"[..], &[b'v'; 32], &[b'v'; 700]] {
             let mut stream = BigStream::default();
             for ms in 1..=2_000 {
-                stream.add(id(ms, 0), &[(b"f", value)]);
+                stream.add(id(ms, 0), &[(b"f", value)], NodeLimits::default());
             }
             stream.check();
             let last = stream.chunks.len() - 1;
@@ -1460,7 +1491,7 @@ mod tests {
     fn radix_nodes_are_as_redis_counts_them() {
         let mut stream = BigStream::default();
         assert_eq!(stream.radix_nodes(), 1);
-        stream.add(id(1, 0), &[(b"f", b"v")]);
+        stream.add(id(1, 0), &[(b"f", b"v")], NodeLimits::default());
         // A run of 16 bytes, and the key it ends in.
         assert_eq!(stream.radix_nodes(), 2);
     }
@@ -1504,13 +1535,13 @@ mod tests {
         assert_eq!(s.next_id(Some((0, Some(0))), 0), Err(AddError::TooSmall));
         let first = s.next_id(None, 100).unwrap();
         assert_eq!(first, id(100, 0));
-        s.add(first, &[(b"f", b"v")]);
+        s.add(first, &[(b"f", b"v")], NodeLimits::default());
         assert_eq!(s.next_id(None, 50), Ok(id(100, 1)));
         assert_eq!(s.next_id(Some((100, None)), 0), Ok(id(100, 1)));
         assert_eq!(s.next_id(Some((101, None)), 0), Ok(id(101, 0)));
         assert_eq!(s.next_id(Some((99, None)), 0), Err(AddError::TooSmall));
         assert_eq!(s.next_id(Some((100, Some(0))), 0), Err(AddError::TooSmall));
-        s.add(StreamId::MAX, &[(b"f", b"v")]);
+        s.add(StreamId::MAX, &[(b"f", b"v")], NodeLimits::default());
         assert_eq!(s.next_id(Some((1, Some(1))), 0), Err(AddError::Exhausted));
     }
 
@@ -1528,7 +1559,7 @@ mod tests {
             let mut s = BigStream::default();
             let value = vec![b'x'; value_len];
             for i in 0..n {
-                s.add(id(i + 1, 1), &[(b"f", &value)]);
+                s.add(id(i + 1, 1), &[(b"f", &value)], NodeLimits::default());
             }
             assert_eq!(
                 s.trim(Trim::MaxLen(1), true, 10_000),
@@ -1544,9 +1575,13 @@ mod tests {
         for i in 1..=250u64 {
             let v = i.to_string();
             if i % 7 == 0 {
-                s.add(id(i, 0), &[(b"other", v.as_bytes()), (b"x", b"y")]);
+                s.add(
+                    id(i, 0),
+                    &[(b"other", v.as_bytes()), (b"x", b"y")],
+                    NodeLimits::default(),
+                );
             } else {
-                s.add(id(i, 0), &[(b"f", v.as_bytes())]);
+                s.add(id(i, 0), &[(b"f", v.as_bytes())], NodeLimits::default());
             }
         }
         let ids = |s: &BigStream, a, b, rev| {

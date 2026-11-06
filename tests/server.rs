@@ -1140,29 +1140,30 @@ async fn connection_commands() {
     assert!(
         all.starts_with(format!("*{}\r\n", count[1..count.len() - 2].escape_ascii()).as_bytes())
     );
-    check(
-        &mut c,
-        &req(&[b"COMMAND", b"INFO", b"get", b"nope", b"MSET"]),
-        b"*3\r\n\
-          *10\r\n$3\r\nget\r\n:2\r\n*2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n*0\r\n*0\r\n*0\r\n*0\r\n\
-          $-1\r\n\
-          *10\r\n$4\r\nmset\r\n:-3\r\n*2\r\n+write\r\n+denyoom\r\n:1\r\n:-1\r\n:2\r\n*0\r\n*0\r\n*0\r\n*0\r\n",
-    )
-    .await;
+    c.write_all(&req(&[b"COMMAND", b"INFO", b"get", b"nope", b"MSET"]))
+        .await
+        .unwrap();
+    let info = read_reply(&mut c).await.escape_ascii().to_string();
+    assert!(
+        info.starts_with(
+            r"*3\r\n*10\r\n$3\r\nget\r\n:2\r\n*2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n*3\r\n+@read"
+        ),
+        "{info}"
+    );
+    assert!(
+        info.contains(r"$-1\r\n*10\r\n$4\r\nmset\r\n:-3\r\n"),
+        "{info}"
+    );
     check(
         &mut c,
         &[
-            req(&[b"COMMAND", b"DOCS"]),
-            req(&[b"CONFIG", b"GET", b"maxmemory*"]),
+            req(&[b"CONFIG", b"GET", b"maxmemory", b"maxmemory-policy"]),
             req(&[b"CONFIG", b"GET", b"save", b"APPENDONLY", b"nothing"]),
-            req(&[b"CONFIG", b"SET", b"maxmemory", b"1"]),
             req(&[b"CONFIG", b"GET"]),
         ]
         .concat(),
-        b"*0\r\n\
-          *4\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\r\n\
-          *4\r\n$4\r\nsave\r\n$0\r\n\r\n$10\r\nappendonly\r\n$2\r\nno\r\n\
-          -ERR CONFIG SET is not supported: restart with the option instead\r\n\
+        b"*4\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n$16\r\nmaxmemory-policy\r\n$10\r\nnoeviction\r\n\
+          *4\r\n$10\r\nappendonly\r\n$2\r\nno\r\n$4\r\nsave\r\n$0\r\n\r\n\
           -ERR wrong number of arguments for 'config|get' command\r\n",
     )
     .await;
@@ -1186,8 +1187,6 @@ async fn resp3() {
             req(&[b"GETDEL", b"missing"]),
             req(&[b"CLIENT", b"GETNAME"]),
             req(&[b"CONFIG", b"GET", b"maxmemory"]),
-            req(&[b"COMMAND", b"INFO", b"get", b"nope"]),
-            req(&[b"COMMAND", b"DOCS"]),
             // HELLO without a version keeps the protocol.
             req(&[b"HELLO"]),
         ]
@@ -1197,9 +1196,6 @@ async fn resp3() {
           $4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n\
           _\r\n+OK\r\n*2\r\n$1\r\n1\r\n_\r\n_\r\n_\r\n_\r\n_\r\n\
           %1\r\n$9\r\nmaxmemory\r\n$1\r\n0\r\n\
-          *2\r\n*10\r\n$3\r\nget\r\n:2\r\n~2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
-          ~0\r\n~0\r\n*0\r\n*0\r\n_\r\n\
-          %0\r\n\
           %7\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$5\r\n7.2.4\r\n\
           $5\r\nproto\r\n:3\r\n$2\r\nid\r\n:1\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n\
           $4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n",

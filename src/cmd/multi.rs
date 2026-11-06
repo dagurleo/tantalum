@@ -17,7 +17,7 @@ pub(super) fn runs_in_multi(command: &str) -> bool {
 
 /// Commands Redis refuses inside a transaction.
 pub(super) fn refused_in_multi(command: &str) -> bool {
-    command == "save"
+    matches!(command, "save" | "monitor")
 }
 
 fn reply_error(out: &mut Vec<u8>, msg: &[u8]) -> Reply {
@@ -125,9 +125,14 @@ pub(super) fn exec(
             let args = queue.command(i);
             let command = find_command(args.get(0)).expect("checked when queued");
             let start = out.len();
-            match (command.run)(ctx, session, now, &args, out) {
+            let reply = if session.special {
+                super::watched_inside(ctx, session, now, command, &args, out)
+            } else {
+                super::timed(ctx, session, now, command, &args, out)
+            };
+            match reply {
                 Reply::Bulk(value) => resp::write_bulk(out, value.as_bytes()),
-                Reply::Written | Reply::Close | Reply::Block(_) => {}
+                Reply::Written | Reply::Close | Reply::Block(_) | Reply::Paused => {}
             }
             if command.writes() {
                 crate::aof::record(command.name, &args, &out[start..]);

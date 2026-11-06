@@ -42,7 +42,7 @@
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -141,6 +141,14 @@ pub enum EvictionPolicy {
 }
 
 impl EvictionPolicy {
+    fn from_u8(n: u8) -> Self {
+        match n {
+            n if n == EvictionPolicy::AllKeysLru as u8 => EvictionPolicy::AllKeysLru,
+            n if n == EvictionPolicy::VolatileLru as u8 => EvictionPolicy::VolatileLru,
+            _ => EvictionPolicy::NoEviction,
+        }
+    }
+
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "noeviction" => Some(Self::NoEviction),
@@ -183,6 +191,11 @@ pub struct Config {
     /// How many numbered databases there are (`SELECT`); 0 means 16, as in
     /// Redis.
     pub databases: usize,
+}
+
+/// What a key and a value of this size take, packed.
+pub(crate) fn entry_size(key_len: usize, value_len: usize) -> usize {
+    KeyValue::size_for(key_len, value_len)
 }
 
 /// A write was refused because it would exceed `maxmemory`.
@@ -1400,14 +1413,15 @@ pub struct Store {
     /// Loading data (replaying the append-only log): writes aren't held to
     /// `maxmemory`, as the evictions they made are in the log.
     loading: AtomicBool,
-    maxmemory: usize,
-    policy: EvictionPolicy,
+    /// `CONFIG SET` can change these two, in every database.
+    maxmemory: AtomicUsize,
+    policy: AtomicU8,
     /// Sum of all shards' flushed footprints.
     used: AtomicI64,
     /// Connection buffers, counted against `maxmemory` too (see
     /// [`Store::add_client_memory`]).
     client_memory: AtomicI64,
-    flush_bytes: usize,
+    flush_bytes: AtomicUsize,
     ready: Ready,
     /// Which numbered database this is (`SELECT`).
     index: u32,
@@ -1495,6 +1509,8 @@ struct Ready {
     keys: Mutex<Vec<(u32, Box<[u8]>)>>,
     /// Clients blocked right now.
     blocked: AtomicI64,
+    /// And what each is blocked in, for `CLIENT UNBLOCK`.
+    waiters: Mutex<HashMap<u64, Arc<Waiter>>>,
 }
 
 impl Store {
@@ -1553,16 +1569,65 @@ impl Store {
                 None => unix_now.saturating_sub(1),
             },
             loading: AtomicBool::new(false),
-            maxmemory: config.maxmemory,
-            policy: config.policy,
+            maxmemory: AtomicUsize::new(config.maxmemory),
+            policy: AtomicU8::new(config.policy as u8),
             used: AtomicI64::new(0),
             client_memory: AtomicI64::new(0),
-            flush_bytes,
+            flush_bytes: AtomicUsize::new(flush_bytes),
             ready: Ready::default(),
             index: 0,
             base: None,
             others: (1..databases).map(|_| OnceLock::new()).collect(),
         }
+    }
+
+    /// A new memory limit, in every database. What it takes to get under it is
+    /// evicted as writes come, or they're refused, by the policy.
+    pub(crate) fn set_maxmemory(&self, limit: usize) {
+        for db in self.live() {
+            db.maxmemory.store(limit, Relaxed);
+            let flush = match limit {
+                0 => MAX_FLUSH_BYTES,
+                limit => (limit / db.shards.len() / 64).min(MAX_FLUSH_BYTES),
+            };
+            db.flush_bytes.store(flush, Relaxed);
+        }
+    }
+
+    /// A new eviction policy, in every database.
+    pub(crate) fn set_policy(&self, policy: EvictionPolicy) {
+        for db in self.live() {
+            db.policy.store(policy as u8, Relaxed);
+        }
+    }
+
+    /// Forgets how many keys expired and were evicted, for `CONFIG RESETSTAT`.
+    pub(crate) fn reset_stats(&self) {
+        for db in self.live() {
+            for shard in db.shards.iter() {
+                let mut inner = db.lock(shard);
+                inner.mem.expired = 0;
+                inner.mem.evicted = 0;
+            }
+        }
+    }
+
+    /// Notes what a client is blocked in.
+    pub(crate) fn track_waiter(&self, waiter: &Arc<Waiter>) {
+        self.base()
+            .ready
+            .waiters
+            .lock()
+            .insert(waiter.client(), waiter.clone());
+    }
+
+    pub(crate) fn untrack_waiter(&self, client: u64) {
+        self.base().ready.waiters.lock().remove(&client);
+    }
+
+    /// What client `id` is blocked in, if anything.
+    pub(crate) fn waiter_of(&self, id: u64) -> Option<Arc<Waiter>> {
+        self.base().ready.waiters.lock().get(&id).cloned()
     }
 
     /// Database 0, for what it counts for all of them (see `base`).
@@ -1595,11 +1660,11 @@ impl Store {
                 clock_start: self.clock_start,
                 unix_base: self.unix_base,
                 loading: AtomicBool::new(false),
-                maxmemory: self.maxmemory,
-                policy: self.policy,
+                maxmemory: AtomicUsize::new(self.maxmemory()),
+                policy: AtomicU8::new(self.policy() as u8),
                 used: AtomicI64::new(0),
                 client_memory: AtomicI64::new(0),
-                flush_bytes: self.flush_bytes,
+                flush_bytes: AtomicUsize::new(self.flush_bytes.load(Relaxed)),
                 ready: Ready::default(),
                 index: index as u32,
                 base: Some(self.clone()),
@@ -1726,7 +1791,7 @@ impl Store {
 
     /// Whether usage is within 10% of `maxmemory`.
     fn near_limit(&self) -> bool {
-        self.maxmemory != 0 && self.used_memory() * 10 >= self.maxmemory * 9
+        self.maxmemory() != 0 && self.used_memory() * 10 >= self.maxmemory() * 9
     }
 
     /// `bytes` as a key, hashed.
@@ -1760,7 +1825,9 @@ impl Store {
         shard.table_buckets.store(buckets, Relaxed);
         inner.unflushed += footprint as isize - inner.reported as isize;
         inner.reported = footprint;
-        if inner.unflushed != 0 && (force || inner.unflushed.unsigned_abs() > self.flush_bytes) {
+        if inner.unflushed != 0
+            && (force || inner.unflushed.unsigned_abs() > self.flush_bytes.load(Relaxed))
+        {
             self.base().used.fetch_add(inner.unflushed as i64, Relaxed);
             inner.unflushed = 0;
         }
@@ -1951,7 +2018,7 @@ impl Store {
     ) -> Result<SetOutcome, OutOfMemory> {
         let (hash, index) = self.locate(key.hash);
         let key = key.bytes;
-        if self.maxmemory != 0 && KeyValue::size_for(key.len(), value.len()) > self.maxmemory {
+        if self.maxmemory() != 0 && KeyValue::size_for(key.len(), value.len()) > self.maxmemory() {
             // Can never fit; don't flush the cache trying.
             return Err(OutOfMemory);
         }
@@ -2015,12 +2082,12 @@ impl Store {
             // have. Never evict while holding our own shard's lock: drop it,
             // evict, and retry. After two tries, write anyway (bounded
             // overshoot) rather than fail under heavy concurrent writes.
-            if self.maxmemory != 0 && attempts < 2 {
+            if self.maxmemory() != 0 && attempts < 2 {
                 // Segment memory is counted as written pages, so the entry
                 // itself is what this write adds (a new segment's untouched
                 // capacity is free).
                 let needed = external_size + entry_len;
-                if self.used_memory() + needed > self.maxmemory
+                if self.used_memory() + needed > self.maxmemory()
                     && !self.base().loading.load(Relaxed)
                 {
                     drop(guard);
@@ -2179,8 +2246,8 @@ impl Store {
     /// allows.
     fn room_for(&self, home: usize, seed: u32, incoming: usize, now: Millis) -> bool {
         let incoming = incoming + 64;
-        self.maxmemory == 0
-            || self.used_memory() + incoming <= self.maxmemory
+        self.maxmemory() == 0
+            || self.used_memory() + incoming <= self.maxmemory()
             || self.base().loading.load(Relaxed)
             || self.make_room(home, seed, incoming, now)
     }
@@ -2464,8 +2531,8 @@ impl Store {
             None => segment::encoded_len(&Payload::Inline { key, value }, deadline),
         };
         if may_evict
-            && self.maxmemory != 0
-            && self.used_memory() + needed > self.maxmemory
+            && self.maxmemory() != 0
+            && self.used_memory() + needed > self.maxmemory()
             && !self.base().loading.load(Relaxed)
         {
             return Err(Retry::NeedRoom(needed));
@@ -2990,11 +3057,11 @@ impl Store {
     }
 
     pub fn maxmemory(&self) -> usize {
-        self.maxmemory
+        self.maxmemory.load(Relaxed)
     }
 
     pub fn policy(&self) -> EvictionPolicy {
-        self.policy
+        EvictionPolicy::from_u8(self.policy.load(Relaxed))
     }
 
     /// A deadline on the store clock as a Unix timestamp in milliseconds.
@@ -3019,7 +3086,7 @@ impl Store {
     }
 
     fn evict_for(&self, home: usize, seed: u32, incoming: usize, now: Millis) -> bool {
-        let volatile_only = match self.policy {
+        let volatile_only = match self.policy() {
             EvictionPolicy::NoEviction => return false,
             EvictionPolicy::AllKeysLru => false,
             EvictionPolicy::VolatileLru => true,
@@ -3033,7 +3100,7 @@ impl Store {
                 shard.footprint.load(Relaxed)
             }
         };
-        let needed = (self.used_memory() + incoming).saturating_sub(self.maxmemory);
+        let needed = (self.used_memory() + incoming).saturating_sub(self.maxmemory());
         let mut freed = 0;
         let mut rng = (u64::from(seed) << 1) | 1;
         // xorshift64: a cheap, good-enough source of shard choices.
@@ -3148,8 +3215,8 @@ impl Store {
     pub fn stats(&self) -> Stats {
         let client_bytes = self.base().client_memory.load(Relaxed).max(0) as usize;
         let mut stats = Stats {
-            maxmemory: self.maxmemory,
-            policy: self.policy,
+            maxmemory: self.maxmemory(),
+            policy: self.policy(),
             shards: self.shards.len(),
             used_memory: client_bytes,
             client_bytes,
@@ -3170,6 +3237,14 @@ impl Store {
             }
         }
         stats
+    }
+
+    /// What this database's table of keys takes.
+    pub fn table_bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| pages::reserved(self.lock(shard).table.allocation_size()))
+            .sum()
     }
 
     /// This database's keys, and how many of them have a TTL.

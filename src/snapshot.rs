@@ -780,7 +780,7 @@ mod tests {
         let id = |ms| StreamId { ms, seq: 0 };
         let mut stream = BigStream::default();
         for ms in 1..=250 {
-            stream.add(id(ms), &[(b"f", b"v")]);
+            stream.add(id(ms), &[(b"f", b"v")], Default::default());
         }
         stream.delete(id(2));
         let mut group = Group::new(id(5), 5);
@@ -862,7 +862,11 @@ mod tests {
         use crate::stream::{BigStream, StreamId};
         let path = temp_path("streams-v4");
         let mut stream = BigStream::default();
-        stream.add(StreamId { ms: 7, seq: 1 }, &[(b"f", b"v")]);
+        stream.add(
+            StreamId { ms: 7, seq: 1 },
+            &[(b"f", b"v")],
+            Default::default(),
+        );
         let value = stream.to_compact();
         assert!(!BigStream::compact_has_groups(&value));
         let mut record = vec![STREAM];
@@ -914,12 +918,20 @@ mod tests {
         let mut stream = BigStream::default();
         for i in 1..=350u64 {
             let value = "v".repeat((i % 40) as usize);
-            stream.add(StreamId { ms: i, seq: 0 }, &[(b"f", value.as_bytes())]);
+            stream.add(
+                StreamId { ms: i, seq: 0 },
+                &[(b"f", value.as_bytes())],
+                Default::default(),
+            );
         }
         stream.delete(StreamId { ms: 120, seq: 0 });
         stream.trim(Trim::MaxLen(300), false, 0);
         let mut empty = BigStream::default();
-        empty.add(StreamId { ms: 9, seq: 9 }, &[(b"a", b"b")]);
+        empty.add(
+            StreamId { ms: 9, seq: 9 },
+            &[(b"a", b"b")],
+            Default::default(),
+        );
         empty.trim(Trim::MaxLen(0), false, 0);
         for (key, value) in [(&b"s"[..], stream.clone()), (b"empty", empty)] {
             let mut made = Some(Collection::Stream(value));
