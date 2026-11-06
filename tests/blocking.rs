@@ -140,11 +140,11 @@ async fn replies_match_redis() {
 /// Waits until `n` clients are blocked.
 async fn blocked(ctx: &Context, n: usize) {
     let start = Instant::now();
-    while ctx.store.blocked_clients() != n {
+    while ctx.store.clients_waiting() != n {
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "{} blocked, not {n}",
-            ctx.store.blocked_clients()
+            ctx.store.clients_waiting()
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }

@@ -263,7 +263,7 @@ async fn resp3_subscribers_run_commands_too() {
         assert_eq!(c.call(&["GET", "k"]).await, "$1\r\nv\r\n");
         // Messages still come while a command blocks.
         c.send(&["BLPOP", "q", "0"]).await;
-        until("it blocks", || ctx.store.blocked_clients() == 1).await;
+        until("it blocks", || ctx.store.clients_waiting() == 1).await;
         publisher.call(&["PUBLISH", "ch", "m2"]).await;
         let push = format!(">3\r\n$7\r\nmessage\r\n{}{}", bulk("ch"), bulk("m2"));
         assert_eq!(c.reply().await, push, "{mode:?}");

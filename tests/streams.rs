@@ -204,12 +204,12 @@ async fn random_commands_match_redis() {
 
 async fn blocked(ctx: &Context, n: usize) {
     for _ in 0..1000 {
-        if ctx.store.blocked_clients() == n {
+        if ctx.store.clients_waiting() == n {
             return;
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    panic!("{} blocked, not {n}", ctx.store.blocked_clients());
+    panic!("{} blocked, not {n}", ctx.store.clients_waiting());
 }
 
 fn entry(id: &str, pairs: &[&str]) -> String {
