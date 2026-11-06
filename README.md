@@ -784,6 +784,64 @@ caps the accounted memory. `--maxmemory-policy` decides what happens at the cap:
 
 ## Benchmarks
 
+### Everyday apps (Agent37 VM, November 2026)
+
+What people use Redis for, rather than one command on its own. Tantalum 0.24.0,
+Redis 8.10.3 and Valkey 9.1.3, each on one core of a 4-vCPU Xeon E-2388G, with
+memtier (3 × 80 clients) on the other three, persistence off, 1M items. Thousands
+of ops/s, medians of 3 rotated rounds of 12 s, the best in each row in bold
+(`bench/showcase/run.sh`, about 35 minutes, `summary.py` for the tables; raw
+output: `bench/showcase/results-agent37.txt`). "vs Redis" is Tantalum on epoll.
+
+| Example | Pipeline | Tantalum | Tantalum, io_uring | Redis | Valkey | vs Redis |
+|---|---|---|---|---|---|---|
+| Login sessions: a 5-field hash each, mostly `HGETALL` | 1 | 303 | **314** | 253 | 218 | +19.8% |
+| | 16 | **2,021** | 1,995 | 1,003 | 784 | +101.6% |
+| Event stream: `XADD` capped at 1M, `XREVRANGE` of the latest | 1 | 239 | **254** | 169 | 167 | +41.5% |
+| | 16 | 619 | **652** | 319 | 345 | +94.1% |
+| Page cache: 1 KB values with TTLs, 9 reads to a write | 1 | 281 | **290** | 257 | 259 | +9.1% |
+| | 16 | 1,115 | **1,290** | 1,094 | 1,068 | +1.9% |
+| Leaderboard: one sorted set of 1M players | 1 | 245 | **252** | 238 | 239 | +2.9% |
+| | 16 | 714 | 707 | 699 | **726** | +2.1% |
+| Activity feeds: lists of the latest 50, `LRANGE` of 20 | 1 | 255 | **264** | 248 | 251 | +2.8% |
+| | 16 | 735 | 841 | **876** | 847 | -16.2% |
+| Rate limiter: a Lua script doing `INCR` and `EXPIRE` | 1 | 149 | 156 | **220** | 209 | -32.3% |
+| | 16 | 252 | 256 | **624** | 556 | -59.7% |
+
+The job queue is the real BullMQ 6.5.4 (`bench/bullmq/run.sh`, 100,000 jobs, three
+Node workers, medians of 3 rounds), in thousands of jobs/s. Tantalum's server used
+0.85 of its core processing, as the workers limit the rate, and Redis' 0.97. A job,
+added and processed, cost the server 17.3 µs of CPU, Redis 47.9 and Valkey 52.9.
+
+| BullMQ | Tantalum | Tantalum, io_uring | Redis | Valkey | vs Redis |
+|---|---|---|---|---|---|
+| Adding jobs | **59.6** | 59.2 | 37.4 | 35.6 | +59.5% |
+| Processing jobs | 66.4 | **68.3** | 29.6 | 26.9 | +124.6% |
+
+Memory for the same data, RSS after the fill, in MB:
+
+| Example | Tantalum | Redis | Valkey | vs Redis |
+|---|---|---|---|---|
+| Page cache | **1,025** | 1,322 | 1,329 | -22.5% |
+| Login sessions | **155** | 195 | 196 | -20.6% |
+| Leaderboard | **53** | 83 | 83 | -35.6% |
+| Activity feeds | **185** | 190 | 189 | -2.5% |
+| Event stream | **48** | 54 | 54 | -10.8% |
+
+Two examples lose. **The rate limiter** because a Lua script takes every shard's
+lock first, as it may touch keys it didn't declare: with the default 256 shards
+that's about 2.5 µs a call. In a later run on a slower spell of the VM, Redis did
+183k and 608k, Tantalum with its 256 shards 144k and 245k, with `--shards 16` 191k
+and 611k, and with `--shards 1` 199k and 644k. What fewer shards cost elsewhere is
+unmeasured, so the default stays for now. BullMQ's scripts avoid this by running
+natively. **Activity feeds at pipeline 16** lose on epoll and by 4% on io_uring,
+cause not looked into yet.
+
+An error reply is the fastest reply there is, so `run.sh` asks every server the same
+questions after filling it, and `summary.py` compares the bytes each server sent per
+command: nothing differed here. These runs are at saturation and show what one core
+can do; an app far below that sees the memory saved, and little else.
+
 ### Linux (Railway, November 2026)
 
 Railway containers with a 32-vCPU limit, all servers and the client in one
@@ -1167,6 +1225,9 @@ hit rates share the seeding flaw described above.
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
   the 209 commands that are here (1, which expects over 300).
+- **Lua scripts are behind Redis**: each takes all 256 shard locks, about 2.5 µs a
+  call, so a rate limiter does 32-60% less than on Redis (see "Everyday apps").
+  Scripts BullMQ uses most run natively and don't pay it.
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
