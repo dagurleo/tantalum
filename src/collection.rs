@@ -14,7 +14,8 @@ pub enum Collection {
     Hash(BigHash),
     List(BigList),
     Set(BigSet),
-    ZSet(BigZSet),
+    /// Boxed, to leave the others' places as small as they can be.
+    ZSet(Box<BigZSet>),
     Stream(BigStream),
 }
 
@@ -69,7 +70,7 @@ impl Collection {
             Kind::Hash => Collection::Hash(BigHash::from_packed(bytes)),
             Kind::List => Collection::List(BigList::from_packed(bytes)),
             Kind::Set => Collection::Set(BigSet::from_compact(bytes)),
-            Kind::ZSet => Collection::ZSet(BigZSet::from_packed(bytes)),
+            Kind::ZSet => Collection::ZSet(Box::new(BigZSet::from_packed(bytes))),
             Kind::Stream => {
                 Collection::Stream(BigStream::from_compact(bytes).expect("a valid stream"))
             }

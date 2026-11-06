@@ -16,8 +16,7 @@ use std::borrow::Cow;
 
 use std::hash::BuildHasher;
 
-use hashbrown::HashTable;
-
+use crate::big::{Address, Index, Listed, Paged, Records};
 use crate::resp;
 
 /// Redis' `set-max-intset-entries`.
@@ -219,21 +218,19 @@ pub fn fits_compact(bytes: &[u8]) -> bool {
     }
 }
 
-/// A big set, kept compact: its members back to back in one buffer, each
-/// a varint length and bytes; their offsets in a list, whose order is the
-/// set's (so a random member, or a position to scan from, is O(1)); and a
-/// hash table of positions in that list. About 18 bytes per member besides
-/// its own (Redis 7.2 takes about 29 for short ones), plus growth room.
-/// Removing a member moves the last one into its place, as `swap_remove`
-/// does, and leaves its bytes as a hole until holes are half the buffer.
+/// A big set, kept compact: its members in [`Records`], each a varint length and
+/// bytes; their addresses in a list, whose order is the set's (so a random member, or
+/// a position to scan from, is O(1)); and an [`Index`] of positions in that list.
+/// None of them stops to grow (see [`crate::big`]). About 18 bytes per member besides
+/// its own (Redis 7.2 takes about 29 for short ones), plus growth room. Removing a
+/// member moves the last one into its place, as `swap_remove` does, and leaves its
+/// bytes as a hole.
 #[derive(Clone)]
 pub struct BigSet {
-    bytes: Vec<u8>,
-    offsets: Vec<u32>,
-    index: HashTable<u32>,
+    records: Records,
+    offsets: Paged<u32>,
+    index: Index,
     hasher: foldhash::fast::FixedState,
-    /// Bytes of removed members still in `bytes`.
-    holes: usize,
 }
 
 impl Default for BigSet {
@@ -242,20 +239,56 @@ impl Default for BigSet {
     }
 }
 
-fn read_member(bytes: &[u8], offset: u32) -> &[u8] {
-    let mut at = &bytes[offset as usize..];
+impl Address for u32 {
+    #[inline]
+    fn new(at: usize) -> Self {
+        u32::try_from(at).expect("a big set under 4 GB")
+    }
+
+    #[inline]
+    fn get(self) -> usize {
+        self as usize
+    }
+}
+
+#[inline]
+fn read_member(records: &Records, offset: u32) -> &[u8] {
+    let mut at = records.at(offset as usize);
     let len = take_varint(&mut at).expect("a member") as usize;
     &at[..len]
+}
+
+/// What an [`Index`] needs to hash the member at a position.
+#[inline]
+fn listed<'a>(
+    records: &'a Records,
+    offsets: &'a Paged<u32>,
+    hasher: &'a foldhash::fast::FixedState,
+) -> Listed<'a, u32, impl Fn(&[u8]) -> u64 + 'a> {
+    Listed {
+        records,
+        list: offsets,
+        hash_of: move |mut bytes: &[u8]| {
+            let len = take_varint(&mut bytes).expect("a member") as usize;
+            hasher.hash_one(&bytes[..len])
+        },
+    }
+}
+
+/// A record's length, from its bytes.
+fn size_of_record(bytes: &[u8]) -> usize {
+    let mut at = bytes;
+    let len = take_varint(&mut at).expect("a member") as usize;
+    bytes.len() - at.len() + len
 }
 
 impl BigSet {
     pub fn with_capacity(n: usize) -> Self {
         BigSet {
-            bytes: Vec::new(),
-            offsets: Vec::with_capacity(n),
-            index: HashTable::with_capacity(n),
+            records: Records::default(),
+            offsets: Paged::with_capacity(n),
+            index: Index::with_capacity(n),
             hasher: foldhash::fast::FixedState::with_seed(random_seed()),
-            holes: 0,
         }
     }
 
@@ -268,22 +301,26 @@ impl BigSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.offsets.len() == 0
     }
 
     /// The member at position `i`.
     pub fn get_index(&self, i: usize) -> &[u8] {
-        read_member(&self.bytes, self.offsets[i])
+        read_member(&self.records, self.offsets.get(i))
+    }
+
+    fn find(&self, hash: u64, member: &[u8]) -> Option<usize> {
+        let (records, offsets) = (&self.records, &self.offsets);
+        self.index
+            .find(hash, |i| {
+                read_member(records, offsets.get(i as usize)) == member
+            })
+            .map(|i| i as usize)
     }
 
     /// Where `member` is in the set's order.
     pub fn position(&self, member: &[u8]) -> Option<usize> {
-        let (bytes, offsets) = (&self.bytes, &self.offsets);
-        self.index
-            .find(self.hash(member), |&i| {
-                read_member(bytes, offsets[i as usize]) == member
-            })
-            .map(|&i| i as usize)
+        self.find(self.hash(member), member)
     }
 
     pub fn contains(&self, member: &[u8]) -> bool {
@@ -293,85 +330,82 @@ impl BigSet {
     /// Adds `member`; returns whether it's new.
     pub fn insert(&mut self, member: &[u8]) -> bool {
         let hash = self.hash(member);
-        let (bytes, offsets) = (&self.bytes, &self.offsets);
-        if self
-            .index
-            .find(hash, |&i| read_member(bytes, offsets[i as usize]) == member)
-            .is_some()
-        {
+        if self.find(hash, member).is_some() {
             return false;
         }
-        let offset = u32::try_from(self.bytes.len()).expect("a big set under 4 GB");
-        put_varint(&mut self.bytes, member.len() as u64);
-        self.bytes.extend_from_slice(member);
-        self.offsets.push(offset);
+        let (at, bytes) = self.records.append(varint_len(member.len()) + member.len());
+        put_varint(bytes, member.len() as u64);
+        bytes.extend_from_slice(member);
+        self.offsets.push(u32::new(at));
         let position = (self.offsets.len() - 1) as u32;
-        let (bytes, offsets, hasher) = (&self.bytes, &self.offsets, &self.hasher);
-        self.index.insert_unique(hash, position, |&i| {
-            hasher.hash_one(read_member(bytes, offsets[i as usize]))
-        });
+        self.index.insert(
+            hash,
+            position,
+            &listed(&self.records, &self.offsets, &self.hasher),
+        );
         true
     }
 
     /// Removes `member`; returns whether it was there.
     pub fn remove(&mut self, member: &[u8]) -> bool {
-        match self.position(member) {
-            Some(i) => {
-                self.swap_remove_index(i);
-                true
-            }
-            None => false,
-        }
+        let hash = self.hash(member);
+        let (records, offsets) = (&self.records, &self.offsets);
+        let found = self.index.take(
+            hash,
+            |i| read_member(records, offsets.get(i as usize)) == member,
+            &listed(records, offsets, &self.hasher),
+        );
+        let Some(i) = found else {
+            return false;
+        };
+        self.forget(i as usize, varint_len(member.len()) + member.len());
+        true
     }
 
     /// Removes the member at position `i`, moving the last one there.
+    pub fn remove_at(&mut self, i: usize) {
+        let member = self.get_index(i);
+        let (hash, size) = (self.hash(member), varint_len(member.len()) + member.len());
+        self.index.remove(
+            hash,
+            i as u32,
+            &listed(&self.records, &self.offsets, &self.hasher),
+        );
+        self.forget(i, size);
+    }
+
+    /// The same, returning the member.
     pub fn swap_remove_index(&mut self, i: usize) -> Vec<u8> {
         let member = self.get_index(i).to_vec();
-        let hash = self.hash(&member);
-        let found = self.index.find_entry(hash, |&p| p as usize == i);
-        found.expect("indexed").remove();
+        self.remove_at(i);
+        member
+    }
+
+    /// Lets go of position `i`, of `size` bytes, which the index no longer has, moving
+    /// the last one there.
+    fn forget(&mut self, i: usize, size: usize) {
+        self.records.hole(self.offsets.get(i) as usize, size);
         let last = self.offsets.len() - 1;
         if i != last {
             // The last member takes position `i`.
             let moved = self.hash(self.get_index(last));
-            *self
-                .index
-                .find_mut(moved, |&p| p as usize == last)
-                .expect("indexed") = i as u32;
+            self.index.replace(moved, last as u32, i as u32);
         }
         self.offsets.swap_remove(i);
-        self.holes += varint_len(member.len()) + member.len();
-        if self.holes > 4096 && self.holes * 2 > self.bytes.len() {
-            self.compact();
-        }
-        member
-    }
-
-    /// Writes the members again without the holes; positions stay.
-    fn compact(&mut self) {
-        let mut bytes = Vec::with_capacity(self.bytes.len() - self.holes);
-        for offset in &mut self.offsets {
-            let member = read_member(&self.bytes, *offset);
-            *offset = bytes.len() as u32;
-            put_varint(&mut bytes, member.len() as u64);
-            bytes.extend_from_slice(member);
-        }
-        self.bytes = bytes;
-        self.holes = 0;
+        self.records.tidy(&mut self.offsets, size_of_record);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
-        self.offsets.iter().map(|&o| read_member(&self.bytes, o))
+        self.offsets
+            .iter()
+            .map(|&offset| read_member(&self.records, offset))
     }
 
-    /// Memory it takes: the buffers' capacity, and the table's buckets (a
-    /// position and a control byte each; at most 7/8 full, a power of two).
+    /// Memory it takes.
     pub fn allocation_size(&self) -> usize {
-        let buckets = match self.index.capacity() {
-            0 => 0,
-            n => (n * 8 / 7).next_power_of_two(),
-        };
-        self.bytes.capacity() + self.offsets.capacity() * 4 + buckets * 5
+        self.records.allocation_size()
+            + self.offsets.allocation_size()
+            + self.index.allocation_size()
     }
 
     pub fn to_compact(&self) -> Vec<u8> {

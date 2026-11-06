@@ -81,7 +81,7 @@ fn store_update(set: BigZSet) -> Update {
     } else if set.fits_packed() {
         Update::Replace(Kind::ZSet, set.to_packed())
     } else {
-        Update::Object(Collection::ZSet(set))
+        Update::Object(Collection::ZSet(Box::new(set)))
     }
 }
 

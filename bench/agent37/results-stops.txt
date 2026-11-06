@@ -1,0 +1,260 @@
+# 2026-11-06, Agent37 VM (Xeon E-2388G), one server core. 0.22.3 ("old") against 0.22.4
+# ("new"), whose big hashes, sets and sorted sets don't stop to grow, Redis 7.2.4 and
+# Valkey, all in one session. bench/agent37/stops.py, setsizes.py, memtypes.py, memtier.
+# "longest": the four longest batches of 500, in ms, @ where they were; "usual": the median
+# batch; "all": the whole fill or removal of three in four, client's own time included.
+
+== stops
+old        hash    fill   longest 657.6@7.34M 292.9@3.67M 156.7@1.83M 80.4@5.38M, over 5 ms: 13, usual 0.20 ms, all 12.1 s
+old        hash    empty  longest 231.5@4.00M 6.4@3.27M 3.7@3.27M 2.5@4.76M, over 5 ms: 2, usual 0.34 ms, all 9.2 s
+new        hash    fill   longest 2.7@7.61M 2.7@7.34M 2.6@3.67M 2.4@7.54M, over 5 ms: 0, usual 0.20 ms, all 11.1 s
+new        hash    empty  longest 3.4@5.16M 3.1@4.85M 2.8@4.88M 2.8@4.88M, over 5 ms: 0, usual 0.37 ms, all 9.7 s
+redis      hash    fill   longest 2.8@0.48M 2.7@6.85M 2.3@7.45M 2.2@6.36M, over 5 ms: 0, usual 0.46 ms, all 14.6 s
+redis      hash    empty  longest 3.7@0.48M 2.4@4.33M 2.4@5.61M 1.9@4.35M, over 5 ms: 0, usual 0.38 ms, all 9.5 s
+valkey     hash    fill   longest 2.4@1.73M 2.3@1.26M 2.3@1.83M 2.1@7.34M, over 5 ms: 0, usual 0.52 ms, all 16.7 s
+valkey     hash    empty  longest 2.8@5.62M 2.7@5.61M 2.7@5.60M 2.5@5.61M, over 5 ms: 0, usual 0.40 ms, all 10.2 s
+old        set     fill   longest 884.1@7.34M 405.7@3.67M 171.9@1.83M 65.7@0.92M, over 5 ms: 10, usual 0.20 ms, all 11.3 s
+old        set     empty  longest 97.9@4.00M 3.2@4.79M 2.0@0.05M 1.0@1.09M, over 5 ms: 1, usual 0.46 ms, all 10.5 s
+new        set     fill   longest 4.2@3.67M 3.8@7.38M 3.2@7.33M 3.2@7.37M, over 5 ms: 0, usual 0.20 ms, all 10.3 s
+new        set     empty  longest 3.7@4.87M 3.6@4.86M 3.3@4.85M 3.3@4.87M, over 5 ms: 0, usual 0.37 ms, all 9.8 s
+redis      set     fill   longest 2.8@6.63M 1.8@4.19M 1.7@4.20M 1.6@4.20M, over 5 ms: 0, usual 0.44 ms, all 13.0 s
+redis      set     empty  longest 3.0@0.46M 2.9@0.47M 2.4@0.49M 1.9@0.45M, over 5 ms: 0, usual 0.38 ms, all 9.4 s
+valkey     set     fill   longest 4.1@0.22M 2.2@1.35M 2.2@0.23M 2.0@7.34M, over 5 ms: 0, usual 0.33 ms, all 13.5 s
+valkey     set     empty  longest 1.9@5.55M 1.7@0.46M 1.3@0.02M 1.3@0.01M, over 5 ms: 0, usual 0.39 ms, all 10.0 s
+old        zset    fill   longest 865.4@7.34M 404.6@3.67M 172.9@1.83M 65.7@0.92M, over 5 ms: 11, usual 0.80 ms, all 23.4 s
+old        zset    empty  longest 101.9@4.00M 5.9@4.33M 4.8@4.33M 4.5@5.88M, over 5 ms: 2, usual 1.98 ms, all 29.5 s
+new        zset    fill   longest 5.0@7.31M 4.6@3.65M 4.2@4.32M 3.9@4.32M, over 5 ms: 1, usual 0.68 ms, all 20.3 s
+new        zset    empty  longest 8.1@4.85M 6.5@4.85M 5.7@4.85M 5.5@4.89M, over 5 ms: 8, usual 1.69 ms, all 26.5 s
+redis      zset    fill   longest 5.2@3.53M 2.7@4.20M 2.7@4.19M 2.7@4.20M, over 5 ms: 1, usual 1.12 ms, all 26.7 s
+redis      zset    empty  longest 5.7@0.25M 5.0@0.25M 4.9@2.86M 4.8@0.50M, over 5 ms: 2, usual 1.46 ms, all 22.9 s
+valkey     zset    fill   longest 4.4@7.88M 3.9@7.37M 3.5@7.34M 3.5@7.34M, over 5 ms: 0, usual 1.05 ms, all 26.5 s
+valkey     zset    empty  longest 7.9@5.71M 5.9@5.71M 5.7@5.03M 5.5@5.71M, over 5 ms: 5, usual 1.51 ms, all 23.4 s
+== memory: RSS per item at each size, settled
+-- hash
+old        0.5M  72.6  1M  69.2  2M  67.3  3M  63.2  4M  66.1  6M  62.5  8M  65.8   longest batch 647 ms
+new        0.5M  71.8  1M  68.0  2M  67.2  3M  63.2  4M  66.9  6M  62.9  8M  66.6   longest batch 5 ms
+redis      0.5M  75.6  1M  75.3  2M  73.0  3M  78.6  4M  70.8  6M  78.5  8M  70.7   longest batch 6 ms
+valkey     0.5M  80.5  1M  80.2  2M  80.0  3M  70.2  4M  79.9  6M  70.1  8M  79.9   longest batch 8 ms
+-- set
+old        0.5M  54.1  1M  50.3  2M  49.7  3M  45.3  4M  48.2  6M  44.5  8M  47.8   longest batch 857 ms
+new        0.5M  53.9  1M  50.1  2M  49.2  3M  45.2  4M  49.0  6M  45.0  8M  48.6   longest batch 4 ms
+redis      0.5M  59.7  1M  61.4  2M  57.0  3M  64.0  4M  54.7  6M  62.5  8M  54.7   longest batch 6 ms
+valkey     0.5M  64.8  1M  64.3  2M  64.1  3M  54.2  4M  63.9  6M  54.2  8M  63.9   longest batch 8 ms
+== memory: used_memory and RSS per item
+hash        old       used_memory/item  105.5  RSS/item  111.8   slope: used  116.1  RSS  130.6
+hash        new       used_memory/item   62.3  RSS/item   63.3   slope: used   60.5  RSS   61.4
+set         old       used_memory/item   58.7  RSS/item   73.9   slope: used   63.4  RSS   83.0
+set         new       used_memory/item   44.6  RSS/item   45.2   slope: used   42.7  RSS   42.8
+zset        old       used_memory/item   75.2  RSS/item   67.4   slope: used   81.4  RSS   65.2
+zset        new       used_memory/item   57.9  RSS/item   63.6   slope: used   56.0  RSS   61.4
+== speed, 1M items in one key
+
+# Speed, 1M items in one key: medians of 3 rounds, order rotated, 3x80 clients on the other cores.
+test       P        redis    valkey       old       new  new/old vs redis vs valkey   p99 r/v/o/n
+hget       P1     298,655   297,381   324,417   327,276    +0.9%    +9.6%    +10.1%   1.56/1.57/1.09/1.12
+hget       P16  1,657,232 1,686,805 2,267,380 2,286,086    +0.8%   +37.9%    +35.5%   3.62/3.50/2.59/2.61
+hset       P1     294,764   281,131   317,228   322,205    +1.6%    +9.3%    +14.6%   1.58/1.65/1.15/1.09
+hset       P16  1,495,568 1,383,744 2,141,939 2,097,845    -2.1%   +40.3%    +51.6%   4.13/3.87/2.85/2.94
+sismember  P1     302,678   293,074   323,311   321,819    -0.5%    +6.3%     +9.8%   1.53/1.58/1.14/1.13
+sismember  P16  1,769,497 1,789,634 2,372,573 2,288,912    -3.5%   +29.4%    +27.9%   3.60/3.02/2.53/2.65
+sadd       P1     301,888   298,668   325,125   318,457    -2.1%    +5.5%     +6.6%   1.53/1.55/1.10/1.16
+sadd       P16  1,798,952 1,790,463 2,275,028 2,362,382    +3.8%   +31.3%    +31.9%   3.29/3.01/2.73/2.37
+zscore     P1     299,735   299,936   326,441   320,545    -1.8%    +6.9%     +6.9%   1.57/1.56/1.08/1.13
+zscore     P16  1,785,883 1,705,457 2,237,314 2,212,126    -1.1%   +23.9%    +29.7%   3.04/3.31/2.59/2.53
+zadd       P1     290,435   284,960   315,266   316,933    +0.5%    +9.1%    +11.2%   1.59/1.63/1.14/1.14
+zadd       P16  1,516,262 1,475,497 2,047,165 2,050,575    +0.2%   +35.2%    +39.0%   3.76/3.66/2.83/2.75
+
+# Instructions and cycles of the server's own code per command, perf stat, 4M fields, on the
+# build before removal was changed (reading and adding are the same code). Two rounds.
+old   fill   instr   2730  cycles   1474  ipc 1.85  dTLB misses  3.43  faults per 1k 34.01
+old   get    instr   1815  cycles   1952  ipc 0.93  dTLB misses  3.81  faults per 1k  0.01
+old   get    instr   1815  cycles   1958  ipc 0.93  dTLB misses  3.82  faults per 1k  0.00
+Rss: 266528 kB AnonHugePages: 4096 kB
+new   fill   instr   3005  cycles   1361  ipc 2.21  dTLB misses  3.43  faults per 1k 16.51
+new   get    instr   1831  cycles   2074  ipc 0.88  dTLB misses  3.81  faults per 1k  0.00
+new   get    instr   1831  cycles   2079  ipc 0.88  dTLB misses  3.81  faults per 1k  0.00
+Rss: 270536 kB AnonHugePages: 4096 kB
+old   fill   instr   2747  cycles   1476  ipc 1.86  dTLB misses  3.42  faults per 1k 32.47
+old   get    instr   1832  cycles   1990  ipc 0.92  dTLB misses  3.81  faults per 1k  0.01
+old   get    instr   1832  cycles   1983  ipc 0.92  dTLB misses  3.80  faults per 1k  0.00
+Rss: 270540 kB AnonHugePages: 4096 kB
+new   fill   instr   3005  cycles   1366  ipc 2.20  dTLB misses  3.43  faults per 1k 16.51
+new   get    instr   1831  cycles   2036  ipc 0.90  dTLB misses  3.81  faults per 1k  0.01
+new   get    instr   1831  cycles   2033  ipc 0.90  dTLB misses  3.81  faults per 1k  0.00
+Rss: 270536 kB AnonHugePages: 4096 kB
+
+# Every kind on 0.22.3 first, before any of this, with the same script: strings, lists and
+# streams never stopped, so they didn't change.
+tantalum   string  fill   longest     2.4 ms at  2.96M, over 5 ms:     0, usual batch  0.16 ms, all   9.5 s
+redis      string  fill   longest     3.7 ms at  6.54M, over 5 ms:     0, usual batch  0.36 ms, all  12.1 s
+valkey     string  fill   longest     3.9 ms at  7.44M, over 5 ms:     0, usual batch  0.31 ms, all  13.1 s
+tantalum   hash    fill   longest   596.6 ms at  7.34M, over 5 ms:    12, usual batch  0.19 ms, all  11.6 s
+tantalum   hash    empty  longest   214.0 ms at  4.00M, over 5 ms:     1, usual batch  0.32 ms, all   9.0 s
+redis      hash    fill   longest     2.5 ms at  4.25M, over 5 ms:     0, usual batch  0.53 ms, all  15.9 s
+redis      hash    empty  longest     2.8 ms at  1.81M, over 5 ms:     0, usual batch  0.39 ms, all   9.6 s
+valkey     hash    fill   longest     7.5 ms at  0.06M, over 5 ms:     1, usual batch  0.39 ms, all  15.6 s
+valkey     hash    empty  longest     2.8 ms at  2.59M, over 5 ms:     0, usual batch  0.39 ms, all  10.0 s
+tantalum   set     fill   longest   829.5 ms at  7.34M, over 5 ms:    10, usual batch  0.19 ms, all  11.0 s
+tantalum   set     empty  longest    96.9 ms at  4.00M, over 5 ms:     2, usual batch  0.44 ms, all  10.5 s
+redis      set     fill   longest     3.6 ms at  6.15M, over 5 ms:     0, usual batch  0.43 ms, all  13.0 s
+redis      set     empty  longest     3.8 ms at  2.89M, over 5 ms:     0, usual batch  0.37 ms, all   9.3 s
+valkey     set     fill   longest     4.0 ms at  5.06M, over 5 ms:     0, usual batch  0.35 ms, all  13.7 s
+valkey     set     empty  longest     3.0 ms at  0.96M, over 5 ms:     0, usual batch  0.39 ms, all   9.9 s
+tantalum   zset    fill   longest   852.0 ms at  7.34M, over 5 ms:    11, usual batch  0.74 ms, all  22.6 s
+tantalum   zset    empty  longest    95.8 ms at  4.00M, over 5 ms:     2, usual batch  1.81 ms, all  27.4 s
+redis      zset    fill   longest     4.9 ms at  2.66M, over 5 ms:     0, usual batch  1.09 ms, all  25.9 s
+redis      zset    empty  longest     2.7 ms at  1.39M, over 5 ms:     0, usual batch  1.36 ms, all  22.0 s
+valkey     zset    fill   longest     5.2 ms at  6.49M, over 5 ms:     1, usual batch  1.02 ms, all  26.1 s
+valkey     zset    empty  longest     4.7 ms at  2.04M, over 5 ms:     0, usual batch  1.40 ms, all  22.0 s
+tantalum   list    fill   longest     2.8 ms at  7.78M, over 5 ms:     0, usual batch  0.12 ms, all   7.7 s
+redis      list    fill   longest     2.3 ms at  7.02M, over 5 ms:     0, usual batch  0.22 ms, all  10.0 s
+valkey     list    fill   longest     2.9 ms at  0.78M, over 5 ms:     0, usual batch  0.27 ms, all  10.3 s
+tantalum   stream  fill   longest     3.6 ms at  6.79M, over 5 ms:     0, usual batch  0.16 ms, all  11.0 s
+redis      stream  fill   longest     3.3 ms at  0.17M, over 5 ms:     0, usual batch  0.45 ms, all  15.5 s
+valkey     stream  fill   longest     3.0 ms at  5.21M, over 5 ms:     0, usual batch  0.48 ms, all  16.1 s
+
+# Raw rounds.
+round 1 valkey  hget       P1        295,777 ops/s  p50 0.77500  p99 1.56700
+round 1 old     hget       P1        324,417 ops/s  p50 0.67100  p99 1.08700
+round 1 new     hget       P1        327,276 ops/s  p50 0.67100  p99 1.07100
+round 1 redis   hget       P1        300,316 ops/s  p50 0.76700  p99 1.55100
+round 1 valkey  hget       P16     1,686,805 ops/s  p50 2.33500  p99 3.23100
+round 1 old     hget       P16     2,334,926 ops/s  p50 1.65500  p99 2.46300
+round 1 new     hget       P16     2,263,485 ops/s  p50 1.69500  p99 2.67100
+round 1 redis   hget       P16     1,657,232 ops/s  p50 2.38300  p99 3.34300
+round 1 valkey  hset       P1        281,131 ops/s  p50 0.82300  p99 1.64700
+round 1 old     hset       P1        317,228 ops/s  p50 0.68700  p99 1.15100
+round 1 new     hset       P1        321,338 ops/s  p50 0.68700  p99 1.09500
+round 1 redis   hset       P1        294,764 ops/s  p50 0.78300  p99 1.58300
+round 1 valkey  hset       P16     1,374,989 ops/s  p50 2.87900  p99 3.87100
+round 1 old     hset       P16     2,171,530 ops/s  p50 1.77500  p99 2.73500
+round 1 new     hset       P16     2,016,557 ops/s  p50 1.86300  p99 3.32700
+round 1 redis   hset       P16     1,498,313 ops/s  p50 2.55900  p99 3.93500
+round 1 valkey  sismember  P1        302,466 ops/s  p50 0.76700  p99 1.54300
+round 1 old     sismember  P1        324,681 ops/s  p50 0.67100  p99 1.11900
+round 1 new     sismember  P1        321,819 ops/s  p50 0.68700  p99 1.13500
+round 1 redis   sismember  P1        298,276 ops/s  p50 0.76700  p99 1.54300
+round 1 valkey  sismember  P16     1,790,369 ops/s  p50 2.20700  p99 2.95900
+round 1 old     sismember  P16     2,372,573 ops/s  p50 1.60700  p99 2.57500
+round 1 new     sismember  P16     2,388,793 ops/s  p50 1.59100  p99 2.33500
+round 1 redis   sismember  P16     1,816,330 ops/s  p50 2.17500  p99 2.94300
+round 1 valkey  sadd       P1        298,668 ops/s  p50 0.77500  p99 1.55900
+round 1 old     sadd       P1        316,525 ops/s  p50 0.68700  p99 1.23100
+round 1 new     sadd       P1        324,621 ops/s  p50 0.69500  p99 1.10300
+round 1 redis   sadd       P1        300,045 ops/s  p50 0.76700  p99 1.54300
+round 1 valkey  sadd       P16     1,790,463 ops/s  p50 2.23900  p99 3.00700
+round 1 old     sadd       P16     2,269,212 ops/s  p50 1.67900  p99 2.73500
+round 1 new     sadd       P16     2,367,379 ops/s  p50 1.61500  p99 2.33500
+round 1 redis   sadd       P16     1,798,952 ops/s  p50 2.20700  p99 3.29500
+round 1 valkey  zscore     P1        298,917 ops/s  p50 0.78300  p99 1.57500
+round 1 old     zscore     P1        326,441 ops/s  p50 0.67100  p99 1.07900
+round 1 new     zscore     P1        320,326 ops/s  p50 0.68700  p99 1.12700
+round 1 redis   zscore     P1        297,193 ops/s  p50 0.76700  p99 1.56700
+round 1 valkey  zscore     P16     1,704,471 ops/s  p50 2.28700  p99 3.53500
+round 1 old     zscore     P16     2,236,760 ops/s  p50 1.71100  p99 2.54300
+round 1 new     zscore     P16     2,212,126 ops/s  p50 1.70300  p99 2.60700
+round 1 redis   zscore     P16     1,802,938 ops/s  p50 2.15900  p99 3.03900
+round 1 valkey  zadd       P1        282,063 ops/s  p50 0.80700  p99 1.63100
+round 1 old     zadd       P1        311,785 ops/s  p50 0.69500  p99 1.18300
+round 1 new     zadd       P1        307,049 ops/s  p50 0.71100  p99 1.25500
+round 1 redis   zadd       P1        290,435 ops/s  p50 0.79100  p99 1.59100
+round 1 valkey  zadd       P16     1,468,543 ops/s  p50 2.63900  p99 3.71100
+round 1 old     zadd       P16     2,047,165 ops/s  p50 1.83900  p99 2.83100
+round 1 new     zadd       P16     2,048,735 ops/s  p50 1.84700  p99 2.70300
+round 1 redis   zadd       P16     1,516,262 ops/s  p50 2.54300  p99 3.75900
+round 2 old     hget       P1        324,188 ops/s  p50 0.66300  p99 1.18300
+round 2 new     hget       P1        327,746 ops/s  p50 0.66300  p99 1.11900
+round 2 redis   hget       P1        298,655 ops/s  p50 0.77500  p99 1.55900
+round 2 valkey  hget       P1        301,448 ops/s  p50 0.77500  p99 1.55100
+round 2 old     hget       P16     2,203,900 ops/s  p50 1.75900  p99 2.71900
+round 2 new     hget       P16     2,364,564 ops/s  p50 1.63100  p99 2.47900
+round 2 redis   hget       P16     1,632,459 ops/s  p50 2.38300  p99 4.41500
+round 2 valkey  hget       P16     1,663,789 ops/s  p50 2.33500  p99 3.91900
+round 2 old     hset       P1        324,589 ops/s  p50 0.67100  p99 1.10300
+round 2 new     hset       P1        322,205 ops/s  p50 0.67900  p99 1.14300
+round 2 redis   hset       P1        295,775 ops/s  p50 0.79100  p99 1.58300
+round 2 valkey  hset       P1        284,183 ops/s  p50 0.80700  p99 1.63900
+round 2 old     hset       P16     2,141,939 ops/s  p50 1.74300  p99 2.89500
+round 2 new     hset       P16     2,097,845 ops/s  p50 1.80700  p99 2.84700
+round 2 redis   hset       P16     1,495,568 ops/s  p50 2.57500  p99 4.12700
+round 2 valkey  hset       P16     1,383,744 ops/s  p50 2.79900  p99 3.96700
+round 2 old     sismember  P1        323,311 ops/s  p50 0.67100  p99 1.14300
+round 2 new     sismember  P1        321,456 ops/s  p50 0.67100  p99 1.12700
+round 2 redis   sismember  P1        302,678 ops/s  p50 0.75900  p99 1.53500
+round 2 valkey  sismember  P1        292,158 ops/s  p50 0.79100  p99 1.58300
+round 2 old     sismember  P16     2,370,295 ops/s  p50 1.64700  p99 2.47900
+round 2 new     sismember  P16     2,288,912 ops/s  p50 1.65500  p99 2.65500
+round 2 redis   sismember  P16     1,722,846 ops/s  p50 2.23900  p99 3.85500
+round 2 valkey  sismember  P16     1,789,634 ops/s  p50 2.20700  p99 3.02300
+round 2 old     sadd       P1        325,125 ops/s  p50 0.67900  p99 1.10300
+round 2 new     sadd       P1        318,457 ops/s  p50 0.70300  p99 1.15900
+round 2 redis   sadd       P1        304,077 ops/s  p50 0.75900  p99 1.53500
+round 2 valkey  sadd       P1        298,369 ops/s  p50 0.77500  p99 1.55100
+round 2 old     sadd       P16     2,275,028 ops/s  p50 1.61500  p99 2.75100
+round 2 new     sadd       P16     2,262,484 ops/s  p50 1.67100  p99 2.76700
+round 2 redis   sadd       P16     1,781,226 ops/s  p50 2.20700  p99 3.50300
+round 2 valkey  sadd       P16     1,781,771 ops/s  p50 2.23900  p99 3.07100
+round 2 old     zscore     P1        330,457 ops/s  p50 0.66300  p99 1.05500
+round 2 new     zscore     P1        324,087 ops/s  p50 0.68700  p99 1.09500
+round 2 redis   zscore     P1        304,084 ops/s  p50 0.76700  p99 1.53500
+round 2 valkey  zscore     P1        300,930 ops/s  p50 0.77500  p99 1.55900
+round 2 old     zscore     P16     2,272,474 ops/s  p50 1.67900  p99 2.60700
+round 2 new     zscore     P16     2,223,203 ops/s  p50 1.69500  p99 2.51100
+round 2 redis   zscore     P16     1,785,883 ops/s  p50 2.20700  p99 3.00700
+round 2 valkey  zscore     P16     1,705,457 ops/s  p50 2.31900  p99 3.26300
+round 2 old     zadd       P1        315,266 ops/s  p50 0.67900  p99 1.13500
+round 2 new     zadd       P1        316,933 ops/s  p50 0.68700  p99 1.13500
+round 2 redis   zadd       P1        286,893 ops/s  p50 0.79900  p99 1.60700
+round 2 valkey  zadd       P1        284,960 ops/s  p50 0.82300  p99 1.64700
+round 2 old     zadd       P16     2,035,492 ops/s  p50 1.87900  p99 2.83100
+round 2 new     zadd       P16     2,086,242 ops/s  p50 1.83100  p99 2.81500
+round 2 redis   zadd       P16     1,512,785 ops/s  p50 2.52700  p99 3.85500
+round 2 valkey  zadd       P16     1,475,497 ops/s  p50 2.62300  p99 3.58300
+round 3 new     hget       P1        318,226 ops/s  p50 0.67900  p99 1.15900
+round 3 redis   hget       P1        286,452 ops/s  p50 0.79100  p99 1.63100
+round 3 valkey  hget       P1        297,381 ops/s  p50 0.77500  p99 1.56700
+round 3 old     hget       P1        331,607 ops/s  p50 0.67100  p99 1.07100
+round 3 new     hget       P16     2,286,086 ops/s  p50 1.68700  p99 2.60700
+round 3 redis   hget       P16     1,658,616 ops/s  p50 2.35100  p99 3.61500
+round 3 valkey  hget       P16     1,693,999 ops/s  p50 2.30300  p99 3.50300
+round 3 old     hget       P16     2,267,380 ops/s  p50 1.71900  p99 2.59100
+round 3 new     hset       P1        327,910 ops/s  p50 0.67100  p99 1.07100
+round 3 redis   hset       P1        285,379 ops/s  p50 0.80700  p99 1.60700
+round 3 valkey  hset       P1        276,970 ops/s  p50 0.83100  p99 1.65500
+round 3 old     hset       P1        311,898 ops/s  p50 0.68700  p99 1.31900
+round 3 new     hset       P16     2,112,464 ops/s  p50 1.79100  p99 2.94300
+round 3 redis   hset       P16     1,488,343 ops/s  p50 2.60700  p99 4.19100
+round 3 valkey  hset       P16     1,395,620 ops/s  p50 2.83100  p99 3.67900
+round 3 old     hset       P16     2,081,900 ops/s  p50 1.84700  p99 2.84700
+round 3 new     sismember  P1        324,796 ops/s  p50 0.67900  p99 1.11100
+round 3 redis   sismember  P1        305,733 ops/s  p50 0.75900  p99 1.52700
+round 3 valkey  sismember  P1        293,074 ops/s  p50 0.78300  p99 1.59900
+round 3 old     sismember  P1        321,628 ops/s  p50 0.67100  p99 1.14300
+round 3 new     sismember  P16     2,212,868 ops/s  p50 1.72700  p99 2.70300
+round 3 redis   sismember  P16     1,769,497 ops/s  p50 2.20700  p99 3.59900
+round 3 valkey  sismember  P16     1,781,333 ops/s  p50 2.17500  p99 3.10300
+round 3 old     sismember  P16     2,395,731 ops/s  p50 1.58300  p99 2.52700
+round 3 new     sadd       P1        316,880 ops/s  p50 0.68700  p99 1.23900
+round 3 redis   sadd       P1        301,888 ops/s  p50 0.76700  p99 1.53500
+round 3 valkey  sadd       P1        301,203 ops/s  p50 0.77500  p99 1.55100
+round 3 old     sadd       P1        331,464 ops/s  p50 0.66300  p99 1.07100
+round 3 new     sadd       P16     2,362,382 ops/s  p50 1.60700  p99 2.36700
+round 3 redis   sadd       P16     1,815,029 ops/s  p50 2.17500  p99 3.02300
+round 3 valkey  sadd       P16     1,799,759 ops/s  p50 2.20700  p99 2.97500
+round 3 old     sadd       P16     2,472,310 ops/s  p50 1.54300  p99 2.25500
+round 3 new     zscore     P1        320,545 ops/s  p50 0.68700  p99 1.15100
+round 3 redis   zscore     P1        299,735 ops/s  p50 0.76700  p99 1.56700
+round 3 valkey  zscore     P1        299,936 ops/s  p50 0.77500  p99 1.55900
+round 3 old     zscore     P1        325,207 ops/s  p50 0.67100  p99 1.08700
+round 3 new     zscore     P16     2,201,019 ops/s  p50 1.74300  p99 2.52700
+round 3 redis   zscore     P16     1,729,528 ops/s  p50 2.23900  p99 3.82300
+round 3 valkey  zscore     P16     1,715,481 ops/s  p50 2.30300  p99 3.31100
+round 3 old     zscore     P16     2,237,314 ops/s  p50 1.69500  p99 2.59100
+round 3 new     zadd       P1        318,097 ops/s  p50 0.68700  p99 1.12700
+round 3 redis   zadd       P1        293,584 ops/s  p50 0.78300  p99 1.57500
+round 3 valkey  zadd       P1        285,453 ops/s  p50 0.79100  p99 1.60700
+round 3 old     zadd       P1        318,633 ops/s  p50 0.68700  p99 1.10300
+round 3 new     zadd       P16     2,050,575 ops/s  p50 1.87900  p99 2.75100
+round 3 redis   zadd       P16     1,537,115 ops/s  p50 2.51100  p99 3.61500
+round 3 valkey  zadd       P16     1,485,750 ops/s  p50 2.59100  p99 3.66300
+round 3 old     zadd       P16     2,060,222 ops/s  p50 1.84700  p99 2.78300
