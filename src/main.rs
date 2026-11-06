@@ -96,6 +96,9 @@ Options:
   --shards <N>      Store shards, rounded up to a power of two
                     [default: 256, or 1 per 4 MB of --maxmemory between 16 and 256]
   --databases <N>   How many numbered databases there are (SELECT) [default: 16]
+  --enable-debug-command <no|yes|local>
+                    Who may run DEBUG: nobody, anyone, or local connections
+                    [default: no]
   --maxmemory <SIZE>
                     Memory limit, e.g. 100mb or 2gb; 0 is unlimited [default: 0]
   --maxmemory-policy <POLICY>
@@ -260,6 +263,14 @@ fn parse_args() -> Result<Config, String> {
             "--port" => config.port = value.parse().map_err(|_| bad(()))?,
             "--threads" => config.threads = value.parse::<usize>().map_err(|_| bad(()))?.max(1),
             "--shards" => config.store.shards = value.parse().map_err(|_| bad(()))?,
+            "--enable-debug-command" => {
+                config.settings.debug_command = match value.as_str() {
+                    "no" => tantalum::context::DebugCommand::No,
+                    "yes" => tantalum::context::DebugCommand::Yes,
+                    "local" => tantalum::context::DebugCommand::Local,
+                    _ => return Err(bad(())),
+                };
+            }
             "--databases" => {
                 config.store.databases = value
                     .parse::<usize>()
@@ -364,6 +375,9 @@ fn main() -> std::io::Result<()> {
     raise_open_file_limit(config.settings.maxclients);
     let store = Arc::new(store::Store::with_config(config.store.clone()));
     let mut ctx = Context::new(store.clone(), config.settings.clone());
+    // What `CONFIG GET` says of the options it was started with.
+    ctx.config.set("port", &config.port.to_string());
+    ctx.config.set("bind", &config.bind);
     let logged = config
         .aof
         .as_ref()

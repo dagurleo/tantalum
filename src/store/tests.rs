@@ -1154,7 +1154,11 @@ fn stream_memory_budget() {
     let entries = 200_000;
     let mut stream = BigStream::default();
     for ms in 1..=entries {
-        stream.add(StreamId { ms, seq: 0 }, &[(b"f", &[b'v'; 32])]);
+        stream.add(
+            StreamId { ms, seq: 0 },
+            &[(b"f", &[b'v'; 32])],
+            Default::default(),
+        );
     }
     let bare = stream.allocation_size();
     let per_entry = bare as f64 / entries as f64;

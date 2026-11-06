@@ -3,18 +3,23 @@
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
+use crate::cmd::Args;
+use crate::config::ConfigTable;
+use crate::latency::Latency;
 use crate::pubsub::{PubSub, Subscriber, Subscriptions};
 use crate::resp;
 use crate::script::Scripting;
+use crate::slowlog::SlowLog;
 use crate::snapshot::Snapshots;
 use crate::store::Store;
+use crate::stream::NodeLimits;
 use crate::transaction::{Queue, Watching};
 
 /// Settings that apply to connections rather than the store.
@@ -31,6 +36,8 @@ pub struct Settings {
     pub tcp_keepalive: Option<Duration>,
     /// Whether BullMQ's hottest scripts run natively (`src/bullmq.rs`).
     pub native_scripts: bool,
+    /// Who may run `DEBUG`.
+    pub debug_command: DebugCommand,
     /// Tests only: an otherwise unknown command that panics, to check that a
     /// panic closes just its own connection.
     #[doc(hidden)]
@@ -46,9 +53,37 @@ impl Default for Settings {
             timeout: None,
             tcp_keepalive: Some(Duration::from_secs(300)),
             native_scripts: true,
+            debug_command: DebugCommand::No,
             panic_command: None,
         }
     }
+}
+
+/// In [`Context::special`]: something's watching every command.
+const SPECIAL_ON: u8 = 1;
+/// In [`Context::special`]: the ticking clock's asleep, as nothing has run for a while. In the
+/// same byte, so that the first batch after a quiet spell wakes it, and it costs the others nothing.
+const CLOCK_ASLEEP: u8 = 2;
+
+/// `--enable-debug-command`, as in Redis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugCommand {
+    No,
+    Yes,
+    /// From this machine only.
+    Local,
+}
+
+/// `CLIENT REPLY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyMode {
+    On,
+    Off,
+    /// The next command's isn't sent.
+    Skip,
+    /// A command with `Off` or `Skip` is running: whether this is still what it's
+    /// set to afterwards says whether that command changed it.
+    Passing,
 }
 
 /// A connection reports its buffer memory to the store only once it has
@@ -90,6 +125,34 @@ pub struct Context {
     memory_peak: AtomicUsize,
     /// Forty hex digits, different each time the server starts.
     run_id: String,
+    /// `CONFIG`'s settings.
+    pub config: ConfigTable,
+    pub(crate) slowlog: SlowLog,
+    pub(crate) latency: Latency,
+    /// `stream-node-max-entries` and `-bytes`, as streams read them.
+    stream_node_entries: AtomicUsize,
+    stream_node_bytes: AtomicUsize,
+    /// A clock a thread ticks, for commands that aren't `fast` to read (`slowlog.rs`).
+    ticks: AtomicU64,
+    /// Something's watching every command: `MONITOR`, `CLIENT PAUSE`, the latency
+    /// monitor, or a `SLOWLOG` threshold below what the ticking clock can tell.
+    /// Connections look once a batch (which also wakes the clock: see [`CLOCK_ASLEEP`]),
+    /// and while it's on, take the restricted path, whose checks are the ones that
+    /// see to it. So none of this costs a command anything when it's off.
+    special: AtomicU8,
+    /// The thread that ticks the clock.
+    clock: OnceLock<std::thread::Thread>,
+    monitoring: AtomicBool,
+    /// Who's running `MONITOR`.
+    monitors: Mutex<Vec<Weak<Subscriber>>>,
+    pause: Mutex<Option<Pause>>,
+    /// What `CONFIG SET` can change of [`Settings`].
+    maxclients: AtomicUsize,
+    /// In milliseconds, 0 for none.
+    timeout: AtomicU64,
+    tcp_keepalive: AtomicU64,
+    password: Mutex<Option<Vec<u8>>>,
+    has_password: AtomicBool,
     /// Lua scripts and their interpreter, made on the first one.
     pub(crate) scripting: Scripting,
     started: Instant,
@@ -114,6 +177,24 @@ impl Context {
             pubsub: Arc::new(PubSub::new(store.clone())),
             memory_peak: AtomicUsize::new(0),
             run_id: new_run_id(),
+            config: ConfigTable::default(),
+            slowlog: SlowLog::default(),
+            latency: Latency::default(),
+            stream_node_entries: AtomicUsize::new(NodeLimits::default().entries),
+            stream_node_bytes: AtomicUsize::new(NodeLimits::default().bytes),
+            ticks: AtomicU64::new(0),
+            special: AtomicU8::new(0),
+            clock: OnceLock::new(),
+            monitoring: AtomicBool::new(false),
+            monitors: Mutex::new(Vec::new()),
+            pause: Mutex::new(None),
+            maxclients: AtomicUsize::new(settings.maxclients),
+            timeout: AtomicU64::new(settings.timeout.map_or(0, |t| t.as_millis() as u64)),
+            tcp_keepalive: AtomicU64::new(
+                settings.tcp_keepalive.map_or(0, |t| t.as_millis() as u64),
+            ),
+            password: Mutex::new(settings.password.clone()),
+            has_password: AtomicBool::new(settings.password.is_some()),
             scripting: Scripting::default(),
             store,
             settings,
@@ -138,6 +219,261 @@ impl Context {
             &self.store
         } else {
             self.store.db(session.db as usize)
+        }
+    }
+
+    /// Whether a connection's commands take the watched path, once a batch.
+    #[inline]
+    pub(crate) fn follow_special(&self, session: &mut Session) {
+        let state = self.special.load(Relaxed);
+        if state != u8::from(session.special) {
+            self.special_changed(session, state);
+        }
+    }
+
+    #[cold]
+    fn special_changed(&self, session: &mut Session, state: u8) {
+        if state & CLOCK_ASLEEP != 0 {
+            let was = self.special.fetch_and(!CLOCK_ASLEEP, Relaxed);
+            if was & CLOCK_ASLEEP != 0 {
+                self.tick();
+                if let Some(clock) = self.clock.get() {
+                    clock.unpark();
+                }
+            }
+        }
+        let special = state & SPECIAL_ON != 0;
+        if special != session.special {
+            session.special = special;
+            session.refresh();
+        }
+    }
+
+    /// After what `special` goes by changed.
+    pub(crate) fn update_special(&self) {
+        let on = !self.monitors.lock().is_empty()
+            || self.pause.lock().is_some()
+            || self.slowlog.needs_precise()
+            || self.latency.threshold() != 0;
+        if on {
+            self.special.fetch_or(SPECIAL_ON, Relaxed);
+        } else {
+            self.special.fetch_and(!SPECIAL_ON, Relaxed);
+        }
+    }
+
+    /// What starts a new node in a stream.
+    #[inline]
+    pub(crate) fn stream_limits(&self) -> NodeLimits {
+        NodeLimits {
+            entries: self.stream_node_entries.load(Relaxed),
+            bytes: self.stream_node_bytes.load(Relaxed),
+        }
+    }
+
+    pub(crate) fn set_stream_node_entries(&self, entries: usize) {
+        self.stream_node_entries.store(entries, Relaxed);
+    }
+
+    pub(crate) fn set_stream_node_bytes(&self, bytes: usize) {
+        self.stream_node_bytes
+            .store(NodeLimits::bytes_from_setting(bytes), Relaxed);
+    }
+
+    /// The clock a thread ticks, in ticks since the start.
+    #[inline]
+    pub(crate) fn ticks(&self) -> u64 {
+        self.ticks.load(Relaxed)
+    }
+
+    /// Brings the clock up to date. Only forwards: see [`Context::clock_sleeps`].
+    pub(crate) fn tick(&self) {
+        let ticks = self.started.elapsed().as_micros() as u64 / crate::slowlog::TICK_MICROS as u64;
+        self.ticks.fetch_max(ticks, Relaxed);
+    }
+
+    /// For the thread that ticks the clock: it's this one.
+    pub(crate) fn clock_starts(&self) {
+        let _ = self.clock.set(std::thread::current());
+    }
+
+    /// For the thread that ticks the clock: no command has run for a while, so it stops
+    /// until a connection's next batch. It moves once more, so a command running now
+    /// finds it moved when it ends, and asks what time it really is.
+    pub(crate) fn clock_sleeps(&self) {
+        self.special.fetch_or(CLOCK_ASLEEP, Relaxed);
+        self.ticks.fetch_add(1, Relaxed);
+    }
+
+    pub(crate) fn clock_asleep(&self) -> bool {
+        self.special.load(Relaxed) & CLOCK_ASLEEP != 0
+    }
+
+    /// Commands run so far, as far as connections have said.
+    pub(crate) fn commands_so_far(&self) -> u64 {
+        self.counters.iter().map(|c| c.commands.load(Relaxed)).sum()
+    }
+
+    /// Whether anyone's running `MONITOR`.
+    pub(crate) fn monitoring(&self) -> bool {
+        self.monitoring.load(Relaxed)
+    }
+
+    /// Makes `session` a monitor.
+    pub(crate) fn add_monitor(&self, session: &mut Session) {
+        let outbox = Subscriber::alone(session.id, self.store.clone());
+        self.monitors.lock().push(Arc::downgrade(&outbox));
+        session.monitor = Some(outbox);
+        session.refresh();
+        self.monitoring.store(true, Relaxed);
+        self.update_special();
+    }
+
+    /// Tells the monitors of a command, as `+time [db who] "arg" "arg"`.
+    pub(crate) fn feed_monitors(&self, db: u32, who: &str, args: &Args<'_>) {
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mut line = format!(
+            "+{}.{:06} [{db} {who}]",
+            time.as_secs(),
+            time.subsec_micros()
+        )
+        .into_bytes();
+        for (i, secret) in crate::slowlog::secret_args(args).into_iter().enumerate() {
+            line.push(b' ');
+            if secret {
+                line.extend_from_slice(b"\"(redacted)\"");
+            } else {
+                write_repr(&mut line, args.get(i));
+            }
+        }
+        line.extend_from_slice(b"\r\n");
+        let empty = {
+            let mut monitors = self.monitors.lock();
+            monitors.retain(|monitor| match monitor.upgrade() {
+                Some(monitor) => {
+                    monitor.deliver_line(&line);
+                    true
+                }
+                None => false,
+            });
+            monitors.is_empty()
+        };
+        if empty {
+            self.monitoring.store(false, Relaxed);
+            self.update_special();
+        }
+    }
+
+    /// A connection's address, as logs and `MONITOR` show it.
+    pub(crate) fn peer_of(&self, session: &mut Session) -> String {
+        if let Some(peer) = &session.peer {
+            return peer.to_string();
+        }
+        let peer = self
+            .clients
+            .lock()
+            .get(&session.id)
+            .map_or_else(|| "?:0".to_string(), |client| client.addresses().0);
+        session.peer = Some(peer.clone().into_boxed_str());
+        peer
+    }
+
+    /// `CLIENT PAUSE`: for this long, the commands it says are held back.
+    pub(crate) fn pause_clients(&self, millis: u64, all: bool) {
+        *self.pause.lock() = Some(Pause {
+            until: Instant::now() + Duration::from_millis(millis),
+            all,
+        });
+        self.update_special();
+    }
+
+    pub(crate) fn unpause_clients(&self) {
+        *self.pause.lock() = None;
+        self.update_special();
+    }
+
+    /// Whether clients are paused: `Some(true)` for every command, `Some(false)` for
+    /// those that write. It's over by itself when the time's up.
+    pub(crate) fn pause_mode(&self) -> Option<bool> {
+        let mut pause = self.pause.lock();
+        let current = (*pause)?;
+        if Instant::now() < current.until {
+            return Some(current.all);
+        }
+        *pause = None;
+        drop(pause);
+        self.update_special();
+        None
+    }
+
+    /// `CONFIG RESETSTAT`.
+    pub(crate) fn reset_stats(&self) {
+        for counters in self.counters.iter() {
+            counters.commands.store(0, Relaxed);
+            counters.hits.store(0, Relaxed);
+            counters.misses.store(0, Relaxed);
+        }
+        self.total_connections.store(0, Relaxed);
+        self.rejected_connections.store(0, Relaxed);
+        self.memory_peak.store(0, Relaxed);
+        self.store.reset_stats();
+    }
+
+    pub(crate) fn maxclients(&self) -> usize {
+        self.maxclients.load(Relaxed)
+    }
+
+    pub(crate) fn set_maxclients(&self, max: usize) {
+        self.maxclients.store(max, Relaxed);
+    }
+
+    /// How long an idle connection is kept.
+    #[inline]
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        match self.timeout.load(Relaxed) {
+            0 => None,
+            millis => Some(Duration::from_millis(millis)),
+        }
+    }
+
+    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
+        self.timeout
+            .store(timeout.map_or(0, |t| t.as_millis() as u64), Relaxed);
+    }
+
+    pub(crate) fn tcp_keepalive(&self) -> Option<Duration> {
+        match self.tcp_keepalive.load(Relaxed) {
+            0 => None,
+            millis => Some(Duration::from_millis(millis)),
+        }
+    }
+
+    pub(crate) fn set_tcp_keepalive(&self, time: Option<Duration>) {
+        self.tcp_keepalive
+            .store(time.map_or(0, |t| t.as_millis() as u64), Relaxed);
+    }
+
+    pub(crate) fn password(&self) -> Option<Vec<u8>> {
+        self.password.lock().clone()
+    }
+
+    /// Clients already authenticated stay so, as in Redis.
+    pub(crate) fn set_password(&self, password: Option<Vec<u8>>) {
+        self.has_password.store(password.is_some(), Relaxed);
+        *self.password.lock() = password;
+    }
+
+    /// Whether this connection may run `DEBUG`.
+    pub(crate) fn debug_allowed(&self, session: &mut Session) -> bool {
+        match self.settings.debug_command {
+            DebugCommand::Yes => true,
+            DebugCommand::No => false,
+            DebugCommand::Local => {
+                let peer = self.peer_of(session);
+                peer.starts_with("127.") || peer.starts_with("[::1]")
+            }
         }
     }
 
@@ -174,7 +510,7 @@ impl Context {
     /// connected already (counted as rejected) or the server is shutting
     /// down; the caller should close it.
     pub fn connect(&self, fd: RawFd) -> Option<Client<'_>> {
-        if self.connected.fetch_add(1, Relaxed) >= self.settings.maxclients {
+        if self.connected.fetch_add(1, Relaxed) >= self.maxclients() {
             self.connected.fetch_sub(1, Relaxed);
             self.rejected_connections.fetch_add(1, Relaxed);
             return None;
@@ -205,6 +541,8 @@ impl Context {
                     resp3: false,
                     db: 0,
                     pubsub: false,
+                    monitor: false,
+                    last_command: None,
                 },
             );
         }
@@ -265,23 +603,26 @@ impl Context {
 
     /// `CLIENT KILL`: closes the connections it picks, but for `me`'s own,
     /// which the caller closes after its reply. How many it picked, and
-    /// whether `me` was one.
+    /// whether `me` was one. They're gone from the list at once, as in Redis,
+    /// though their threads may not have noticed yet.
     pub(crate) fn kill_clients(&self, me: u64, filter: &KillFilter<'_>) -> (usize, bool) {
-        let clients = self.clients.lock();
-        let (mut killed, mut me_too) = (0, false);
-        for (&id, client) in clients.iter() {
-            if !filter.picks(id, me, client) {
-                continue;
-            }
-            killed += 1;
-            if id == me {
-                me_too = true;
-            } else {
+        let mut clients = self.clients.lock();
+        let picked: Vec<u64> = clients
+            .iter()
+            .filter(|&(&id, client)| filter.picks(id, me, client))
+            .map(|(&id, _)| id)
+            .collect();
+        let me_too = picked.contains(&me);
+        for id in &picked {
+            if *id != me
+                && let Some(client) = clients.remove(id)
+            {
                 // SAFETY: as in `shutdown`.
                 unsafe { libc::shutdown(client.dup, libc::SHUT_RDWR) };
+                close(client.dup);
             }
         }
-        (killed, me_too)
+        (picked.len(), me_too)
     }
 
     /// `CLIENT LIST` (`ids` empty: every connection, by id) and `CLIENT
@@ -326,7 +667,7 @@ impl Context {
     }
 
     pub fn has_password(&self) -> bool {
-        self.settings.password.is_some()
+        self.has_password.load(Relaxed)
     }
 
     /// Whether these credentials are valid. There is one user, `default`,
@@ -334,8 +675,8 @@ impl Context {
     pub fn check_password(&self, user: &[u8], password: &[u8]) -> bool {
         user == b"default"
             && self
-                .settings
                 .password
+                .lock()
                 .as_ref()
                 .is_none_or(|expected| constant_time_eq(expected, password))
     }
@@ -420,6 +761,12 @@ impl Client<'_> {
             name: None,
             resp3: false,
             db: 0,
+            special: false,
+            reply: ReplyMode::On,
+            no_evict: false,
+            no_touch: false,
+            monitor: None,
+            peer: None,
             commands: 0,
             hits: 0,
             misses: 0,
@@ -469,6 +816,9 @@ pub(crate) struct Registered {
     pub(crate) db: u32,
     /// Subscribed to something, as `CLIENT LIST` and `CLIENT KILL` go by.
     pub(crate) pubsub: bool,
+    pub(crate) monitor: bool,
+    /// What it last ran, where that's known: what subscribed it.
+    pub(crate) last_command: Option<&'static str>,
 }
 
 fn new_run_id() -> String {
@@ -480,6 +830,32 @@ fn new_run_id() -> String {
     }
     id.truncate(40);
     id
+}
+
+/// A `CLIENT PAUSE` going on.
+#[derive(Clone, Copy)]
+struct Pause {
+    until: Instant,
+    all: bool,
+}
+
+/// An argument as `MONITOR` shows it: quoted, and what's not printable escaped.
+fn write_repr(out: &mut Vec<u8>, arg: &[u8]) {
+    out.push(b'"');
+    for &byte in arg {
+        match byte {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            7 => out.extend_from_slice(b"\\a"),
+            8 => out.extend_from_slice(b"\\b"),
+            0x20..=0x7e => out.push(byte),
+            _ => out.extend_from_slice(format!("\\x{byte:02x}").as_bytes()),
+        }
+    }
+    out.push(b'"');
 }
 
 /// What `CLIENT KILL` goes by.
@@ -560,8 +936,17 @@ fn client_line(
     if client.pubsub {
         flags.push('P');
     }
+    if client.monitor {
+        flags.push('O');
+    }
     if session.is_some_and(|s| s.multi.is_some()) {
         flags.push('x');
+    }
+    if session.is_some_and(|s| s.no_evict) {
+        flags.push('e');
+    }
+    if session.is_some_and(|s| s.no_touch) {
+        flags.push('T');
     }
     if flags.is_empty() {
         flags.push('N');
@@ -584,7 +969,7 @@ fn client_line(
         count(crate::pubsub::To::Channels),
         count(crate::pubsub::To::Patterns),
         count(crate::pubsub::To::ShardChannels),
-        me.map_or("NULL", |(_, cmd)| cmd),
+        me.map_or(client.last_command.unwrap_or("NULL"), |(_, cmd)| cmd),
         if resp3 { 3 } else { 2 },
         text(&client.lib_name),
         text(&client.lib_ver),
@@ -615,6 +1000,15 @@ pub struct Session {
     pub(crate) resp3: bool,
     /// The database it has selected (`SELECT`).
     pub(crate) db: u32,
+    /// As it last saw [`Context::follow_special`].
+    pub(crate) special: bool,
+    pub(crate) reply: ReplyMode,
+    pub(crate) no_evict: bool,
+    pub(crate) no_touch: bool,
+    /// Its outbox, if it's run `MONITOR`.
+    pub(crate) monitor: Option<Arc<Subscriber>>,
+    /// Its address, once something's wanted it.
+    pub(crate) peer: Option<Box<str>>,
     /// Counts not yet added to the server's (see [`Context::publish`]).
     pub(crate) commands: u64,
     pub(crate) hits: u64,
@@ -649,6 +1043,12 @@ impl Session {
             name: None,
             resp3: false,
             db: 0,
+            special: false,
+            reply: ReplyMode::On,
+            no_evict: false,
+            no_touch: false,
+            monitor: None,
+            peer: None,
             commands: 0,
             hits: 0,
             misses: 0,
@@ -690,7 +1090,12 @@ impl Session {
 
     /// Recomputes `unrestricted` after what it depends on changed.
     pub(crate) fn refresh(&mut self) {
-        self.unrestricted = self.authenticated && self.pubsub.is_none() && self.multi.is_none();
+        self.unrestricted = self.authenticated
+            && self.pubsub.is_none()
+            && self.multi.is_none()
+            && self.monitor.is_none()
+            && !self.special
+            && matches!(self.reply, ReplyMode::On | ReplyMode::Passing);
     }
 
     pub(crate) fn set_resp3(&mut self, resp3: bool) {
@@ -729,6 +1134,9 @@ impl Session {
 
     /// Its outbox while it's subscribed, for its connection to send.
     pub fn subscriber(&self) -> Option<&Arc<Subscriber>> {
-        self.pubsub.as_deref().map(Subscriptions::subscriber)
+        self.pubsub
+            .as_deref()
+            .map(Subscriptions::subscriber)
+            .or(self.monitor.as_ref())
     }
 }

@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 
 use crate::cmd::{Args, Reply};
-use crate::context::{Context, Session};
+use crate::context::{Context, ReplyMode, Session};
 use crate::resp;
 use crate::store::{Kind, Millis, Store};
 use crate::wake::{Mailbox, Wake};
@@ -115,11 +115,26 @@ pub struct Waiter {
     waker: Mutex<Option<Wake>>,
     /// With [`Attempt::Wait`]'s `on_change`: how the keys know it.
     on_change: Option<Arc<AtomicBool>>,
+    /// What it replies when time's up, for a wait that isn't for a key (`WAIT`):
+    /// otherwise a null array.
+    timed_out: Option<&'static [u8]>,
 }
 
 impl Waiter {
+    pub(crate) fn client(&self) -> u64 {
+        self.client
+    }
+
     pub(crate) fn kind(&self) -> Kind {
         self.kind
+    }
+
+    fn timed_out_reply(&self) -> &'static [u8] {
+        match self.timed_out {
+            Some(reply) => reply,
+            None if self.resp3 => resp::NULL,
+            None => b"*-1\r\n",
+        }
     }
 
     pub(crate) fn wakes_on_change(&self) -> bool {
@@ -218,6 +233,12 @@ impl Waiter {
             name: None,
             resp3: self.resp3,
             db: self.db,
+            special: false,
+            reply: ReplyMode::On,
+            no_evict: false,
+            no_touch: false,
+            monitor: None,
+            peer: None,
             commands: 0,
             hits: 0,
             misses: 0,
@@ -362,6 +383,7 @@ pub(crate) fn block(
         reply: Mutex::new(Vec::new()),
         waker: Mutex::new(None),
         on_change: on_change.then(|| Arc::new(AtomicBool::new(false))),
+        timed_out: None,
     });
     let store = ctx.store.db(session.db as usize);
     let blocked = Blocked {
@@ -376,6 +398,7 @@ pub(crate) fn block(
         }
     }
     store.count_blocked(1);
+    store.track_waiter(&blocked.waiter);
     // Again, now that a write creating a key would see it (with what it
     // waits with).
     let waiter = blocked.waiter.clone();
@@ -388,6 +411,66 @@ pub(crate) fn block(
             return Reply::Block(Box::new(blocked));
         }
     }
+}
+
+/// Waits for no key, only for `timeout`, then replies `reply`: `WAIT`, as there are
+/// no replicas to hear from.
+pub(crate) fn block_for(
+    ctx: &Context,
+    session: &Session,
+    timeout: Option<Duration>,
+    reply: &'static [u8],
+) -> Reply {
+    fn never(_: &Context, _: &mut Session, _: Millis, _: &Args<'_>, _: &mut Vec<u8>) -> Attempt {
+        Attempt::Done
+    }
+    let waiter = Arc::new(Waiter {
+        state: AtomicU8::new(ARMING),
+        kind: Kind::String,
+        buf: Box::default(),
+        ranges: Box::default(),
+        keys: 0..0,
+        attempt: never,
+        client: session.id,
+        resp3: session.resp3,
+        db: session.db,
+        socket: -1,
+        reply: Mutex::new(Vec::new()),
+        waker: Mutex::new(None),
+        on_change: None,
+        timed_out: Some(reply),
+    });
+    let store = ctx.store.db(session.db as usize);
+    store.count_blocked(1);
+    store.track_waiter(&waiter);
+    waiter.arm();
+    Reply::Block(Box::new(Blocked {
+        waiter,
+        store: store.clone(),
+        timeout,
+    }))
+}
+
+/// `CLIENT UNBLOCK`: ends client `id`'s blocking command as if it had timed out, or
+/// with an error. Whether it was blocked in one.
+pub(crate) fn unblock(ctx: &Context, id: u64, error: bool) -> bool {
+    let Some(waiter) = ctx.store.waiter_of(id) else {
+        return false;
+    };
+    if !waiter.claim() {
+        return false;
+    }
+    let mut claimed = Claimed {
+        waiter,
+        holds: true,
+    };
+    let reply: Vec<u8> = if error {
+        b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n".to_vec()
+    } else {
+        claimed.waiter.timed_out_reply().to_vec()
+    };
+    claimed.serve(reply);
+    true
 }
 
 /// Serves the clients waiting on keys that got data. Commands call this
@@ -468,11 +551,7 @@ impl Blocked {
     pub fn finish(self, out: &mut Vec<u8>) {
         if self.waiter.give_up() {
             // Timed out: a null array, whatever the command.
-            out.extend_from_slice(if self.waiter.resp3 {
-                resp::NULL
-            } else {
-                b"*-1\r\n"
-            });
+            out.extend_from_slice(self.waiter.timed_out_reply());
         } else {
             out.extend_from_slice(&self.waiter.reply.lock());
         }
@@ -489,6 +568,7 @@ impl Drop for Blocked {
             }
         }
         self.store.count_blocked(-1);
+        self.store.untrack_waiter(self.waiter.client);
     }
 }
 
@@ -536,6 +616,7 @@ mod tests {
         Waiter {
             state: AtomicU8::new(ARMING),
             kind: Kind::List,
+            timed_out: None,
             db: 0,
             buf: Box::new([]),
             ranges: Box::new([]),

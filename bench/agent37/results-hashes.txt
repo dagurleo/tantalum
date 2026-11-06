@@ -161,7 +161,7 @@ ab 4 old big-values 39173.48 6.01500 11.19900
 ab 4 new reconnect 255503.20 0.90300 1.51100
 ab 4 old reconnect 255177.86 0.89500 1.50300
 
-# One big hash of 1M fields: Redis 7.2.4, Valkey and 0.22.3, each round in a different
+# One big hash of 1M fields: Redis 8.10.3, Valkey and 0.22.3, each round in a different
 # order, memtier's Totals line.
 round 1 valkey hget P1 Totals     294395.08    294395.08         0.00         0.81527         0.77500         1.56700     21529.41
 round 1 tantalum hget P1 Totals     323490.57    323490.57         0.00         0.74195         0.65500         1.35900     23657.42

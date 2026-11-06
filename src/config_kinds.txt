@@ -1,0 +1,195 @@
+acl-pubsub-default	oneof	allchannels, resetchannels
+aclfile	immutable
+acllog-max-len	int	0	9223372036854775807
+active-defrag-cycle-max	int	1	99
+active-defrag-cycle-min	int	1	99
+active-defrag-ignore-bytes	memory	1	9223372036854775807
+active-defrag-max-scan-fields	int	1	9223372036854775807
+active-defrag-threshold-lower	int	0	1000
+active-defrag-threshold-upper	int	0	1000
+active-expire-effort	int	1	10
+activedefrag	bool
+activerehashing	bool
+always-show-logo	immutable
+aof-load-truncated	bool
+aof-rewrite-incremental-fsync	bool
+aof-timestamp-enabled	bool
+aof-use-rdb-preamble	bool
+aof_rewrite_cpulist	immutable
+appenddirname	immutable
+appendfilename	immutable
+appendfsync	oneof	everysec, always, no
+appendonly	bool
+auto-aof-rewrite-min-size	memory	0	9223372036854775807
+auto-aof-rewrite-percentage	int	0	2147483647
+bgsave_cpulist	immutable
+bind	text
+bind-source-addr	text
+bio_cpulist	immutable
+busy-reply-threshold	int	0	9223372036854775807
+client-output-buffer-limit	text
+client-query-buffer-limit	memory	1048576	9223372036854775807
+cluster-allow-pubsubshard-when-down	bool
+cluster-allow-reads-when-down	bool
+cluster-allow-replica-migration	bool
+cluster-announce-bus-port	int	0	65535
+cluster-announce-hostname	text
+cluster-announce-human-nodename	text
+cluster-announce-ip	text
+cluster-announce-port	int	0	65535
+cluster-announce-tls-port	int	0	65535
+cluster-config-file	immutable
+cluster-enabled	immutable
+cluster-link-sendbuf-limit	memory	0	18446744073709551615
+cluster-migration-barrier	int	0	2147483647
+cluster-node-timeout	int	0	9223372036854775807
+cluster-port	immutable
+cluster-preferred-endpoint-type	oneof	ip, hostname, unknown-endpoint
+cluster-replica-no-failover	bool
+cluster-replica-validity-factor	int	0	2147483647
+cluster-require-full-coverage	bool
+cluster-slave-no-failover	bool
+cluster-slave-validity-factor	int	0	2147483647
+crash-log-enabled	bool
+crash-memcheck-enabled	bool
+daemonize	immutable
+databases	immutable
+dbfilename	protected
+dir	protected
+disable-thp	immutable
+dynamic-hz	bool
+enable-debug-command	immutable
+enable-module-command	immutable
+enable-protected-configs	immutable
+hash-max-listpack-entries	int	0	9223372036854775807
+hash-max-listpack-value	memory	0	9223372036854775807
+hash-max-ziplist-entries	int	0	9223372036854775807
+hash-max-ziplist-value	memory	0	9223372036854775807
+hll-sparse-max-bytes	memory	0	9223372036854775807
+hz	int	0	2147483647
+ignore-warnings	text
+io-threads	immutable
+io-threads-do-reads	immutable
+jemalloc-bg-thread	bool
+latency-monitor-threshold	int	0	9223372036854775807
+latency-tracking	bool
+latency-tracking-info-percentiles	text
+lazyfree-lazy-eviction	bool
+lazyfree-lazy-expire	bool
+lazyfree-lazy-server-del	bool
+lazyfree-lazy-user-del	bool
+lazyfree-lazy-user-flush	bool
+lfu-decay-time	int	0	2147483647
+lfu-log-factor	int	0	2147483647
+list-compress-depth	int	0	2147483647
+list-max-listpack-size	int	-2147483648	2147483647
+list-max-ziplist-size	int	-2147483648	2147483647
+locale-collate	text
+logfile	immutable
+loglevel	oneof	debug, verbose, notice, warning, nothing
+lua-time-limit	int	0	9223372036854775807
+masterauth	text
+masteruser	text
+maxclients	int	1	4294967295
+maxmemory	memory	0	18446744073709551615
+maxmemory-clients	percent
+maxmemory-eviction-tenacity	int	0	100
+maxmemory-policy	oneof	volatile-lru, volatile-lfu, volatile-random, volatile-ttl, allkeys-lru, allkeys-lfu, allkeys-random, noeviction
+maxmemory-samples	int	1	2147483647
+min-replicas-max-lag	int	0	2147483647
+min-replicas-to-write	int	0	2147483647
+min-slaves-max-lag	int	0	2147483647
+min-slaves-to-write	int	0	2147483647
+no-appendfsync-on-rewrite	bool
+notify-keyspace-events	text
+oom-score-adj	oneof	no, yes, relative, absolute
+oom-score-adj-values	text
+pidfile	immutable
+port	int	0	65535
+proc-title-template	text
+propagation-error-behavior	oneof	ignore, panic, panic-on-replicas
+protected-mode	bool
+proto-max-bulk-len	memory	1048576	9223372036854775807
+rdb-del-sync-files	bool
+rdb-save-incremental-fsync	bool
+rdbchecksum	immutable
+rdbcompression	bool
+repl-backlog-size	memory	1	9223372036854775807
+repl-backlog-ttl	int	0	9223372036854775807
+repl-disable-tcp-nodelay	bool
+repl-diskless-load	oneof	disabled, on-empty-db, swapdb
+repl-diskless-sync	bool
+repl-diskless-sync-delay	int	0	2147483647
+repl-diskless-sync-max-replicas	int	0	2147483647
+repl-ping-replica-period	int	1	2147483647
+repl-ping-slave-period	int	1	2147483647
+repl-timeout	int	1	2147483647
+replica-announce-ip	text
+replica-announce-port	int	0	65535
+replica-announced	bool
+replica-ignore-disk-write-errors	bool
+replica-ignore-maxmemory	bool
+replica-lazy-flush	bool
+replica-priority	int	0	2147483647
+replica-read-only	bool
+replica-serve-stale-data	bool
+replicaof	immutable
+requirepass	text
+sanitize-dump-payload	oneof	no, yes, clients
+save	text
+server_cpulist	immutable
+set-max-intset-entries	int	0	9223372036854775807
+set-max-listpack-entries	int	0	9223372036854775807
+set-max-listpack-value	int	0	9223372036854775807
+set-proc-title	immutable
+shutdown-on-sigint	oneof	default, save, nosave, now, force
+shutdown-on-sigterm	oneof	default, save, nosave, now, force
+shutdown-timeout	int	0	2147483647
+slave-announce-ip	text
+slave-announce-port	int	0	65535
+slave-ignore-maxmemory	bool
+slave-lazy-flush	bool
+slave-priority	int	0	2147483647
+slave-read-only	bool
+slave-serve-stale-data	bool
+slaveof	immutable
+slowlog-log-slower-than	int	-1	9223372036854775807
+slowlog-max-len	int	0	9223372036854775807
+socket-mark-id	immutable
+stop-writes-on-bgsave-error	bool
+stream-node-max-bytes	memory	0	9223372036854775807
+stream-node-max-entries	int	0	9223372036854775807
+supervised	immutable
+syslog-enabled	immutable
+syslog-facility	immutable
+syslog-ident	immutable
+tcp-backlog	immutable
+tcp-keepalive	int	0	2147483647
+timeout	int	0	2147483647
+tls-auth-clients	oneof	no, yes, optional
+tls-ca-cert-dir	text
+tls-ca-cert-file	text
+tls-cert-file	text
+tls-ciphers	text
+tls-ciphersuites	text
+tls-client-cert-file	text
+tls-client-key-file	text
+tls-client-key-file-pass	text
+tls-cluster	bool
+tls-dh-params-file	text
+tls-key-file	text
+tls-key-file-pass	text
+tls-port	int	0	65535
+tls-prefer-server-ciphers	bool
+tls-protocols	text
+tls-replication	bool
+tls-session-cache-size	int	0	2147483647
+tls-session-cache-timeout	int	0	2147483647
+tls-session-caching	bool
+tracking-table-max-keys	int	0	9223372036854775807
+unixsocket	immutable
+unixsocketperm	immutable
+zset-max-listpack-entries	int	0	9223372036854775807
+zset-max-listpack-value	memory	0	9223372036854775807
+zset-max-ziplist-entries	int	0	9223372036854775807
+zset-max-ziplist-value	memory	0	9223372036854775807

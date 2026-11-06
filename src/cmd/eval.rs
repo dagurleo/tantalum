@@ -79,8 +79,13 @@ fn run(
     }
     // BullMQ's scripts natively, holding only the shards they use (but
     // not inside EXEC, which holds every one already).
-    let native =
-        sha && !read_only && ctx.settings.native_scripts && !crate::shard_lock::holding_all();
+    // (Not while something wants to hear of what scripts run.)
+    let watched = session.special || ctx.monitoring();
+    let native = sha
+        && !read_only
+        && ctx.settings.native_scripts
+        && !watched
+        && !crate::shard_lock::holding_all();
     if native
         && ctx
             .scripting
@@ -92,7 +97,7 @@ fn run(
         ctx.scripting.eval(
             ctx,
             session,
-            !native,
+            !native && !watched,
             now,
             args,
             numkeys as usize,
@@ -247,7 +252,12 @@ pub(crate) fn call_from_script(
     }
     session.commands += 1;
     let start = out.len();
-    if let Reply::Bulk(value) = (command.run)(ctx, session, now, args, out) {
+    let reply = if session.special {
+        super::watched_inside(ctx, session, now, command, args, out)
+    } else {
+        super::timed(ctx, session, now, command, args, out)
+    };
+    if let Reply::Bulk(value) = reply {
         resp::write_bulk(out, value.as_bytes());
     }
     if write {

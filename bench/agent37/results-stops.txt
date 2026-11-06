@@ -1,5 +1,5 @@
 # 2026-11-06, Agent37 VM (Xeon E-2388G), one server core. 0.22.3 ("old") against 0.22.4
-# ("new"), whose big hashes, sets and sorted sets don't stop to grow, Redis 7.2.4 and
+# ("new"), whose big hashes, sets and sorted sets don't stop to grow, Redis 8.10.3 and
 # Valkey, all in one session. bench/agent37/stops.py, setsizes.py, memtypes.py, memtier.
 # "longest": the four longest batches of 500, in ms, @ where they were; "usual": the median
 # batch; "all": the whole fill or removal of three in four, client's own time included.

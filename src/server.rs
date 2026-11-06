@@ -50,6 +50,8 @@ use crate::store::{KeyHash, Millis, Store};
 use crate::wake::Mailbox;
 
 /// Minimum free space in the read buffer before each read.
+/// How often a command `CLIENT PAUSE` holds back looks again.
+const PAUSE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 const READ_RESERVE: usize = 16 * 1024;
 /// A reply buffer's first allocation.
 const WRITE_RESERVE: usize = READ_RESERVE;
@@ -707,7 +709,7 @@ async fn handle_uring(
         return Ok(());
     };
     socket.set_nodelay(true)?;
-    if let Some(time) = ctx.settings.tcp_keepalive {
+    if let Some(time) = ctx.tcp_keepalive() {
         let _ = socket.set_tcp_keepalive(Some(time), Some(time / 3), Some(3));
     }
     let store = &*ctx.store;
@@ -732,7 +734,7 @@ async fn handle_uring(
         client.set_buffer_bytes(rbuf.capacity() + wbuf.capacity());
         let filled = rbuf.len();
         let read = socket.read(rbuf.slice_mut(filled..));
-        let (result, slice) = match ctx.settings.timeout {
+        let (result, slice) = match ctx.timeout() {
             None => read.await,
             Some(timeout) => match monoio::time::timeout(timeout, read).await {
                 Ok(read) => read,
@@ -773,14 +775,25 @@ async fn handle_uring(
         loop {
             // Prefetching in the database it has selected. (A `SELECT` in the
             // batch only makes the rest of its prefetching useless.)
+            ctx.follow_special(&mut session);
             let store = ctx.db(&session);
             let parsed = batch.parse(&rbuf, pos, store);
             for i in 0..batch.len() {
                 batch.prefetch(i, store);
                 let args = batch.command(i, &rbuf);
                 if !args.is_empty() {
-                    match run(ctx, &mut session, now, &args, &mut wbuf) {
-                        Some(Reply::Written) => {}
+                    let mut reply = run(ctx, &mut session, now, &args, &mut wbuf);
+                    // Held back by `CLIENT PAUSE`: what it has goes out meanwhile.
+                    while matches!(reply, Some(Reply::Paused)) {
+                        if !wbuf.is_empty() {
+                            wbuf = flush(&mut socket, wbuf).await?;
+                        }
+                        monoio::time::sleep(PAUSE_POLL).await;
+                        now = store.now();
+                        reply = run(ctx, &mut session, now, &args, &mut wbuf);
+                    }
+                    match reply {
+                        Some(Reply::Written | Reply::Paused) => {}
                         Some(Reply::Close) | None => close = true,
                         Some(Reply::Bulk(value)) => resp::write_bulk(&mut wbuf, value.as_bytes()),
                         Some(Reply::Block(blocked)) => {
@@ -920,7 +933,7 @@ pub async fn handle_connection(
     };
     // Without this, Nagle + delayed ACK can stall small replies by ~40ms.
     socket.set_nodelay(true)?;
-    set_keepalive(socket2::SockRef::from(&socket), ctx.settings.tcp_keepalive);
+    set_keepalive(socket2::SockRef::from(&socket), ctx.tcp_keepalive());
     match tls {
         None => serve_stream(socket, ctx, client).await,
         Some(acceptor) => {
@@ -1261,7 +1274,7 @@ async fn serve_stream(
                     }
                     socket.poll_read_ready(cx)
                 });
-                match ctx.settings.timeout {
+                match ctx.timeout() {
                     None => ready.await?,
                     Some(timeout) => match tokio::time::timeout(timeout, ready).await {
                         Ok(ready) => ready?,
@@ -1284,7 +1297,7 @@ async fn serve_stream(
             // socket is drained, so the next wait doesn't first try a read that
             // finds nothing: that cost an extra syscall per request.
             let read = socket.read_buf(&mut rbuf);
-            match ctx.settings.timeout {
+            match ctx.timeout() {
                 Some(timeout) if !plain => match tokio::time::timeout(timeout, read).await {
                     Ok(n) => n?,
                     Err(_) => return Ok(()),
@@ -1310,6 +1323,7 @@ async fn serve_stream(
         loop {
             // Prefetching in the database it has selected. (A `SELECT` in the
             // batch only makes the rest of its prefetching useless.)
+            ctx.follow_special(&mut session);
             let store = ctx.db(&session);
             let parsed = batch.parse(&rbuf, pos, store);
             if std::mem::take(&mut read_first)
@@ -1335,8 +1349,19 @@ async fn serve_stream(
                 let args = batch.command(i, &rbuf);
                 if !args.is_empty() {
                     ran += 1;
-                    match run(ctx, &mut session, now, &args, &mut wbuf) {
-                        Some(Reply::Written) => {}
+                    let mut reply = run(ctx, &mut session, now, &args, &mut wbuf);
+                    // Held back by `CLIENT PAUSE`: what it has goes out meanwhile.
+                    while matches!(reply, Some(Reply::Paused)) {
+                        if !wbuf.is_empty() {
+                            send(&mut socket, &wbuf).await?;
+                            wbuf.clear();
+                        }
+                        tokio::time::sleep(PAUSE_POLL).await;
+                        now = store.now();
+                        reply = run(ctx, &mut session, now, &args, &mut wbuf);
+                    }
+                    match reply {
+                        Some(Reply::Written | Reply::Paused) => {}
                         Some(Reply::Close) | None => close = true,
                         Some(Reply::Bulk(value)) => {
                             // Header, value and trailer in one writev, without

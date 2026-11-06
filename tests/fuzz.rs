@@ -83,6 +83,17 @@ const COMMANDS: &[&[u8]] = &[
     b"SELECT",
     b"MOVE",
     b"SWAPDB",
+    b"MONITOR",
+    b"SLOWLOG",
+    b"MEMORY",
+    b"WAIT",
+    b"WAITAOF",
+    b"ROLE",
+    b"LATENCY",
+    b"MODULE",
+    b"LOLWUT",
+    b"REPLICAOF",
+    b"DEBUG",
     b"DBSIZE",
     b"INFO",
     b"AUTH",
@@ -571,6 +582,7 @@ fn random_commands_never_panic() {
                 b"SSUBSCRIBE",
                 b"SUNSUBSCRIBE",
                 b"RESET",
+                b"MONITOR",
             ]
             .contains(&args[0].as_slice());
             let session = if subscribing || rng.below(20) == 0 {
@@ -580,7 +592,7 @@ fn random_commands_never_panic() {
             };
             // A subscriber's output also holds messages that came before
             // the command, and (un)subscribing replies once per channel.
-            let several = subscribing || session.is_subscribed();
+            let several = subscribing || session.subscriber().is_some();
             match cmd::execute(&ctx, session, now, &Args::new(&buf, &ranges), &mut out) {
                 Reply::Bulk(value) => {
                     if !several {
@@ -591,7 +603,7 @@ fn random_commands_never_panic() {
                 Reply::Written | Reply::Close if several => {
                     assert!(count_replies(&out) >= 1, "step {step}: {args:?}");
                 }
-                Reply::Written | Reply::Close => {
+                Reply::Written | Reply::Close | Reply::Paused => {
                     assert_eq!(count_replies(&out), 1, "step {step}: {args:?}");
                 }
                 // Blocked: nothing written yet. It waits while later

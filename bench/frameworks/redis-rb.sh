@@ -11,7 +11,7 @@ tests() {
   work_on redis-rb
   cp /cache/redis-rb.lock Gemfile.lock 2>/dev/null
   mkdir -p tmp
-  start_server 6381 --unixsocket "$PWD/tmp/redis.sock" --enable-debug-command yes
+  start_server 6381 --unixsocket "$PWD/tmp/redis.sock"
   # It won't start without a Unix socket, which Tantalum doesn't have: one in front of its port.
   if [ "$SERVER" = tantalum ]; then
     socat "UNIX-LISTEN:$PWD/tmp/redis.sock,fork" TCP:127.0.0.1:6381 &

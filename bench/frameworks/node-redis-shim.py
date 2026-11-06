@@ -28,6 +28,7 @@ export async function spawnRedisServerDocker(
   const tantalum = process.env.SERVER === 'tantalum';
   const args: Array<string> = ['--port', String(port)];
   if (tantalum) {
+    args.push('--enable-debug-command', 'yes');
     const at = serverArguments.indexOf('--requirepass');
     if (at >= 0) args.push('--requirepass', serverArguments[at + 1]);
   } else {

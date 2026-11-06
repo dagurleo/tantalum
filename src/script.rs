@@ -251,6 +251,7 @@ impl Scripting {
             ctx,
             session: Session {
                 db: caller.db,
+                special: caller.special,
                 ..Session::for_script()
             },
             now,

@@ -1,5 +1,6 @@
 //! Command dispatch. Replies match Redis 7 byte for byte where practical.
 
+mod admin;
 mod bit;
 mod eval;
 mod group;
@@ -18,7 +19,8 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 pub use crate::blocking::Blocked;
-use crate::context::{Context, KillFilter, Session};
+use crate::command_table;
+use crate::context::{Context, KillFilter, ReplyMode, Session};
 use crate::glob;
 use crate::resp;
 use crate::store::{
@@ -91,6 +93,9 @@ pub enum Reply {
     /// it has, then waits for the reply (see `blocking.rs`). Boxed, so
     /// that every other reply stays as small as before.
     Block(Box<Blocked>),
+    /// `CLIENT PAUSE` holds it back: nothing's run. The connection sends what it
+    /// has, and runs it again in a moment.
+    Paused,
 }
 
 type Handler = fn(&Context, &mut Session, Millis, &Args<'_>, &mut Vec<u8>) -> Reply;
@@ -102,6 +107,8 @@ struct Command {
     /// Number of arguments including the name; negative means at least that.
     arity: i32,
     flags: &'static [&'static str],
+    /// Redis' `fast`: not timed for `SLOWLOG`, unless asked for below 10 ms.
+    fast: bool,
     /// First key, last key (negative counts from the end) and the step
     /// between keys; zeros for commands without keys.
     keys: (i32, i32, i32),
@@ -133,203 +140,215 @@ const ALL_KEYS: (i32, i32, i32) = (1, -1, 1);
 /// Redis 7.
 #[rustfmt::skip]
 static COMMANDS: &[Command] = &[
-    Command { name: "get", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: get },
-    Command { name: "set", arity: -3, flags: &["write", "denyoom"], keys: ONE_KEY, run: set },
-    Command { name: "mget", arity: -2, flags: &["readonly", "fast"], keys: ALL_KEYS, run: mget },
-    Command { name: "mset", arity: -3, flags: &["write", "denyoom"], keys: (1, -1, 2), run: mset },
-    Command { name: "del", arity: -2, flags: &["write"], keys: ALL_KEYS, run: del },
-    Command { name: "unlink", arity: -2, flags: &["write", "fast"], keys: ALL_KEYS, run: del },
-    Command { name: "exists", arity: -2, flags: &["readonly", "fast"], keys: ALL_KEYS, run: exists },
-    Command { name: "expire", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: expire },
-    Command { name: "pexpire", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: pexpire },
-    Command { name: "ttl", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: ttl },
-    Command { name: "pttl", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: pttl },
-    Command { name: "incr", arity: 2, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: incr },
-    Command { name: "incrby", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: incrby },
-    Command { name: "decr", arity: 2, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: decr },
-    Command { name: "decrby", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: decrby },
-    Command { name: "setex", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: setex },
-    Command { name: "psetex", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: psetex },
-    Command { name: "setnx", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: setnx },
-    Command { name: "setbit", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: bit::setbit },
-    Command { name: "getbit", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: bit::getbit },
-    Command { name: "bitcount", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: bit::bitcount },
-    Command { name: "bitpos", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: bit::bitpos },
-    Command { name: "bitop", arity: -4, flags: &["write", "denyoom"], keys: (2, -1, 1), run: bit::bitop },
-    Command { name: "bitfield", arity: -2, flags: &["write", "denyoom"], keys: ONE_KEY, run: bit::bitfield },
-    Command { name: "bitfield_ro", arity: -2, flags: &["readonly", "fast"], keys: ONE_KEY, run: bit::bitfield_ro },
-    Command { name: "strlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: string::strlen },
-    Command { name: "append", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: string::append },
-    Command { name: "getrange", arity: 4, flags: &["readonly"], keys: ONE_KEY, run: string::getrange },
-    Command { name: "substr", arity: 4, flags: &["readonly"], keys: ONE_KEY, run: string::getrange },
-    Command { name: "setrange", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: string::setrange },
-    Command { name: "getset", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: string::getset },
-    Command { name: "incrbyfloat", arity: 3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: string::incrbyfloat },
-    Command { name: "msetnx", arity: -3, flags: &["write", "denyoom"], keys: (1, -1, 2), run: string::msetnx },
-    Command { name: "lcs", arity: -3, flags: &["readonly"], keys: (1, 1, 1), run: string::lcs },
-    Command { name: "getdel", arity: 2, flags: &["write", "fast"], keys: ONE_KEY, run: getdel },
-    Command { name: "getex", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: getex },
-    Command { name: "expireat", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: expireat },
-    Command { name: "pexpireat", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: pexpireat },
-    Command { name: "expiretime", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: expiretime },
-    Command { name: "pexpiretime", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: pexpiretime },
-    Command { name: "persist", arity: 2, flags: &["write", "fast"], keys: ONE_KEY, run: persist },
-    Command { name: "ping", arity: -1, flags: &["fast"], keys: NO_KEYS, run: ping },
-    Command { name: "echo", arity: 2, flags: &["fast"], keys: NO_KEYS, run: echo },
-    Command { name: "select", arity: 2, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: select },
-    Command { name: "dbsize", arity: 1, flags: &["readonly", "fast"], keys: NO_KEYS, run: dbsize },
-    Command { name: "info", arity: -1, flags: &["loading", "stale"], keys: NO_KEYS, run: info },
-    Command { name: "auth", arity: -2, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: auth },
-    Command { name: "hello", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: hello },
-    Command { name: "client", arity: -2, flags: &[], keys: NO_KEYS, run: client },
-    Command { name: "command", arity: -1, flags: &["loading", "stale"], keys: NO_KEYS, run: command },
-    Command { name: "config", arity: -2, flags: &[], keys: NO_KEYS, run: config },
-    Command { name: "flushall", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
-    Command { name: "save", arity: 1, flags: &["admin", "noscript"], keys: NO_KEYS, run: save },
-    Command { name: "bgsave", arity: -1, flags: &["admin", "noscript"], keys: NO_KEYS, run: bgsave },
-    Command { name: "bgrewriteaof", arity: 1, flags: &["admin", "noscript", "no_async_loading"], keys: NO_KEYS, run: bgrewriteaof },
-    Command { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: lastsave },
-    Command { name: "flushdb", arity: -1, flags: &["write"], keys: NO_KEYS, run: flush },
-    Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], keys: NO_KEYS, run: quit },
-    Command { name: "multi", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: NO_KEYS, run: multi::multi },
-    Command { name: "exec", arity: 1, flags: &["noscript", "loading", "stale", "skip_slowlog"], keys: NO_KEYS, run: multi::exec },
-    Command { name: "discard", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: NO_KEYS, run: multi::discard },
-    Command { name: "watch", arity: -2, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: (1, -1, 1), run: multi::watch },
-    Command { name: "unwatch", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], keys: NO_KEYS, run: multi::unwatch },
-    Command { name: "time", arity: 1, flags: &["loading", "stale", "fast"], keys: NO_KEYS, run: time },
-    Command { name: "eval", arity: -3, flags: &["noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::eval },
-    Command { name: "evalsha", arity: -3, flags: &["noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::evalsha },
-    Command { name: "eval_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::eval_ro },
-    Command { name: "evalsha_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], keys: NO_KEYS, run: eval::evalsha_ro },
-    Command { name: "script", arity: -2, flags: &[], keys: NO_KEYS, run: eval::script },
-    Command { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"], keys: NO_KEYS, run: pubsub::reset },
-    Command { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::subscribe },
-    Command { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::unsubscribe },
-    Command { name: "psubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::psubscribe },
-    Command { name: "punsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: NO_KEYS, run: pubsub::punsubscribe },
-    Command { name: "ssubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], keys: (1, -1, 1), run: pubsub::ssubscribe },
-    Command { name: "sunsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], keys: (1, -1, 1), run: pubsub::sunsubscribe },
-    Command { name: "publish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], keys: NO_KEYS, run: pubsub::publish },
-    Command { name: "spublish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], keys: ONE_KEY, run: pubsub::spublish },
-    Command { name: "pubsub", arity: -2, flags: &[], keys: NO_KEYS, run: pubsub::pubsub },
-    Command { name: "type", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: type_of },
-    Command { name: "scan", arity: -2, flags: &["readonly"], keys: NO_KEYS, run: keys::scan },
-    Command { name: "keys", arity: 2, flags: &["readonly"], keys: NO_KEYS, run: keys::keys },
-    Command { name: "rename", arity: 3, flags: &["write"], keys: (1, 2, 1), run: keys::rename },
-    Command { name: "renamenx", arity: 3, flags: &["write", "fast"], keys: (1, 2, 1), run: keys::renamenx },
-    Command { name: "touch", arity: -2, flags: &["readonly", "fast"], keys: ALL_KEYS, run: keys::touch },
-    Command { name: "randomkey", arity: 1, flags: &["readonly"], keys: NO_KEYS, run: keys::randomkey },
-    Command { name: "sort", arity: -2, flags: &["write", "denyoom"], keys: ONE_KEY, run: sort::sort },
-    Command { name: "sort_ro", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: sort::sort_ro },
-    Command { name: "copy", arity: -3, flags: &["write", "denyoom"], keys: (1, 2, 1), run: keys::copy },
-    Command { name: "move", arity: 3, flags: &["write", "fast"], keys: (1, 1, 1), run: keys::move_key },
-    Command { name: "swapdb", arity: 3, flags: &["write", "fast"], keys: NO_KEYS, run: keys::swapdb },
-    Command { name: "object", arity: -2, flags: &[], keys: NO_KEYS, run: keys::object },
-    Command { name: "hget", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hget },
-    Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hset },
-    Command { name: "hgetall", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hgetall },
-    Command { name: "hdel", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: hash::hdel },
-    Command { name: "hmget", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hmget },
-    Command { name: "hincrby", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hincrby },
-    Command { name: "hincrbyfloat", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hincrbyfloat },
-    Command { name: "hrandfield", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: hash::hrandfield },
-    Command { name: "hexists", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hexists },
-    Command { name: "hlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hlen },
-    Command { name: "hmset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hmset },
-    Command { name: "hsetnx", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hsetnx },
-    Command { name: "hkeys", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hkeys },
-    Command { name: "hvals", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: hash::hvals },
-    Command { name: "hstrlen", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hstrlen },
-    Command { name: "hscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: hash::hscan },
-    Command { name: "sadd", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: set::sadd },
-    Command { name: "sismember", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: set::sismember },
-    Command { name: "smembers", arity: 2, flags: &["readonly"], keys: ONE_KEY, run: set::smembers },
-    Command { name: "srem", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: set::srem },
-    Command { name: "scard", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: set::scard },
-    Command { name: "smismember", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: set::smismember },
-    Command { name: "spop", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: set::spop },
-    Command { name: "srandmember", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: set::srandmember },
-    Command { name: "smove", arity: 4, flags: &["write", "fast"], keys: (1, 2, 1), run: set::smove },
-    Command { name: "sinter", arity: -2, flags: &["readonly"], keys: ALL_KEYS, run: set::sinter },
-    Command { name: "sinterstore", arity: -3, flags: &["write", "denyoom"], keys: ALL_KEYS, run: set::sinterstore },
-    Command { name: "sintercard", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: set::sintercard },
-    Command { name: "sunion", arity: -2, flags: &["readonly"], keys: ALL_KEYS, run: set::sunion },
-    Command { name: "sunionstore", arity: -3, flags: &["write", "denyoom"], keys: ALL_KEYS, run: set::sunionstore },
-    Command { name: "sdiff", arity: -2, flags: &["readonly"], keys: ALL_KEYS, run: set::sdiff },
-    Command { name: "sdiffstore", arity: -3, flags: &["write", "denyoom"], keys: ALL_KEYS, run: set::sdiffstore },
-    Command { name: "sscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: set::sscan },
-    Command { name: "lpush", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::lpush },
-    Command { name: "rpush", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::rpush },
-    Command { name: "lpop", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: list::lpop },
-    Command { name: "rpop", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: list::rpop },
-    Command { name: "lrange", arity: 4, flags: &["readonly"], keys: ONE_KEY, run: list::lrange },
-    Command { name: "llen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: list::llen },
-    Command { name: "lindex", arity: 3, flags: &["readonly"], keys: ONE_KEY, run: list::lindex },
-    Command { name: "lset", arity: 4, flags: &["write", "denyoom"], keys: ONE_KEY, run: list::lset },
-    Command { name: "linsert", arity: 5, flags: &["write", "denyoom"], keys: ONE_KEY, run: list::linsert },
-    Command { name: "lrem", arity: 4, flags: &["write"], keys: ONE_KEY, run: list::lrem },
-    Command { name: "ltrim", arity: 4, flags: &["write"], keys: ONE_KEY, run: list::ltrim },
-    Command { name: "lpos", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: list::lpos },
-    Command { name: "lpushx", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::lpushx },
-    Command { name: "rpushx", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: list::rpushx },
-    Command { name: "lmove", arity: 5, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::lmove },
-    Command { name: "rpoplpush", arity: 3, flags: &["write", "denyoom"], keys: (1, 2, 1), run: list::rpoplpush },
-    Command { name: "lmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: list::lmpop },
-    Command { name: "blpop", arity: -3, flags: &["write", "blocking"], keys: (1, -2, 1), run: list::blpop },
-    Command { name: "brpop", arity: -3, flags: &["write", "blocking"], keys: (1, -2, 1), run: list::brpop },
-    Command { name: "blmove", arity: 6, flags: &["write", "denyoom", "blocking"], keys: (1, 2, 1), run: list::blmove },
-    Command { name: "brpoplpush", arity: 4, flags: &["write", "denyoom", "blocking"], keys: (1, 2, 1), run: list::brpoplpush },
-    Command { name: "blmpop", arity: -5, flags: &["write", "blocking"], keys: NO_KEYS, run: list::blmpop },
-    Command { name: "zadd", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: zset::zadd },
-    Command { name: "zscore", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zscore },
-    Command { name: "zrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrange },
-    Command { name: "zincrby", arity: 4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: zset::zincrby },
-    Command { name: "zrem", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zrem },
-    Command { name: "zcard", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zcard },
-    Command { name: "zrank", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zrank },
-    Command { name: "zrevrank", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zrevrank },
-    Command { name: "zrevrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrevrange },
-    Command { name: "zrangebyscore", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrangebyscore },
-    Command { name: "zrevrangebyscore", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrevrangebyscore },
-    Command { name: "zrangebylex", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrangebylex },
-    Command { name: "zrevrangebylex", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: zset::zrevrangebylex },
-    Command { name: "zrangestore", arity: -5, flags: &["write", "denyoom"], keys: (1, 2, 1), run: zset::zrangestore },
-    Command { name: "zcount", arity: 4, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zcount },
-    Command { name: "zlexcount", arity: 4, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zlexcount },
-    Command { name: "zmscore", arity: -3, flags: &["readonly", "fast"], keys: ONE_KEY, run: zset::zmscore },
-    Command { name: "zremrangebyrank", arity: 4, flags: &["write"], keys: ONE_KEY, run: zset::zremrangebyrank },
-    Command { name: "zremrangebyscore", arity: 4, flags: &["write"], keys: ONE_KEY, run: zset::zremrangebyscore },
-    Command { name: "zremrangebylex", arity: 4, flags: &["write"], keys: ONE_KEY, run: zset::zremrangebylex },
-    Command { name: "zpopmin", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zpopmin },
-    Command { name: "zpopmax", arity: -2, flags: &["write", "fast"], keys: ONE_KEY, run: zset::zpopmax },
-    Command { name: "zmpop", arity: -4, flags: &["write"], keys: NO_KEYS, run: zset::zmpop },
-    Command { name: "bzpopmin", arity: -3, flags: &["write", "blocking", "fast"], keys: (1, -2, 1), run: zset::bzpopmin },
-    Command { name: "bzpopmax", arity: -3, flags: &["write", "blocking", "fast"], keys: (1, -2, 1), run: zset::bzpopmax },
-    Command { name: "xadd", arity: -5, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: stream::xadd },
-    Command { name: "xlen", arity: 2, flags: &["readonly", "fast"], keys: ONE_KEY, run: stream::xlen },
-    Command { name: "xrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: stream::xrange },
-    Command { name: "xrevrange", arity: -4, flags: &["readonly"], keys: ONE_KEY, run: stream::xrevrange },
-    Command { name: "xdel", arity: -3, flags: &["write", "fast"], keys: ONE_KEY, run: stream::xdel },
-    Command { name: "xtrim", arity: -4, flags: &["write"], keys: ONE_KEY, run: stream::xtrim },
-    Command { name: "xread", arity: -4, flags: &["readonly", "blocking"], keys: NO_KEYS, run: stream::xread },
-    Command { name: "xreadgroup", arity: -7, flags: &["write", "blocking"], keys: NO_KEYS, run: group::xreadgroup },
-    Command { name: "xgroup", arity: -2, flags: &["write"], keys: NO_KEYS, run: group::xgroup },
-    Command { name: "xack", arity: -4, flags: &["write", "fast"], keys: ONE_KEY, run: group::xack },
-    Command { name: "xpending", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: group::xpending },
-    Command { name: "xclaim", arity: -6, flags: &["write", "fast"], keys: ONE_KEY, run: group::xclaim },
-    Command { name: "xautoclaim", arity: -6, flags: &["write", "fast"], keys: ONE_KEY, run: group::xautoclaim },
-    Command { name: "xinfo", arity: -2, flags: &["readonly"], keys: NO_KEYS, run: group::xinfo },
-    Command { name: "xsetid", arity: -3, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: group::xsetid },
-    Command { name: "bzmpop", arity: -5, flags: &["write", "blocking"], keys: NO_KEYS, run: zset::bzmpop },
-    Command { name: "zrandmember", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: zset::zrandmember },
-    Command { name: "zscan", arity: -3, flags: &["readonly"], keys: ONE_KEY, run: zset::zscan },
-    Command { name: "zunion", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zunion },
-    Command { name: "zinter", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zinter },
-    Command { name: "zdiff", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zdiff },
-    Command { name: "zunionstore", arity: -4, flags: &["write", "denyoom"], keys: ONE_KEY, run: zset::zunionstore },
-    Command { name: "zinterstore", arity: -4, flags: &["write", "denyoom"], keys: ONE_KEY, run: zset::zinterstore },
-    Command { name: "zdiffstore", arity: -4, flags: &["write", "denyoom"], keys: ONE_KEY, run: zset::zdiffstore },
-    Command { name: "zintercard", arity: -3, flags: &["readonly"], keys: NO_KEYS, run: zset::zintercard },
+    Command { name: "get", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: get },
+    Command { name: "set", arity: -3, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: set },
+    Command { name: "mget", arity: -2, flags: &["readonly", "fast"], fast: true, keys: ALL_KEYS, run: mget },
+    Command { name: "mset", arity: -3, flags: &["write", "denyoom"], fast: false, keys: (1, -1, 2), run: mset },
+    Command { name: "del", arity: -2, flags: &["write"], fast: false, keys: ALL_KEYS, run: del },
+    Command { name: "unlink", arity: -2, flags: &["write", "fast"], fast: true, keys: ALL_KEYS, run: del },
+    Command { name: "exists", arity: -2, flags: &["readonly", "fast"], fast: true, keys: ALL_KEYS, run: exists },
+    Command { name: "expire", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: expire },
+    Command { name: "pexpire", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: pexpire },
+    Command { name: "ttl", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: ttl },
+    Command { name: "pttl", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: pttl },
+    Command { name: "incr", arity: 2, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: incr },
+    Command { name: "incrby", arity: 3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: incrby },
+    Command { name: "decr", arity: 2, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: decr },
+    Command { name: "decrby", arity: 3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: decrby },
+    Command { name: "setex", arity: 4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: setex },
+    Command { name: "psetex", arity: 4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: psetex },
+    Command { name: "setnx", arity: 3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: setnx },
+    Command { name: "setbit", arity: 4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: bit::setbit },
+    Command { name: "getbit", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: bit::getbit },
+    Command { name: "bitcount", arity: -2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: bit::bitcount },
+    Command { name: "bitpos", arity: -3, flags: &["readonly"], fast: false, keys: ONE_KEY, run: bit::bitpos },
+    Command { name: "bitop", arity: -4, flags: &["write", "denyoom"], fast: false, keys: (2, -1, 1), run: bit::bitop },
+    Command { name: "bitfield", arity: -2, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: bit::bitfield },
+    Command { name: "bitfield_ro", arity: -2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: bit::bitfield_ro },
+    Command { name: "strlen", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: string::strlen },
+    Command { name: "append", arity: 3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: string::append },
+    Command { name: "getrange", arity: 4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: string::getrange },
+    Command { name: "substr", arity: 4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: string::getrange },
+    Command { name: "setrange", arity: 4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: string::setrange },
+    Command { name: "getset", arity: 3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: string::getset },
+    Command { name: "incrbyfloat", arity: 3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: string::incrbyfloat },
+    Command { name: "msetnx", arity: -3, flags: &["write", "denyoom"], fast: false, keys: (1, -1, 2), run: string::msetnx },
+    Command { name: "lcs", arity: -3, flags: &["readonly"], fast: false, keys: (1, 1, 1), run: string::lcs },
+    Command { name: "getdel", arity: 2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: getdel },
+    Command { name: "getex", arity: -2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: getex },
+    Command { name: "expireat", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: expireat },
+    Command { name: "pexpireat", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: pexpireat },
+    Command { name: "expiretime", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: expiretime },
+    Command { name: "pexpiretime", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: pexpiretime },
+    Command { name: "persist", arity: 2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: persist },
+    Command { name: "ping", arity: -1, flags: &["fast"], fast: true, keys: NO_KEYS, run: ping },
+    Command { name: "echo", arity: 2, flags: &["fast"], fast: true, keys: NO_KEYS, run: echo },
+    Command { name: "select", arity: 2, flags: &["loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: select },
+    Command { name: "dbsize", arity: 1, flags: &["readonly", "fast"], fast: true, keys: NO_KEYS, run: dbsize },
+    Command { name: "info", arity: -1, flags: &["loading", "stale"], fast: false, keys: NO_KEYS, run: info },
+    Command { name: "auth", arity: -2, flags: &["noscript", "loading", "stale", "fast", "no_auth"], fast: true, keys: NO_KEYS, run: auth },
+    Command { name: "hello", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], fast: true, keys: NO_KEYS, run: hello },
+    Command { name: "client", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: client },
+    Command { name: "command", arity: -1, flags: &["loading", "stale"], fast: false, keys: NO_KEYS, run: command },
+    Command { name: "config", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::config },
+    Command { name: "flushall", arity: -1, flags: &["write"], fast: false, keys: NO_KEYS, run: flush },
+    Command { name: "save", arity: 1, flags: &["admin", "noscript"], fast: false, keys: NO_KEYS, run: save },
+    Command { name: "bgsave", arity: -1, flags: &["admin", "noscript"], fast: false, keys: NO_KEYS, run: bgsave },
+    Command { name: "bgrewriteaof", arity: 1, flags: &["admin", "noscript", "no_async_loading"], fast: false, keys: NO_KEYS, run: bgrewriteaof },
+    Command { name: "lastsave", arity: 1, flags: &["loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: lastsave },
+    Command { name: "flushdb", arity: -1, flags: &["write"], fast: false, keys: NO_KEYS, run: flush },
+    Command { name: "quit", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], fast: true, keys: NO_KEYS, run: quit },
+    Command { name: "multi", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], fast: true, keys: NO_KEYS, run: multi::multi },
+    Command { name: "exec", arity: 1, flags: &["noscript", "loading", "stale", "skip_slowlog"], fast: false, keys: NO_KEYS, run: multi::exec },
+    Command { name: "discard", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], fast: true, keys: NO_KEYS, run: multi::discard },
+    Command { name: "watch", arity: -2, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], fast: true, keys: (1, -1, 1), run: multi::watch },
+    Command { name: "unwatch", arity: 1, flags: &["noscript", "loading", "stale", "fast", "allow_busy"], fast: true, keys: NO_KEYS, run: multi::unwatch },
+    Command { name: "time", arity: 1, flags: &["loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: time },
+    Command { name: "eval", arity: -3, flags: &["noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: eval::eval },
+    Command { name: "evalsha", arity: -3, flags: &["noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: eval::evalsha },
+    Command { name: "eval_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: eval::eval_ro },
+    Command { name: "evalsha_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: eval::evalsha_ro },
+    Command { name: "script", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: eval::script },
+    Command { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"], fast: true, keys: NO_KEYS, run: pubsub::reset },
+    Command { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: pubsub::subscribe },
+    Command { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: pubsub::unsubscribe },
+    Command { name: "psubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: pubsub::psubscribe },
+    Command { name: "punsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: pubsub::punsubscribe },
+    Command { name: "ssubscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: (1, -1, 1), run: pubsub::ssubscribe },
+    Command { name: "sunsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: (1, -1, 1), run: pubsub::sunsubscribe },
+    Command { name: "publish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: pubsub::publish },
+    Command { name: "spublish", arity: 3, flags: &["pubsub", "loading", "stale", "fast"], fast: true, keys: ONE_KEY, run: pubsub::spublish },
+    Command { name: "pubsub", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: pubsub::pubsub },
+    Command { name: "type", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: type_of },
+    Command { name: "scan", arity: -2, flags: &["readonly"], fast: false, keys: NO_KEYS, run: keys::scan },
+    Command { name: "keys", arity: 2, flags: &["readonly"], fast: false, keys: NO_KEYS, run: keys::keys },
+    Command { name: "rename", arity: 3, flags: &["write"], fast: false, keys: (1, 2, 1), run: keys::rename },
+    Command { name: "renamenx", arity: 3, flags: &["write", "fast"], fast: true, keys: (1, 2, 1), run: keys::renamenx },
+    Command { name: "touch", arity: -2, flags: &["readonly", "fast"], fast: true, keys: ALL_KEYS, run: keys::touch },
+    Command { name: "randomkey", arity: 1, flags: &["readonly"], fast: false, keys: NO_KEYS, run: keys::randomkey },
+    Command { name: "sort", arity: -2, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: sort::sort },
+    Command { name: "sort_ro", arity: -2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: sort::sort_ro },
+    Command { name: "copy", arity: -3, flags: &["write", "denyoom"], fast: false, keys: (1, 2, 1), run: keys::copy },
+    Command { name: "monitor", arity: 1, flags: &["admin", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: admin::monitor },
+    Command { name: "slowlog", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::slowlog },
+    Command { name: "memory", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::memory },
+    Command { name: "wait", arity: 3, flags: &[], fast: false, keys: NO_KEYS, run: admin::wait },
+    Command { name: "waitaof", arity: 4, flags: &["noscript"], fast: false, keys: NO_KEYS, run: admin::waitaof },
+    Command { name: "role", arity: 1, flags: &["noscript", "loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: admin::role },
+    Command { name: "replicaof", arity: 3, flags: &["admin", "noscript", "stale", "no_async_loading"], fast: false, keys: NO_KEYS, run: admin::replicaof },
+    Command { name: "slaveof", arity: 3, flags: &["admin", "noscript", "stale", "no_async_loading"], fast: false, keys: NO_KEYS, run: admin::replicaof },
+    Command { name: "lolwut", arity: -1, flags: &["readonly", "fast"], fast: true, keys: NO_KEYS, run: admin::lolwut },
+    Command { name: "module", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::module },
+    Command { name: "latency", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::latency },
+    Command { name: "debug", arity: -2, flags: &["admin", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: admin::debug },
+    Command { name: "move", arity: 3, flags: &["write", "fast"], fast: true, keys: (1, 1, 1), run: keys::move_key },
+    Command { name: "swapdb", arity: 3, flags: &["write", "fast"], fast: true, keys: NO_KEYS, run: keys::swapdb },
+    Command { name: "object", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: keys::object },
+    Command { name: "hget", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hget },
+    Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hset },
+    Command { name: "hgetall", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: hash::hgetall },
+    Command { name: "hdel", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: hash::hdel },
+    Command { name: "hmget", arity: -3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hmget },
+    Command { name: "hincrby", arity: 4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hincrby },
+    Command { name: "hincrbyfloat", arity: 4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hincrbyfloat },
+    Command { name: "hrandfield", arity: -2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: hash::hrandfield },
+    Command { name: "hexists", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hexists },
+    Command { name: "hlen", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hlen },
+    Command { name: "hmset", arity: -4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hmset },
+    Command { name: "hsetnx", arity: 4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hsetnx },
+    Command { name: "hkeys", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: hash::hkeys },
+    Command { name: "hvals", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: hash::hvals },
+    Command { name: "hstrlen", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hstrlen },
+    Command { name: "hscan", arity: -3, flags: &["readonly"], fast: false, keys: ONE_KEY, run: hash::hscan },
+    Command { name: "sadd", arity: -3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: set::sadd },
+    Command { name: "sismember", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: set::sismember },
+    Command { name: "smembers", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: set::smembers },
+    Command { name: "srem", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: set::srem },
+    Command { name: "scard", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: set::scard },
+    Command { name: "smismember", arity: -3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: set::smismember },
+    Command { name: "spop", arity: -2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: set::spop },
+    Command { name: "srandmember", arity: -2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: set::srandmember },
+    Command { name: "smove", arity: 4, flags: &["write", "fast"], fast: true, keys: (1, 2, 1), run: set::smove },
+    Command { name: "sinter", arity: -2, flags: &["readonly"], fast: false, keys: ALL_KEYS, run: set::sinter },
+    Command { name: "sinterstore", arity: -3, flags: &["write", "denyoom"], fast: false, keys: ALL_KEYS, run: set::sinterstore },
+    Command { name: "sintercard", arity: -3, flags: &["readonly"], fast: false, keys: NO_KEYS, run: set::sintercard },
+    Command { name: "sunion", arity: -2, flags: &["readonly"], fast: false, keys: ALL_KEYS, run: set::sunion },
+    Command { name: "sunionstore", arity: -3, flags: &["write", "denyoom"], fast: false, keys: ALL_KEYS, run: set::sunionstore },
+    Command { name: "sdiff", arity: -2, flags: &["readonly"], fast: false, keys: ALL_KEYS, run: set::sdiff },
+    Command { name: "sdiffstore", arity: -3, flags: &["write", "denyoom"], fast: false, keys: ALL_KEYS, run: set::sdiffstore },
+    Command { name: "sscan", arity: -3, flags: &["readonly"], fast: false, keys: ONE_KEY, run: set::sscan },
+    Command { name: "lpush", arity: -3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: list::lpush },
+    Command { name: "rpush", arity: -3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: list::rpush },
+    Command { name: "lpop", arity: -2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: list::lpop },
+    Command { name: "rpop", arity: -2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: list::rpop },
+    Command { name: "lrange", arity: 4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: list::lrange },
+    Command { name: "llen", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: list::llen },
+    Command { name: "lindex", arity: 3, flags: &["readonly"], fast: false, keys: ONE_KEY, run: list::lindex },
+    Command { name: "lset", arity: 4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: list::lset },
+    Command { name: "linsert", arity: 5, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: list::linsert },
+    Command { name: "lrem", arity: 4, flags: &["write"], fast: false, keys: ONE_KEY, run: list::lrem },
+    Command { name: "ltrim", arity: 4, flags: &["write"], fast: false, keys: ONE_KEY, run: list::ltrim },
+    Command { name: "lpos", arity: -3, flags: &["readonly"], fast: false, keys: ONE_KEY, run: list::lpos },
+    Command { name: "lpushx", arity: -3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: list::lpushx },
+    Command { name: "rpushx", arity: -3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: list::rpushx },
+    Command { name: "lmove", arity: 5, flags: &["write", "denyoom"], fast: false, keys: (1, 2, 1), run: list::lmove },
+    Command { name: "rpoplpush", arity: 3, flags: &["write", "denyoom"], fast: false, keys: (1, 2, 1), run: list::rpoplpush },
+    Command { name: "lmpop", arity: -4, flags: &["write"], fast: false, keys: NO_KEYS, run: list::lmpop },
+    Command { name: "blpop", arity: -3, flags: &["write", "blocking"], fast: false, keys: (1, -2, 1), run: list::blpop },
+    Command { name: "brpop", arity: -3, flags: &["write", "blocking"], fast: false, keys: (1, -2, 1), run: list::brpop },
+    Command { name: "blmove", arity: 6, flags: &["write", "denyoom", "blocking"], fast: false, keys: (1, 2, 1), run: list::blmove },
+    Command { name: "brpoplpush", arity: 4, flags: &["write", "denyoom", "blocking"], fast: false, keys: (1, 2, 1), run: list::brpoplpush },
+    Command { name: "blmpop", arity: -5, flags: &["write", "blocking"], fast: false, keys: NO_KEYS, run: list::blmpop },
+    Command { name: "zadd", arity: -4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: zset::zadd },
+    Command { name: "zscore", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: zset::zscore },
+    Command { name: "zrange", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zrange },
+    Command { name: "zincrby", arity: 4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: zset::zincrby },
+    Command { name: "zrem", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: zset::zrem },
+    Command { name: "zcard", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: zset::zcard },
+    Command { name: "zrank", arity: -3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: zset::zrank },
+    Command { name: "zrevrank", arity: -3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: zset::zrevrank },
+    Command { name: "zrevrange", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zrevrange },
+    Command { name: "zrangebyscore", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zrangebyscore },
+    Command { name: "zrevrangebyscore", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zrevrangebyscore },
+    Command { name: "zrangebylex", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zrangebylex },
+    Command { name: "zrevrangebylex", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zrevrangebylex },
+    Command { name: "zrangestore", arity: -5, flags: &["write", "denyoom"], fast: false, keys: (1, 2, 1), run: zset::zrangestore },
+    Command { name: "zcount", arity: 4, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: zset::zcount },
+    Command { name: "zlexcount", arity: 4, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: zset::zlexcount },
+    Command { name: "zmscore", arity: -3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: zset::zmscore },
+    Command { name: "zremrangebyrank", arity: 4, flags: &["write"], fast: false, keys: ONE_KEY, run: zset::zremrangebyrank },
+    Command { name: "zremrangebyscore", arity: 4, flags: &["write"], fast: false, keys: ONE_KEY, run: zset::zremrangebyscore },
+    Command { name: "zremrangebylex", arity: 4, flags: &["write"], fast: false, keys: ONE_KEY, run: zset::zremrangebylex },
+    Command { name: "zpopmin", arity: -2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: zset::zpopmin },
+    Command { name: "zpopmax", arity: -2, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: zset::zpopmax },
+    Command { name: "zmpop", arity: -4, flags: &["write"], fast: false, keys: NO_KEYS, run: zset::zmpop },
+    Command { name: "bzpopmin", arity: -3, flags: &["write", "blocking", "fast"], fast: true, keys: (1, -2, 1), run: zset::bzpopmin },
+    Command { name: "bzpopmax", arity: -3, flags: &["write", "blocking", "fast"], fast: true, keys: (1, -2, 1), run: zset::bzpopmax },
+    Command { name: "xadd", arity: -5, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: stream::xadd },
+    Command { name: "xlen", arity: 2, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: stream::xlen },
+    Command { name: "xrange", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: stream::xrange },
+    Command { name: "xrevrange", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: stream::xrevrange },
+    Command { name: "xdel", arity: -3, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: stream::xdel },
+    Command { name: "xtrim", arity: -4, flags: &["write"], fast: false, keys: ONE_KEY, run: stream::xtrim },
+    Command { name: "xread", arity: -4, flags: &["readonly", "blocking"], fast: false, keys: NO_KEYS, run: stream::xread },
+    Command { name: "xreadgroup", arity: -7, flags: &["write", "blocking"], fast: false, keys: NO_KEYS, run: group::xreadgroup },
+    Command { name: "xgroup", arity: -2, flags: &["write"], fast: false, keys: NO_KEYS, run: group::xgroup },
+    Command { name: "xack", arity: -4, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: group::xack },
+    Command { name: "xpending", arity: -3, flags: &["readonly"], fast: false, keys: ONE_KEY, run: group::xpending },
+    Command { name: "xclaim", arity: -6, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: group::xclaim },
+    Command { name: "xautoclaim", arity: -6, flags: &["write", "fast"], fast: true, keys: ONE_KEY, run: group::xautoclaim },
+    Command { name: "xinfo", arity: -2, flags: &["readonly"], fast: false, keys: NO_KEYS, run: group::xinfo },
+    Command { name: "xsetid", arity: -3, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: group::xsetid },
+    Command { name: "bzmpop", arity: -5, flags: &["write", "blocking"], fast: false, keys: NO_KEYS, run: zset::bzmpop },
+    Command { name: "zrandmember", arity: -2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zrandmember },
+    Command { name: "zscan", arity: -3, flags: &["readonly"], fast: false, keys: ONE_KEY, run: zset::zscan },
+    Command { name: "zunion", arity: -3, flags: &["readonly"], fast: false, keys: NO_KEYS, run: zset::zunion },
+    Command { name: "zinter", arity: -3, flags: &["readonly"], fast: false, keys: NO_KEYS, run: zset::zinter },
+    Command { name: "zdiff", arity: -3, flags: &["readonly"], fast: false, keys: NO_KEYS, run: zset::zdiff },
+    Command { name: "zunionstore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: zset::zunionstore },
+    Command { name: "zinterstore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: zset::zinterstore },
+    Command { name: "zdiffstore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: zset::zdiffstore },
+    Command { name: "zintercard", arity: -3, flags: &["readonly"], fast: false, keys: NO_KEYS, run: zset::zintercard },
 ];
 
 /// Runs one command and writes its reply to `out`. `args` must be non-empty.
@@ -356,12 +375,17 @@ pub fn execute(
                 Some(_) => {}
             }
         }
-    } else if let Some(subscriber) = session.subscriber()
-        && !subscriber.take(out)
-    {
-        // Messages that came before this command go out first; this
-        // client is over its output limit.
-        return Reply::Close;
+    } else {
+        if !matches!(session.reply, ReplyMode::On | ReplyMode::Passing) {
+            return silenced(ctx, session, now, args, out);
+        }
+        if let Some(subscriber) = session.subscriber()
+            && !subscriber.take(out)
+        {
+            // Messages that came before this command go out first; this
+            // client is over its output limit.
+            return Reply::Close;
+        }
     }
     // Checked in Redis' order: unknown command, arity, then authentication.
     let Some(command) = find_command(name) else {
@@ -393,6 +417,10 @@ pub fn execute(
         return Reply::Written;
     }
     if !session.unrestricted {
+        if session.special && held_back(ctx, session, command) {
+            session.commands -= 1;
+            return Reply::Paused;
+        }
         // A subscribed RESP2 client may only run the pub/sub ones, PING,
         // QUIT and RESET (but hears about an unknown subcommand first).
         if session.pubsub.is_some()
@@ -416,17 +444,240 @@ pub fn execute(
             }
             return Reply::Written;
         }
+        if session.special {
+            return watched(ctx, session, now, command, args, out);
+        }
     }
+    dispatch(ctx, session, now, command, args, out)
+}
+
+/// A command's run, past every check.
+#[inline]
+fn dispatch(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    command: &Command,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
     if let Some(aof) = ctx.aof()
         && (command.writes() || matches!(command.name, "eval" | "evalsha" | "exec"))
     {
         return logged(ctx, session, aof, command, args, out);
     }
-    let reply = (command.run)(ctx, session, now, args, out);
+    let reply = timed(ctx, session, now, command, args, out);
     if ctx.store.has_ready() {
         serve_ready(ctx, now);
     }
     reply
+}
+
+/// Runs a command, logging it if it took long: by the clock a thread ticks, as
+/// reading it is next to nothing (see `slowlog.rs`), and not at all if it's `fast`.
+#[inline]
+fn timed(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    command: &Command,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    if command.fast {
+        return (command.run)(ctx, session, now, args, out);
+    }
+    let before = ctx.ticks();
+    let reply = (command.run)(ctx, session, now, args, out);
+    if ctx.ticks() != before {
+        slow_by_ticks(ctx, session, command, args, before);
+    }
+    reply
+}
+
+#[cold]
+fn slow_by_ticks(
+    ctx: &Context,
+    session: &mut Session,
+    command: &Command,
+    args: &Args<'_>,
+    before: u64,
+) {
+    // The clock may have gone to sleep while this ran: ask what time it really is.
+    ctx.tick();
+    let ticks = ctx.ticks().saturating_sub(before);
+    if ticks >= ctx.slowlog.threshold_ticks() && !session.special {
+        log_slow(
+            ctx,
+            session,
+            command,
+            args,
+            ticks * crate::slowlog::TICK_MICROS as u64,
+        );
+    }
+}
+
+fn log_slow(ctx: &Context, session: &mut Session, command: &Command, args: &Args<'_>, micros: u64) {
+    let sub = (args.len() > 1).then(|| args.get(1));
+    if command_table::hidden(command.name, sub).from_slowlog || turned_away(command, args) {
+        return;
+    }
+    // A script's own commands have no one to name, as in Redis.
+    if session.in_script {
+        ctx.slowlog.push(args, micros, String::new(), b"");
+        return;
+    }
+    let peer = ctx.peer_of(session);
+    let name = session.name.as_deref().unwrap_or_default();
+    ctx.slowlog.push(args, micros, peer, name);
+}
+
+/// A subcommand that Redis would have refused before running anything, so that nothing hears of it.
+fn turned_away(command: &Command, args: &Args<'_>) -> bool {
+    args.len() > 1 && command_table::refused_subcommand(command.name, args.get(1), args.len())
+}
+
+/// Whether `CLIENT PAUSE` holds this command back: all of them, or those that
+/// write or may.
+#[cold]
+fn held_back(ctx: &Context, session: &Session, command: &Command) -> bool {
+    match ctx.pause_mode() {
+        None => false,
+        Some(true) => true,
+        Some(false) => {
+            command.writes()
+                || match command.name {
+                    "publish" | "spublish" | "eval" | "evalsha" | "script" | "wait" | "waitaof" => {
+                        true
+                    }
+                    "exec" => session.multi.as_ref().is_some_and(|queue| {
+                        (0..queue.len()).any(|i| {
+                            let name = queue.command(i);
+                            find_write_command(name.get(0)).is_some()
+                                || matches!(
+                                    find_command(name.get(0)).map(|c| c.name),
+                                    Some("publish" | "spublish" | "eval" | "evalsha")
+                                )
+                        })
+                    }),
+                    _ => false,
+                }
+        }
+    }
+}
+
+/// A command run while something's watching: `MONITOR` hears of it, and it's timed
+/// with a real clock (see `Context::special`).
+#[cold]
+fn watched(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    command: &Command,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let script = heard_first(ctx, session, command, args);
+    let started = std::time::Instant::now();
+    let reply = dispatch(ctx, session, now, command, args, out);
+    has_run(ctx, session, command, args, started, !script);
+    reply
+}
+
+/// Monitors hear of a script before what it runs (even one that isn't found), and of the
+/// rest once they've run. Says whether this is a script.
+fn heard_first(ctx: &Context, session: &mut Session, command: &Command, args: &Args<'_>) -> bool {
+    let script = matches!(command.name, "eval" | "evalsha" | "eval_ro" | "evalsha_ro");
+    if script && ctx.monitoring() {
+        let peer = ctx.peer_of(session);
+        ctx.feed_monitors(session.db, &peer, args);
+    }
+    script
+}
+
+/// A command inside `EXEC` or a script, while something's watching.
+fn watched_inside(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    command: &Command,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let script = heard_first(ctx, session, command, args);
+    let started = std::time::Instant::now();
+    let reply = (command.run)(ctx, session, now, args, out);
+    has_run(ctx, session, command, args, started, !script);
+    reply
+}
+
+/// What's watching hears of a command that's run.
+fn has_run(
+    ctx: &Context,
+    session: &mut Session,
+    command: &Command,
+    args: &Args<'_>,
+    started: std::time::Instant,
+    tell_monitors: bool,
+) {
+    let micros = started.elapsed().as_micros() as u64;
+    if tell_monitors && ctx.monitoring() {
+        let sub = (args.len() > 1).then(|| args.get(1));
+        if !command_table::hidden(command.name, sub).from_monitor && !turned_away(command, args) {
+            if session.in_script {
+                ctx.feed_monitors(session.db, "lua", args);
+            } else {
+                let peer = ctx.peer_of(session);
+                ctx.feed_monitors(session.db, &peer, args);
+            }
+        }
+    }
+    if ctx.slowlog.is_slow(micros) {
+        log_slow(ctx, session, command, args, micros);
+    }
+    let event = if command.fast {
+        "fast-command"
+    } else {
+        "command"
+    };
+    ctx.latency.note(event, micros / 1000);
+}
+
+/// A command run with `CLIENT REPLY OFF` or `SKIP`: its reply goes, and `SKIP` is
+/// over. (`CLIENT REPLY ON` is heard, and answered.)
+#[cold]
+fn silenced(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    if let Some(subscriber) = session.subscriber()
+        && !subscriber.take(out)
+    {
+        return Reply::Close;
+    }
+    let mode = session.reply;
+    session.reply = ReplyMode::Passing;
+    session.refresh();
+    let start = out.len();
+    let reply = execute(ctx, session, now, args, out);
+    if matches!(session.reply, ReplyMode::Passing) {
+        out.truncate(start);
+        session.reply = if matches!(mode, ReplyMode::Skip) {
+            ReplyMode::On
+        } else {
+            mode
+        };
+    } else if !matches!(session.reply, ReplyMode::On) {
+        out.truncate(start);
+    }
+    session.refresh();
+    match reply {
+        Reply::Bulk(_) if !matches!(session.reply, ReplyMode::On) => Reply::Written,
+        reply => reply,
+    }
 }
 
 /// Runs active expiry every `interval` until `ctx` is dropped. A client blocked
@@ -436,7 +687,41 @@ pub fn spawn_expirer(
     ctx: &Arc<Context>,
     interval: std::time::Duration,
 ) -> std::thread::JoinHandle<()> {
+    let clock = Arc::downgrade(ctx);
     let ctx = Arc::downgrade(ctx);
+    std::thread::Builder::new()
+        .name("tantalum-clock".into())
+        .spawn(move || {
+            let tick = std::time::Duration::from_micros(crate::slowlog::TICK_MICROS as u64);
+            if let Some(ctx) = clock.upgrade() {
+                ctx.clock_starts();
+            }
+            let (mut seen, mut quiet) = (0, 0);
+            loop {
+                std::thread::sleep(tick);
+                let Some(ctx) = clock.upgrade() else { break };
+                ctx.tick();
+                let commands = ctx.commands_so_far();
+                quiet = if commands == seen { quiet + 1 } else { 0 };
+                seen = commands;
+                if quiet < crate::slowlog::TICKS_BEFORE_SLEEP {
+                    continue;
+                }
+                // Nothing to time, so an idle server isn't woken for it. It looks now and
+                // then only to go when the server does.
+                quiet = 0;
+                ctx.clock_sleeps();
+                drop(ctx);
+                loop {
+                    std::thread::park_timeout(std::time::Duration::from_secs(1));
+                    let Some(ctx) = clock.upgrade() else { return };
+                    if !ctx.clock_asleep() {
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn clock thread");
     std::thread::Builder::new()
         .name("tantalum-expire".into())
         .spawn(move || {
@@ -444,8 +729,11 @@ pub fn spawn_expirer(
                 std::thread::sleep(interval);
                 let Some(ctx) = ctx.upgrade() else { break };
                 let now = ctx.store.now();
-                for db in ctx.store.live() {
-                    db.expire_cycle(now);
+                // As in Redis, what's paused doesn't change by itself meanwhile.
+                if ctx.pause_mode().is_none() {
+                    for db in ctx.store.live() {
+                        db.expire_cycle(now);
+                    }
                 }
                 ctx.note_memory_peak();
                 if ctx.store.has_ready() {
@@ -523,7 +811,7 @@ fn logged(
     let mut turn = aof.turn(grouped, session.db);
     let now = turn.now;
     let start = out.len();
-    let reply = (command.run)(ctx, session, now, args, out);
+    let reply = timed(ctx, session, now, command, args, out);
     // A blocked command is logged when it's served.
     if !grouped && !matches!(reply, Reply::Block(_)) {
         let bulk;
@@ -1640,9 +1928,10 @@ fn valid_client_attr(value: &[u8], what: &str, out: &mut Vec<u8>) -> bool {
     valid
 }
 
-/// `CLIENT SETNAME | GETNAME | ID | SETINFO | LIST | INFO | KILL`: what client
-/// libraries send on connect, and what job queues read to find their
-/// workers.
+/// `CLIENT SETNAME | GETNAME | ID | SETINFO | LIST | INFO | KILL | PAUSE | UNPAUSE |
+/// UNBLOCK | REPLY | NO-EVICT | NO-TOUCH | GETREDIR | TRACKINGINFO`: what client
+/// libraries send on connect, what job queues read to find their workers, and
+/// what operators use.
 fn client(
     ctx: &Context,
     session: &mut Session,
@@ -1706,10 +1995,142 @@ fn client(
         client_list(ctx, session, args, out);
     } else if is(b"KILL") {
         return client_kill(ctx, session, args, out);
+    } else if is(b"PAUSE") {
+        client_pause(ctx, args, out);
+        ctx.follow_special(session);
+    } else if is(b"UNPAUSE") {
+        if arity(2, "unpause", out) {
+            ctx.unpause_clients();
+            ctx.follow_special(session);
+            out.extend_from_slice(resp::OK);
+        }
+    } else if is(b"UNBLOCK") {
+        client_unblock(ctx, args, out);
+    } else if is(b"REPLY") {
+        if arity(3, "reply", out) {
+            let mode = args.get(2);
+            if mode.eq_ignore_ascii_case(b"ON") {
+                session.reply = ReplyMode::On;
+                out.extend_from_slice(resp::OK);
+            } else if mode.eq_ignore_ascii_case(b"OFF") {
+                session.reply = ReplyMode::Off;
+            } else if mode.eq_ignore_ascii_case(b"SKIP") {
+                // This one's reply, which there is none of, isn't the one it skips.
+                if !matches!(session.reply, ReplyMode::Off) {
+                    session.reply = ReplyMode::Skip;
+                }
+            } else {
+                resp::write_error(out, SYNTAX_ERROR);
+            }
+            session.refresh();
+        }
+    } else if is(b"NO-EVICT") || is(b"NO-TOUCH") {
+        let name = if is(b"NO-EVICT") {
+            "no-evict"
+        } else {
+            "no-touch"
+        };
+        if arity(3, name, out) {
+            let on = args.get(2).eq_ignore_ascii_case(b"ON");
+            if !on && !args.get(2).eq_ignore_ascii_case(b"OFF") {
+                resp::write_error(out, SYNTAX_ERROR);
+            } else {
+                // Clients aren't evicted here, and keys don't remember being touched.
+                if is(b"NO-EVICT") {
+                    session.no_evict = on;
+                } else {
+                    session.no_touch = on;
+                }
+                out.extend_from_slice(resp::OK);
+            }
+        }
+    } else if is(b"GETREDIR") {
+        if arity(2, "getredir", out) {
+            resp::write_integer(out, -1);
+        }
+    } else if is(b"TRACKINGINFO") {
+        if arity(2, "trackinginfo", out) {
+            resp::write_map_header(out, 3, session.resp3);
+            resp::write_bulk(out, b"flags");
+            resp::write_set_header(out, 1, session.resp3);
+            resp::write_bulk(out, b"off");
+            resp::write_bulk(out, b"redirect");
+            resp::write_integer(out, -1);
+            resp::write_bulk(out, b"prefixes");
+            resp::write_array_header(out, 0);
+        }
     } else {
         unknown_subcommand(out, sub, "CLIENT");
     }
     Reply::Written
+}
+
+/// `CLIENT PAUSE timeout [WRITE|ALL]`
+fn client_pause(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
+    if args.len() < 3 {
+        wrong_arity(out, "client|pause");
+        return;
+    }
+    if args.len() > 4 {
+        subcommand_syntax_error(out, args.get(1), "CLIENT");
+        return;
+    }
+    let Some(timeout) = resp::parse_int(args.get(2)) else {
+        resp::write_error(out, b"ERR timeout is not an integer or out of range");
+        return;
+    };
+    if timeout < 0 {
+        resp::write_error(out, b"ERR timeout is negative");
+        return;
+    }
+    let all = if args.len() == 4 {
+        let mode = args.get(3);
+        if mode.eq_ignore_ascii_case(b"ALL") {
+            true
+        } else if mode.eq_ignore_ascii_case(b"WRITE") {
+            false
+        } else {
+            resp::write_error(out, b"ERR CLIENT PAUSE mode must be WRITE or ALL");
+            return;
+        }
+    } else {
+        true
+    };
+    ctx.pause_clients(timeout as u64, all);
+    out.extend_from_slice(resp::OK);
+}
+
+/// `CLIENT UNBLOCK id [TIMEOUT|ERROR]`: 1 if it was blocked in a command.
+fn client_unblock(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
+    if args.len() < 3 {
+        wrong_arity(out, "client|unblock");
+        return;
+    }
+    if args.len() > 4 {
+        subcommand_syntax_error(out, args.get(1), "CLIENT");
+        return;
+    }
+    let error = if args.len() == 4 {
+        let reason = args.get(3);
+        if reason.eq_ignore_ascii_case(b"ERROR") {
+            true
+        } else if reason.eq_ignore_ascii_case(b"TIMEOUT") {
+            false
+        } else {
+            resp::write_error(out, b"ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR");
+            return;
+        }
+    } else {
+        false
+    };
+    let Some(id) = resp::parse_int(args.get(2)) else {
+        resp::write_error(out, NOT_AN_INTEGER);
+        return;
+    };
+    resp::write_integer(
+        out,
+        i64::from(crate::blocking::unblock(ctx, id as u64, error)),
+    );
 }
 
 /// `CLIENT KILL addr:port`, which replies OK and can close the caller's own
@@ -1851,8 +2272,8 @@ fn client_list(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
     resp::write_verbatim_text(out, &lines, session.resp3);
 }
 
-/// `COMMAND`, `COMMAND COUNT | INFO [name ...] | LIST | DOCS`: enough for
-/// clients and `redis-cli` to discover what's supported.
+/// `COMMAND`, `COMMAND COUNT | INFO [name ...] | LIST [FILTERBY ...] | DOCS [name ...] |
+/// GETKEYS | GETKEYSANDFLAGS | HELP`, with what Redis says of them (`command_table.rs`).
 fn command(
     _: &Context,
     session: &mut Session,
@@ -1872,11 +2293,12 @@ fn command(
     let is = |name: &[u8]| sub.eq_ignore_ascii_case(name);
     if is(b"COUNT") && args.len() == 2 {
         resp::write_integer(out, COMMANDS.len() as i64);
-    } else if is(b"LIST") && args.len() == 2 {
-        resp::write_array_header(out, COMMANDS.len());
-        for c in COMMANDS {
-            resp::write_bulk(out, c.name.as_bytes());
-        }
+    } else if is(b"LIST") {
+        command_list(args, out);
+    } else if is(b"GETKEYS") {
+        admin::command_getkeys(session, args, false, out);
+    } else if is(b"GETKEYSANDFLAGS") {
+        admin::command_getkeys(session, args, true, out);
     } else if is(b"INFO") && args.len() == 2 {
         resp::write_array_header(out, COMMANDS.len());
         for c in COMMANDS {
@@ -1892,21 +2314,72 @@ fn command(
             }
         }
     } else if is(b"DOCS") {
-        // No docs, which redis-cli is fine with.
-        resp::write_map_header(out, 0, resp3);
-    } else if is(b"COUNT") || is(b"LIST") {
-        wrong_arity(
-            out,
-            &format!("command|{}", sub.to_ascii_lowercase().escape_ascii()),
-        );
+        let docs = |c: &'static Command| command_table::entry(c.name).map(|e| (c.name, e.docs));
+        let found: Vec<_> = if args.len() == 2 {
+            COMMANDS.iter().filter_map(docs).collect()
+        } else {
+            (2..args.len())
+                .filter_map(|i| find_command(args.get(i)).and_then(docs))
+                .collect()
+        };
+        resp::write_map_header(out, found.len(), resp3);
+        for (name, docs) in found {
+            resp::write_bulk(out, name.as_bytes());
+            command_table::write(docs, resp3, out);
+        }
+    } else if is(b"COUNT") {
+        wrong_arity(out, "command|count");
     } else {
         unknown_subcommand(out, sub, "COMMAND");
     }
     Reply::Written
 }
 
-/// One command's entry in a `COMMAND` reply, in Redis 7's 10-field shape.
+/// `COMMAND LIST [FILTERBY MODULE name | ACLCAT category | PATTERN pattern]`
+fn command_list(args: &Args<'_>, out: &mut Vec<u8>) {
+    if args.len() == 2 {
+        resp::write_array_header(out, COMMANDS.len());
+        for c in COMMANDS {
+            resp::write_bulk(out, c.name.as_bytes());
+        }
+        return;
+    }
+    if args.len() != 5 || !args.get(2).eq_ignore_ascii_case(b"FILTERBY") {
+        resp::write_error(out, SYNTAX_ERROR);
+        return;
+    }
+    let (by, what) = (args.get(3), args.get(4));
+    let names: Vec<&str> = if by.eq_ignore_ascii_case(b"MODULE") {
+        Vec::new()
+    } else if by.eq_ignore_ascii_case(b"ACLCAT") {
+        COMMANDS
+            .iter()
+            .filter(|c| command_table::in_category(c.name, what))
+            .map(|c| c.name)
+            .collect()
+    } else if by.eq_ignore_ascii_case(b"PATTERN") {
+        COMMANDS
+            .iter()
+            .filter(|c| glob::matches(what, c.name.as_bytes(), true))
+            .map(|c| c.name)
+            .collect()
+    } else {
+        resp::write_error(out, SYNTAX_ERROR);
+        return;
+    };
+    resp::write_array_header(out, names.len());
+    for name in names {
+        resp::write_bulk(out, name.as_bytes());
+    }
+}
+
+/// One command's entry in a `COMMAND` reply, in Redis 7's 10-field shape: what
+/// Redis says of it, or for one it doesn't have, what the table here says.
 fn write_command_info(out: &mut Vec<u8>, c: &Command, resp3: bool) {
+    if let Some(entry) = command_table::entry(c.name) {
+        command_table::write(entry.info, resp3, out);
+        return;
+    }
     resp::write_array_header(out, 10);
     resp::write_bulk(out, c.name.as_bytes());
     resp::write_integer(out, i64::from(c.arity));
@@ -1923,59 +2396,6 @@ fn write_command_info(out: &mut Vec<u8>, c: &Command, resp3: bool) {
     resp::write_set_header(out, 0, resp3);
     resp::write_array_header(out, 0);
     resp::write_array_header(out, 0);
-}
-
-/// `CONFIG GET pattern [pattern ...]`, for clients and tools that read the
-/// settings. Nothing can be changed at runtime.
-fn config(
-    ctx: &Context,
-    session: &mut Session,
-    _: Millis,
-    args: &Args<'_>,
-    out: &mut Vec<u8>,
-) -> Reply {
-    let sub = args.get(1);
-    if sub.eq_ignore_ascii_case(b"GET") {
-        if args.len() < 3 {
-            wrong_arity(out, "config|get");
-            return Reply::Written;
-        }
-        let store = &*ctx.store;
-        let settings = [
-            ("maxmemory", store.maxmemory().to_string()),
-            ("maxmemory-policy", store.policy().name().to_string()),
-            ("databases", store.databases().to_string()),
-            // In Redis' "seconds changes" form: save after this long if
-            // anything changed.
-            (
-                "save",
-                ctx.snapshots
-                    .as_ref()
-                    .and_then(|s| s.interval)
-                    .map_or(String::new(), |i| format!("{} 1", i.as_secs())),
-            ),
-            ("appendonly", "no".to_string()),
-        ];
-        let matching: Vec<_> = settings
-            .iter()
-            .filter(|(name, _)| {
-                (2..args.len()).any(|i| glob::matches(args.get(i), name.as_bytes(), true))
-            })
-            .collect();
-        resp::write_map_header(out, matching.len(), session.resp3);
-        for (name, value) in matching {
-            resp::write_bulk(out, name.as_bytes());
-            resp::write_bulk(out, value.as_bytes());
-        }
-    } else if sub.eq_ignore_ascii_case(b"SET") {
-        resp::write_error(
-            out,
-            b"ERR CONFIG SET is not supported: restart with the option instead",
-        );
-    } else {
-        unknown_subcommand(out, sub, "CONFIG");
-    }
-    Reply::Written
 }
 
 /// A string read by `GETDEL` or `GETEX`: `Err` when the key held another kind.
@@ -2221,7 +2641,7 @@ fn info(
             "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\n\
              tracking_clients:0\r\n\r\n",
             server.connected_clients,
-            ctx.settings.maxclients,
+            ctx.maxclients(),
             ctx.store.blocked_clients(),
         );
     }
@@ -2451,6 +2871,14 @@ fn wrong_arity(out: &mut Vec<u8>, name: &str) {
 
 fn unknown_subcommand(out: &mut Vec<u8>, sub: &[u8], command: &str) {
     let mut msg = b"ERR unknown subcommand '".to_vec();
+    msg.extend_from_slice(&sub[..sub.len().min(128)]);
+    msg.extend_from_slice(format!("'. Try {command} HELP.").as_bytes());
+    resp::write_error(out, &msg);
+}
+
+/// What a subcommand gets that its own code doesn't accept, or that isn't one.
+fn subcommand_syntax_error(out: &mut Vec<u8>, sub: &[u8], command: &str) {
+    let mut msg = b"ERR unknown subcommand or wrong number of arguments for '".to_vec();
     msg.extend_from_slice(&sub[..sub.len().min(128)]);
     msg.extend_from_slice(format!("'. Try {command} HELP.").as_bytes());
     resp::write_error(out, &msg);

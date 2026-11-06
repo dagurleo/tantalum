@@ -147,7 +147,7 @@ fn reply_error(out: &mut Vec<u8>, msg: &[u8]) -> Reply {
 }
 
 /// A score as a reply: a double in RESP3, a bulk string in RESP2.
-fn write_score(out: &mut Vec<u8>, score: f64, resp3: bool) {
+pub(super) fn write_score(out: &mut Vec<u8>, score: f64, resp3: bool) {
     if resp3 {
         out.push(b',');
         format_score(score, out);

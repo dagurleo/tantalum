@@ -1,10 +1,48 @@
-Client libraries' own test suites on Tantalum 0.23.1, 2026-11-06, against Redis 7.2.4 as the control.
+Client libraries' own test suites on Tantalum 0.24.0, 2026-11-06, against Redis 7.2.4 as the control.
 
 redis-py 7.4.0 (sync and asyncio; no cluster, modules, TLS, replicas or cloud), Predis 3.6.1 (phpunit's
 default groups), redis-rb 6.0.0 (redis and distributed), ioredis 5.11.0 (unit and functional), phpredis 6.3.0
 (its Redis class, a test at a time), node-redis 6.3.1 (the client package, started by node-redis-shim.py at
 version 7.2). Agent37 VMs, as in results.txt. go-redis, Jedis and Lettuce aren't here: they expect clusters
 and sentinels up first. A test counts as lost when it passes on Redis and fails on Tantalum.
+
+Lost tests by the feature they need, sorted by the name or error each one failed on, so roughly:
+
+suite totals: {'redis-py': (152, 2357), 'predis': (83, 4525), 'redis-rb': (69, 893), 'ioredis': (1, 566), 'phpredis': (10, 203), '
+                                                      redis-py    predis  redis-rb   ioredis  phpredis node-redi    all
+Geo                                                         60        44        47                   5              156
+ACL                                                         61         7         3         1                   9     81
+FUNCTION / FCALL                                             7        20                                      12     39
+HyperLogLog                                                  9         4        15                   1               29
+Client-side caching (TRACKING)                               1                                       1        20     22
+DUMP / RESTORE / MIGRATE                                    12         3         2                   1         1     19
+CONFIG SET / RESETSTAT / more CONFIG GET                               5                             1                6
+LATENCY                                                                                                        5      5
+INFO commandstats and fields                                                     2                                    2
+other                                                                                                          2      2
+BGSAVE SCHEDULE                                              1                                                        1
+COMMAND GETKEYS, DOCS, full table                            1                                                        1
+OBJECT IDLETIME                                                                                      1                1
+
+That's 364 of 10,530, and 346 of them need one of the first six: something that isn't here. Each of the other
+18 was read: WAITAOF's (5) turn the log on with CONFIG SET appendonly, which needs --aof at the start here;
+LATENCY HISTOGRAM (5) and INFO commandstats (3, counting phpredis' testConfig) need per-command statistics, which
+would cost every command, so they wait for a measurement; BGSAVE and BGREWRITEAOF (3) refuse without --snapshot or
+--aof, where Redis saves to its default; COMMAND LIST (1) expects over 300 commands, and there are 209;
+OBJECT IDLETIME (1) is always 0, as no access time is kept per key.
+
+Both servers now run with DEBUG allowed, as the libraries' own setups have it, so 21 more redis-py tests pass on
+the control than in the table below. Tests of Redis 7.4 and 8 commands (HEXPIRE and the like) fail on the control
+too, so they aren't here. Five node-redis tests (Sentinel's) and three of phpredis' pass on the control and never ran
+on Tantalum, and aren't counted. redis-rb won't start without a Unix socket, so its Tantalum run has socat in front
+of the port: Tantalum has no Unix sockets, and that's in no count above. node-redis's server options are dropped for
+Tantalum but for --requirepass and --enable-debug-command.
+
+Besides these suites, tools/admin-diff.py sends 3,278 commands and checks to Redis 7.2.4 and to Tantalum, with no
+differences: every command's COMMAND INFO and DOCS in both protocols, every setting's default, what each setting says
+to bad values, `~` trims with nodes of other sizes, the latency monitor, MONITOR's lines and SLOWLOG's entries.
+
+== Before: 0.23.1, 539 of 10,509 lost
 
 Lost tests by the feature they need, sorted by the name or error each one failed on, so roughly:
 
