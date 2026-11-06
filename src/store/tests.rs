@@ -1138,6 +1138,14 @@ fn big_hash_memory_budget() {
     );
 }
 
+/// Every big collection takes a place this size in its shard's list of objects, whatever
+/// it holds, so it stays small (a sorted set, the largest, is boxed for that).
+#[test]
+fn a_collections_place_stays_small() {
+    let size = size_of::<crate::collection::Collection>();
+    assert!(size <= 176, "{size} bytes, over the 176 budget");
+}
+
 /// Bytes a stream's entries and pending entries are accounted for, which real
 /// memory follows: on a real server, RSS grows 38.3 and 61.2 bytes for these.
 #[test]
@@ -1528,7 +1536,7 @@ fn big_collections_keep_the_books() {
                 for i in 0..n {
                     set.insert(format!("{tag}-{i}").as_bytes(), i as f64);
                 }
-                Collection::ZSet(set)
+                Collection::ZSet(Box::new(set))
             } else if tag.is_multiple_of(2) {
                 let mut set = BigSet::with_capacity(n as usize);
                 for i in 0..n {

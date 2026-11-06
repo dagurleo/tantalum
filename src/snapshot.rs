@@ -946,7 +946,7 @@ mod tests {
             big.insert(format!("member {i}").as_bytes(), (i % 17) as f64 * 0.5);
         }
         let packed = big.to_packed();
-        let mut made = Some(Collection::ZSet(big));
+        let mut made = Some(Collection::ZSet(Box::new(big)));
         s.update_collection(s.key(b"big"), now, false, |_| {
             (Update::Object(made.take().unwrap()), ())
         })

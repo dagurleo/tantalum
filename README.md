@@ -244,32 +244,51 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   nothing for this: the type was already in the flags byte, so `GET` and
   `SET` read the same bytes, and the speed guard measured no difference.
   Past 512 fields or 8 KB a hash becomes an object the shard keeps and changes in
-  place: its fields and values back to back in one buffer, a list of 5-byte offsets
-  (the order added, and positions for `HRANDFIELD` and `HSCAN`), and a hash table of
-  positions. A write costs the same at any size. A value that fits is written where
-  it is, a longer one goes at the end, and the holes are taken back once they pass half
-  the buffer. Removing a field keeps the order up to 512 fields, where Redis' replies
-  show it, and past that moves the last field into its place. In real memory, the
-  growth of RSS once settled, a field of 16 bytes with a 32-byte value takes 62.5-72.7
-  bytes from 500,000 to 8M fields (Redis 70.7-80.0, Valkey 70.2-80.5), ahead of both
-  at every size. On one core, in one hash of 1M fields, `HGET` and `HSET` do 8-11%
-  more than Redis and 12-16% more than Valkey one at a time, and 31-37% and 41-56%
-  more at pipeline 16 (`bench/agent37/results-hashes.txt`). A snapshot holds a big hash
-  as bytes as above, still version 2, so a build from before big hashes reads it.
+  place: its fields and values back to back, a list of their 5-byte addresses (the
+  order added, and positions for `HRANDFIELD` and `HSCAN`), and a hash table of
+  positions, all in small pieces so that it never stops to grow (see below). A write
+  costs the same at any size. A value that fits is written where it is and a longer one
+  goes at the end. Removing a field keeps the order up to 512 fields, where Redis'
+  replies show it, and past that moves the last field into its place. In real memory,
+  the growth of RSS once settled, a field of 16 bytes with a 32-byte value takes
+  62.9-71.8 bytes from 500,000 to 8M fields (Redis 70.7-78.6, Valkey 70.1-80.5), ahead
+  of both at every size. On one core, in one hash of 1M fields, `HGET` and `HSET` do
+  9-10% more than Redis and 10-15% more than Valkey one at a time, and 38-40% and
+  36-52% more at pipeline 16 (`bench/agent37/results-stops.txt`). A snapshot holds a
+  big hash as bytes as above, still version 2, so a build from before big hashes reads it.
+- **Big hashes, sets and sorted sets don't stop to grow** (`src/big.rs`). One buffer and
+  one table would have to grow all at once, copying the buffer and reading every field
+  again to hash it: 658 ms at 8M fields, under the shard's lock. So the bytes are in
+  chunks of up to 4 MB and the list of addresses in pages of 64K, which stay where they
+  are, and the table of positions is many small ones, each splitting in two when full:
+  about 14,000 positions to read again, fetched ahead of time, in under a millisecond.
+  Tidying up works the same way: once holes pass half of all, each write that leaves one
+  takes four more places in the list and moves the record there if it's in a chunk with
+  more holes than not, and a chunk of nothing but holes goes back. Filling one to 8M, the
+  longest batch of 500 commands took 2.7 ms for a hash (658 before; Redis 2.8, Valkey
+  2.4), 4.2 for a set (884; 2.8, 4.1) and 5.0 for a sorted set (865; 5.2, 4.4). Removing
+  three in four took 3.4 (232; 3.7, 2.8), 3.7 (98; 3.0, 1.9) and 8.1 (102; 5.7, 7.9).
+  It costs a few more loads per command, of small arrays: `HGET` on 4M fields takes the
+  same instructions and 2-6% more cycles of the server's own, under the noise end to end
+  at 1M items. Filling is faster for it (8% on a hash, 13% on a sorted set), with half
+  the page faults. `used_memory` now says what's real (62.3 bytes a field, RSS 63.3), and
+  a fill no longer needs old and new buffers at once (RSS right after 3M fields: 111.8
+  bytes a field before, 63.3 now). Tables don't merge again when a collection shrinks:
+  a few dozen bytes each, gone with the key (`bench/agent37/results-stops.txt`).
 - **Sets** (`src/set.rs`) are packed in their entry while small, the way
   Redis packs them, and so reply in its order: up to 512 integers, sorted, as
   zigzag varints (Redis' intset), or up to 128 members of up to 64 bytes in
   the order added (its listpack). A write decodes, changes and writes the
   entry again. Past those limits a set becomes an object the shard keeps
-  (`src/collection.rs`) and changes in place: its members back to back in
-  one buffer, a list of their offsets (the set's order, so `SPOP` and
-  `SRANDMEMBER` pick in O(1) and `SSCAN` walks positions), and a hash table
-  of positions. Measured with `used_memory` against Redis 7.2.4 (Docker):
+  (`src/collection.rs`) and changes in place: its members back to back, a
+  list of their addresses (the set's order, so `SPOP` and `SRANDMEMBER` pick
+  in O(1) and `SSCAN` walks positions), and a hash table of positions, in
+  small pieces as above. Measured with `used_memory` against Redis 7.2.4 (Docker):
   100k sets of ten 8-byte members take 12.5 bytes per member (Redis 17.8),
   and one set of 1M take 23.0 (Redis 29.3). In real memory, the growth of RSS
-  once settled, a set of 32-byte members takes 44-53 bytes each from 500,000 to
-  8M members (Redis 55-64, Valkey 54-64), ahead of both at every size measured
-  (`bench/agent37/results-sets.txt`). Entries of object kinds use the
+  once settled, a set of 32-byte members takes 45-54 bytes each from 500,000 to
+  8M members (Redis 55-64, Valkey 54-65), ahead of both at every size measured
+  (`bench/agent37/results-stops.txt`). Entries of object kinds use the
   external bit to point into the shard's object table, so strings and
   hashes read the same bytes as before.
 - **Lists** (`src/list.rs`) are packed while small (up to 128 elements in
@@ -347,10 +366,10 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
 - **Sorted sets** (`src/zset.rs`) are packed while small (up to 128
   members of up to 64 bytes, Redis' listpack limits), in order, each entry
   a score and a member; a whole score below 2^52 is a varint of a byte or
-  two, any other 8 bytes. A bigger one keeps its members as a big set does
-  (a buffer, offsets, a table of positions), a score per position, and its
-  order as chunks of positions with a Fenwick tree of chunk sizes, so
-  ranks are O(log n). Against Redis 7.2.4: 100k sorted sets of ten 8-byte
+  two, any other 8 bytes. A bigger one keeps its members as a big set does,
+  a score per position, and its order as chunks of positions with a Fenwick
+  tree of chunk sizes, so ranks are O(log n); a search reads a member only
+  where scores tie. Against Redis 7.2.4: 100k sorted sets of ten 8-byte
   members take 13.4 bytes per member with whole scores (Redis 19.4) and
   22.3 with fractional ones (Redis 25.8); one of 1M takes 36.4 (Redis 93.4,
   its skiplist and dict). In-process on 500k members: `ZADD` of a new
@@ -1095,10 +1114,13 @@ hit rates share the seeding flaw described above.
 - The server binds to `127.0.0.1` by default. If you expose it, set a password,
   and use TLS outside a private network. No client certificates, no
   certificate reloading without a restart.
-- **A big hash or set stops to grow**: its table and buffers double all at once, under
-  its shard's lock, where Redis and Valkey rehash a little at a time. Filling one to 8M,
-  the longest stop was 614 ms for a hash and 817 ms for a set (Redis and Valkey: 5-8 ms
-  for the hash), in proportion to its size, and commands on that shard wait it out.
+- **Removing from big collections**: on one sorted set of 8M, `ZREM` does about 14% less
+  than Redis (1.69 against 1.46 ms per 500), as it searches the order twice, once for the
+  member and once for the one moving into its place. Removing three in four, tidying
+  included, a hash and a set end 2-4% behind Redis over the whole run (9.7 against 9.5 s,
+  9.8 against 9.4, the same client's time in both), though the usual batch is level or
+  ahead (0.37 against 0.38 ms). Its longest batch on a sorted set is 8.1 ms (Redis 5.7,
+  Valkey 7.9).
 - **A small hash is scanned and written whole**: `HGET` costs about 1.6× a `GET` at
   pipeline 16 (243 against 155 ns in the in-process benchmark, 10 fields), mostly in
   the cache lines the scan touches, and a write copies it, up to 512 fields or 8 KB.
@@ -1147,13 +1169,12 @@ hit rates share the seeding flaw described above.
   entries would feel.
 - **Memory gaps**: in real memory, the growth of RSS per item of a 32-byte value
   (`bench/agent37/memtypes.py`), strings (56.8 bytes; Redis 96.6, Valkey 79.6) and
-  a big sorted set (67.4; 108.4, 100.0), a big set (44.5; 64.0, 54.2) and a big hash
-  (63.2; 80.0, 70.2) lead and a big list ties (34.5; 34.9, 35.0), but small collections of ten in one key trail:
+  a big sorted set (63.6; 108.4, 100.0), a big set (45.2; 64.0, 54.2) and a big hash
+  (63.3; 80.0, 70.2) lead and a big list ties (34.5; 34.9, 35.0), but small collections of ten in one key trail:
   hashes 53.6 (51.1, 50.2), lists 51.2 (45.2, 43.9), sets 49.6 (45.2, 43.9), sorted
   sets 54.7 (51.0, 50.1). With 8-byte values small lists lead (see above).
   `used_memory` can also be off, as it counts capacity not yet touched: a big list's
-  says 38.4, a big set's 58.7 and a big hash's 105.5, so `maxmemory` starts evicting
-  early.
+  says 38.4, so `maxmemory` starts evicting a little early.
 - **Transaction gaps**: Redis refuses a write command with `-OOM` while
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client

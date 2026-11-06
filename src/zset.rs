@@ -22,6 +22,7 @@
 
 use std::cmp::Ordering;
 
+use crate::big::Paged;
 use crate::set::BigSet;
 
 pub const MAX_PACKED: usize = 128;
@@ -602,7 +603,7 @@ impl Sizes {
 pub struct BigZSet {
     members: BigSet,
     /// By position in `members`.
-    scores: Vec<f64>,
+    scores: Paged<f64>,
     /// Positions, by score and then member, in chunks.
     order: Vec<Vec<u32>>,
     sizes: Sizes,
@@ -619,27 +620,39 @@ impl BigZSet {
 
     fn key(&self, pos: u32) -> (f64, &[u8]) {
         (
-            self.scores[pos as usize],
+            self.scores.get(pos as usize),
             self.members.get_index(pos as usize),
         )
     }
 
     pub fn score(&self, member: &[u8]) -> Option<f64> {
-        self.members.position(member).map(|p| self.scores[p])
+        self.members.position(member).map(|p| self.scores.get(p))
+    }
+
+    /// Whether the entry at `pos` comes before `key`. The member is only read when the
+    /// scores tie, as it takes two more cache misses, at every step of a search.
+    #[inline]
+    fn comes_before(&self, pos: u32, key: (f64, &[u8])) -> bool {
+        let score = self.scores.get(pos as usize);
+        match score.partial_cmp(&key.0).expect("no NaN scores") {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => self.members.get_index(pos as usize) < key.1,
+        }
     }
 
     /// Where `(score, member)` is, or would go: its chunk and index there.
     fn locate(&self, key: (f64, &[u8])) -> (usize, usize) {
-        let c = self.order.partition_point(|chunk| {
-            cmp(self.key(*chunk.last().expect("non-empty")), key) == Ordering::Less
-        });
+        let c = self
+            .order
+            .partition_point(|chunk| self.comes_before(*chunk.last().expect("non-empty"), key));
         if c == self.order.len() {
             return match self.order.last() {
                 Some(chunk) => (c - 1, chunk.len()),
                 None => (0, 0),
             };
         }
-        let i = self.order[c].partition_point(|&p| cmp(self.key(p), key) == Ordering::Less);
+        let i = self.order[c].partition_point(|&p| self.comes_before(p, key));
         (c, i)
     }
 
@@ -692,11 +705,11 @@ impl BigZSet {
     pub fn insert(&mut self, member: &[u8], score: f64) -> Option<f64> {
         debug_assert!(!score.is_nan());
         if let Some(pos) = self.members.position(member) {
-            let old = self.scores[pos];
+            let old = self.scores.get(pos);
             // Equal scores (0 and -0 too) leave it as it is, as in Redis.
             if old != score {
                 self.remove_order((old, member));
-                self.scores[pos] = score;
+                self.scores.set(pos, score);
                 self.insert_order(pos as u32);
             }
             return Some(old);
@@ -710,7 +723,7 @@ impl BigZSet {
     /// Removes `member`, returning its score.
     pub fn remove(&mut self, member: &[u8]) -> Option<f64> {
         let pos = self.members.position(member)?;
-        let score = self.scores[pos];
+        let score = self.scores.get(pos);
         self.remove_order((score, member));
         let last = self.members.len() - 1;
         if pos != last {
@@ -718,7 +731,7 @@ impl BigZSet {
             let (c, i) = self.locate(self.key(last as u32));
             self.order[c][i] = pos as u32;
         }
-        self.members.swap_remove_index(pos);
+        self.members.remove_at(pos);
         self.scores.swap_remove(pos);
         Some(score)
     }
@@ -798,7 +811,7 @@ impl BigZSet {
     /// are counted as a position each plus a quarter for growth room.
     pub fn allocation_size(&self) -> usize {
         self.members.allocation_size()
-            + self.scores.capacity() * 8
+            + self.scores.allocation_size()
             + self.order.capacity() * size_of::<Vec<u32>>()
             + self.len() * 5
             + self.sizes.0.capacity() * 8
@@ -819,7 +832,7 @@ impl BigZSet {
         let packed = Packed::new(bytes);
         let mut set = BigZSet {
             members: BigSet::with_capacity(packed.len()),
-            scores: Vec::with_capacity(packed.len()),
+            scores: Paged::with_capacity(packed.len()),
             order: Vec::new(),
             sizes: Sizes::default(),
         };
@@ -916,13 +929,13 @@ impl<'a> ZView<'a> {
 /// A sorted set being changed: a packed one decoded into a [`BigZSet`]
 /// (packed again if it still fits), or a big one in place.
 pub enum ZMut<'a> {
-    Owned { set: BigZSet, changed: bool },
+    Owned { set: Box<BigZSet>, changed: bool },
     Big { set: &'a mut BigZSet, changed: bool },
 }
 
 pub enum Finished {
     Packed(Vec<u8>),
-    Grown(BigZSet),
+    Grown(Box<BigZSet>),
     Changed,
     Delete,
 }
@@ -930,14 +943,14 @@ pub enum Finished {
 impl<'a> ZMut<'a> {
     pub fn new() -> Self {
         ZMut::Owned {
-            set: BigZSet::default(),
+            set: Box::default(),
             changed: false,
         }
     }
 
     pub fn from_packed(bytes: &[u8]) -> Self {
         ZMut::Owned {
-            set: BigZSet::from_packed(bytes),
+            set: Box::new(BigZSet::from_packed(bytes)),
             changed: false,
         }
     }

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 
-use hashbrown::HashTable;
+use crate::big::{Address, Index, Listed, Paged, PagedIter, Records};
 
 /// Past this many fields a hash isn't packed: Redis' `hash-max-listpack-entries`,
 /// up to which it replies in the order added, so a [`BigHash`] does too.
@@ -39,6 +39,14 @@ fn put_varint(out: &mut Vec<u8>, mut n: usize) {
         n >>= 7;
     }
     out.push(n as u8);
+}
+
+/// Writes a varint over all of `out`, which is as long as it takes.
+fn put_varint_in(out: &mut [u8], mut n: usize) {
+    for byte in out {
+        *byte = if n >= 0x80 { n as u8 | 0x80 } else { n as u8 };
+        n >>= 7;
+    }
 }
 
 fn varint_len(mut n: usize) -> usize {
@@ -295,7 +303,8 @@ struct Offset {
     high: u8,
 }
 
-impl Offset {
+impl Address for Offset {
+    #[inline]
     fn new(at: usize) -> Self {
         Offset {
             low: at as u32,
@@ -303,6 +312,7 @@ impl Offset {
         }
     }
 
+    #[inline]
     fn get(self) -> usize {
         usize::from(self.high) << 32 | self.low as usize
     }
@@ -319,45 +329,67 @@ fn record_len(field: &[u8], value: &[u8]) -> usize {
     varint_len(field.len()) + field.len() + varint_len(value.len()) + value.len()
 }
 
-fn field_at(bytes: &[u8], offset: Offset) -> &[u8] {
-    take_bytes(&mut &bytes[offset.get()..]).expect("a field")
+#[inline]
+fn field_at(records: &Records, offset: Offset) -> &[u8] {
+    take_bytes(&mut records.at(offset.get())).expect("a field")
 }
 
-fn record_at(bytes: &[u8], offset: Offset) -> (&[u8], &[u8]) {
-    let mut at = &bytes[offset.get()..];
+#[inline]
+fn record_at(records: &Records, offset: Offset) -> (&[u8], &[u8]) {
+    let mut at = records.at(offset.get());
     let field = take_bytes(&mut at).expect("a field");
     let value = take_bytes(&mut at).expect("a value");
     (field, value)
 }
 
-/// A big hash, kept compact: its fields and values back to back in one buffer,
-/// each field next to its value so that finding one has the other in hand; their
-/// offsets in a list, whose order is the hash's (so a random field, or a position
-/// to scan from, is O(1)); and a hash table of positions in that list. A value is
-/// changed where it is if it fits, else written at the end. What that and removing
-/// a field leave behind is a hole until holes are half the buffer.
+/// A record's length, from its bytes.
+#[inline]
+fn size_of_record(bytes: &[u8]) -> usize {
+    let mut at = bytes;
+    take_bytes(&mut at).expect("a field");
+    take_bytes(&mut at).expect("a value");
+    bytes.len() - at.len()
+}
+
+/// What an [`Index`] needs to hash the field at a position.
+#[inline]
+fn listed<'a>(
+    records: &'a Records,
+    offsets: &'a Paged<Offset>,
+    hasher: &'a foldhash::fast::FixedState,
+) -> Listed<'a, Offset, impl Fn(&[u8]) -> u64 + 'a> {
+    Listed {
+        records,
+        list: offsets,
+        hash_of: move |mut bytes: &[u8]| hasher.hash_one(take_bytes(&mut bytes).expect("a field")),
+    }
+}
+
+/// A big hash, kept compact: its fields and values back to back in [`Records`], each
+/// field next to its value so that finding one has the other in hand; their addresses
+/// in a list, whose order is the hash's (so a random field, or a position to scan
+/// from, is O(1)); and an [`Index`] of positions in that list. None of them stops to
+/// grow (see [`crate::big`]). A value is changed where it is if it fits, else written
+/// at the end.
 ///
 /// In the list, a removed field's place goes to the last one, as `swap_remove` does,
 /// unless Redis might still have the hash packed: within [`PACKED_FIELDS`] the rest
 /// move up, as they do in a listpack, so that replies stay in the order added.
 #[derive(Clone)]
 pub struct BigHash {
-    bytes: Vec<u8>,
-    offsets: Vec<Offset>,
-    index: HashTable<u32>,
+    records: Records,
+    offsets: Paged<Offset>,
+    index: Index,
     hasher: foldhash::fast::FixedState,
-    /// Bytes in `bytes` that nothing refers to.
-    holes: usize,
 }
 
 impl BigHash {
     fn with_capacity(fields: usize, bytes: usize) -> Self {
         BigHash {
-            bytes: Vec::with_capacity(bytes),
-            offsets: Vec::with_capacity(fields),
-            index: HashTable::with_capacity(fields),
+            records: Records::with_capacity(bytes),
+            offsets: Paged::with_capacity(fields),
+            index: Index::with_capacity(fields),
             hasher: foldhash::fast::FixedState::with_seed(crate::set::random_seed()),
-            holes: 0,
         }
     }
 
@@ -370,31 +402,41 @@ impl BigHash {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.offsets.len() == 0
     }
 
-    fn position(&self, field: &[u8]) -> Option<usize> {
-        let (bytes, offsets) = (&self.bytes, &self.offsets);
+    fn find(&self, hash: u64, field: &[u8]) -> Option<usize> {
+        let (records, offsets) = (&self.records, &self.offsets);
         self.index
-            .find(self.hash(field), |&p| {
-                same(field_at(bytes, offsets[p as usize]), field)
+            .find(hash, |p| {
+                same(field_at(records, offsets.get(p as usize)), field)
             })
-            .map(|&p| p as usize)
+            .map(|p| p as usize)
     }
 
     pub fn get(&self, field: &[u8]) -> Option<&[u8]> {
-        let position = self.position(field)?;
-        Some(record_at(&self.bytes, self.offsets[position]).1)
+        // The record once: finding the field has its value in hand.
+        let (records, offsets) = (&self.records, &self.offsets);
+        let mut value = None;
+        self.index.find(self.hash(field), |p| {
+            let (candidate, its_value) = record_at(records, offsets.get(p as usize));
+            let found = same(candidate, field);
+            if found {
+                value = Some(its_value);
+            }
+            found
+        });
+        value
     }
 
     /// The field and value at position `i`.
     pub fn get_index(&self, i: usize) -> (&[u8], &[u8]) {
-        record_at(&self.bytes, self.offsets[i])
+        record_at(&self.records, self.offsets.get(i))
     }
 
     pub fn iter(&self) -> BigPairs<'_> {
         BigPairs {
-            bytes: &self.bytes,
+            records: &self.records,
             offsets: self.offsets.iter(),
         }
     }
@@ -402,120 +444,90 @@ impl BigHash {
     /// Sets `field` to `value`. Returns whether the field is new.
     pub fn insert(&mut self, field: &[u8], value: &[u8]) -> bool {
         let hash = self.hash(field);
-        let (bytes, offsets) = (&self.bytes, &self.offsets);
-        let found = self
-            .index
-            .find(hash, |&p| same(field_at(bytes, offsets[p as usize]), field));
-        if let Some(&position) = found {
-            self.replace_value(position as usize, value);
+        if let Some(position) = self.find(hash, field) {
+            self.replace_value(position, field, value);
             return false;
         }
         let position = u32::try_from(self.offsets.len()).expect("under 4 billion fields");
-        self.offsets.push(Offset::new(self.bytes.len()));
-        put_record(&mut self.bytes, field, value);
-        let (bytes, offsets, hasher) = (&self.bytes, &self.offsets, &self.hasher);
-        self.index.insert_unique(hash, position, |&p| {
-            hasher.hash_one(field_at(bytes, offsets[p as usize]))
-        });
+        let (at, bytes) = self.records.append(record_len(field, value));
+        put_record(bytes, field, value);
+        self.offsets.push(Offset::new(at));
+        self.index.insert(
+            hash,
+            position,
+            &listed(&self.records, &self.offsets, &self.hasher),
+        );
         true
     }
 
-    fn replace_value(&mut self, position: usize, value: &[u8]) {
-        let start = self.offsets[position].get();
-        let (field_len, old_len) = {
-            let (field, old) = record_at(&self.bytes, self.offsets[position]);
-            (field.len(), old.len())
-        };
-        let field_at = start + varint_len(field_len);
-        let length_at = field_at + field_len;
+    fn replace_value(&mut self, position: usize, field: &[u8], value: &[u8]) {
+        let offset = self.offsets.get(position);
+        let old_len = record_at(&self.records, offset).1.len();
         if value.len() <= old_len && varint_len(value.len()) == varint_len(old_len) {
             // It fits, and nothing reads past a record's own end.
-            let mut length = Vec::with_capacity(varint_len(value.len()));
-            put_varint(&mut length, value.len());
-            let value_at = length_at + length.len();
-            self.bytes[length_at..value_at].copy_from_slice(&length);
-            self.bytes[value_at..value_at + value.len()].copy_from_slice(value);
-            self.holes += old_len - value.len();
+            let length_at = varint_len(field.len()) + field.len();
+            let value_at = length_at + varint_len(value.len());
+            let record = self.records.at_mut(offset.get());
+            put_varint_in(&mut record[length_at..value_at], value.len());
+            record[value_at..value_at + value.len()].copy_from_slice(value);
+            if value.len() < old_len {
+                self.records.hole(offset.get(), old_len - value.len());
+                self.records.tidy(&mut self.offsets, size_of_record);
+            }
             return;
         }
-        self.holes += varint_len(field_len) + field_len + varint_len(old_len) + old_len;
-        self.offsets[position] = Offset::new(self.bytes.len());
-        put_varint(&mut self.bytes, field_len);
-        self.bytes.extend_from_within(field_at..length_at);
-        put_varint(&mut self.bytes, value.len());
-        self.bytes.extend_from_slice(value);
-        self.compact_if_due();
+        let old_size = varint_len(field.len()) + field.len() + varint_len(old_len) + old_len;
+        let (at, bytes) = self.records.append(record_len(field, value));
+        put_record(bytes, field, value);
+        self.offsets.set(position, Offset::new(at));
+        self.records.hole(offset.get(), old_size);
+        self.records.tidy(&mut self.offsets, size_of_record);
     }
 
     /// Removes `field`. Returns whether it was there.
     pub fn remove(&mut self, field: &[u8]) -> bool {
-        let Some(i) = self.position(field) else {
+        let hash = self.hash(field);
+        let (records, offsets) = (&self.records, &self.offsets);
+        let Some(i) = self.index.take(
+            hash,
+            |p| same(field_at(records, offsets.get(p as usize)), field),
+            &listed(records, offsets, &self.hasher),
+        ) else {
             return false;
         };
-        let hash = self.hash(field);
-        let found = self.index.find_entry(hash, |&p| p as usize == i);
-        found.expect("indexed").remove();
-        let (removed, value) = record_at(&self.bytes, self.offsets[i]);
-        self.holes += record_len(removed, value);
+        let i = i as usize;
+        let offset = self.offsets.get(i);
+        let size = size_of_record(self.records.at(offset.get()));
+        self.records.hole(offset.get(), size);
         let last = self.offsets.len() - 1;
         if self.offsets.len() <= PACKED_FIELDS {
-            self.offsets.remove(i);
-            for position in self.index.iter_mut() {
+            self.offsets.remove_in_order(i);
+            for position in self.index.positions_mut() {
                 if *position as usize > i {
                     *position -= 1;
                 }
             }
         } else {
             if i != last {
-                let moved = self.hash(field_at(&self.bytes, self.offsets[last]));
-                *self
-                    .index
-                    .find_mut(moved, |&p| p as usize == last)
-                    .expect("indexed") = i as u32;
+                let moved = self.hash(field_at(&self.records, self.offsets.get(last)));
+                self.index.replace(moved, last as u32, i as u32);
             }
             self.offsets.swap_remove(i);
         }
-        self.compact_if_due();
+        self.records.tidy(&mut self.offsets, size_of_record);
         true
     }
 
-    fn compact_if_due(&mut self) {
-        if self.holes > 4096 && self.holes * 2 > self.bytes.len() {
-            self.compact();
-        }
-    }
-
-    /// Writes the fields again without the holes, and gives back what the list and
-    /// the table have left spare; positions stay.
-    fn compact(&mut self) {
-        let mut bytes = Vec::with_capacity(self.bytes.len() - self.holes);
-        for offset in &mut self.offsets {
-            let (field, value) = record_at(&self.bytes, *offset);
-            *offset = Offset::new(bytes.len());
-            put_record(&mut bytes, field, value);
-        }
-        self.bytes = bytes;
-        self.holes = 0;
-        self.offsets.shrink_to(self.offsets.len() * 2);
-        let (fields, offsets, hasher) = (&self.bytes, &self.offsets, &self.hasher);
-        self.index.shrink_to(offsets.len() * 2, |&p| {
-            hasher.hash_one(field_at(fields, offsets[p as usize]))
-        });
-    }
-
-    /// Memory it takes: the buffers' capacity, and the table's buckets (a
-    /// position and a control byte each; at most 7/8 full, a power of two).
+    /// Memory it takes.
     pub fn allocation_size(&self) -> usize {
-        let buckets = match self.index.capacity() {
-            0 => 0,
-            n => (n * 8 / 7).next_power_of_two(),
-        };
-        self.bytes.capacity() + self.offsets.capacity() * size_of::<Offset>() + buckets * 5
+        self.records.allocation_size()
+            + self.offsets.allocation_size()
+            + self.index.allocation_size()
     }
 
     /// Its contents as a packed hash, however long.
     pub fn to_packed(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.bytes.len() - self.holes + 10);
+        let mut out = Vec::with_capacity(self.records.used() + 10);
         put_varint(&mut out, self.len());
         for (field, value) in self.iter() {
             put_record(&mut out, field, value);
@@ -537,17 +549,21 @@ impl BigHash {
         assert_eq!(self.index.len(), self.offsets.len());
         let mut used = 0;
         for (i, (field, value)) in self.iter().enumerate() {
-            assert_eq!(self.position(field), Some(i), "a field's position");
+            assert_eq!(
+                self.find(self.hash(field), field),
+                Some(i),
+                "a field's position"
+            );
             used += record_len(field, value);
         }
-        assert_eq!(used + self.holes, self.bytes.len(), "its bytes");
+        self.records.check(used);
     }
 }
 
 /// See [`BigHash::iter`].
 pub struct BigPairs<'a> {
-    bytes: &'a [u8],
-    offsets: std::slice::Iter<'a, Offset>,
+    records: &'a Records,
+    offsets: PagedIter<'a, Offset>,
 }
 
 impl<'a> Iterator for BigPairs<'a> {
@@ -555,7 +571,7 @@ impl<'a> Iterator for BigPairs<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let offset = self.offsets.next()?;
-        Some(record_at(self.bytes, *offset))
+        Some(record_at(self.records, *offset))
     }
 }
 
@@ -756,17 +772,17 @@ mod tests {
         let mut hash = BigHash::with_capacity(0, 0);
         hash.insert(b"a", b"12345");
         hash.insert(b"b", b"x");
-        let bytes = hash.bytes.len();
-        // Shorter or the same: no longer a buffer, and the rest stay readable.
+        let bytes = hash.records.written();
+        // Shorter or the same: no more written, and the rest stay readable.
         hash.insert(b"a", b"123");
-        assert_eq!(hash.bytes.len(), bytes);
-        assert_eq!(hash.holes, 2);
+        assert_eq!(hash.records.written(), bytes);
+        assert_eq!(hash.records.holes(), 2);
         assert_eq!(hash.get(b"a"), Some(&b"123"[..]));
         assert_eq!(hash.get(b"b"), Some(&b"x"[..]));
         hash.check();
         // Longer: at the end.
         hash.insert(b"a", b"123456789");
-        assert!(hash.bytes.len() > bytes);
+        assert!(hash.records.written() > bytes);
         assert_eq!(hash.get(b"a"), Some(&b"123456789"[..]));
         hash.check();
         // A length taking another byte to write can't stay, though it's shorter.
@@ -789,11 +805,40 @@ mod tests {
             hash.remove(format!("f{i}").as_bytes());
         }
         hash.check();
-        assert!(hash.bytes.len() < 20_000, "{} bytes", hash.bytes.len());
+        let written = hash.records.written();
+        assert!(written < 30_000, "{written} bytes");
         assert!(hash.allocation_size() < full / 2);
         for i in 1_900..2_000 {
             assert_eq!(hash.get(format!("f{i}").as_bytes()), Some(&value[..]));
         }
+    }
+
+    /// A value over a chunk's size has one of its own, in every way a value can change.
+    #[test]
+    fn values_of_many_megabytes() {
+        let mut hash = BigHash::with_capacity(0, 0);
+        let huge = vec![b'h'; 5 << 20];
+        hash.insert(b"small", b"v");
+        hash.insert(b"huge", &huge);
+        hash.insert(b"other", &huge);
+        assert_eq!(hash.get(b"huge"), Some(&huge[..]));
+        assert_eq!(hash.get(b"small"), Some(&b"v"[..]));
+        hash.check();
+        // Shorter, where it is.
+        hash.insert(b"huge", &huge[..huge.len() - 100]);
+        assert_eq!(hash.get(b"huge"), Some(&huge[..huge.len() - 100]));
+        hash.check();
+        // Longer, somewhere else: what it was goes back.
+        let more = vec![b'm'; 6 << 20];
+        hash.insert(b"huge", &more);
+        assert_eq!(hash.get(b"huge"), Some(&more[..]));
+        assert_eq!(hash.get(b"other"), Some(&huge[..]));
+        hash.check();
+        assert!(hash.allocation_size() < (12 << 20));
+        assert!(hash.remove(b"other"));
+        assert!(hash.allocation_size() < (7 << 20));
+        assert_eq!(hash.get(b"huge"), Some(&more[..]));
+        hash.check();
     }
 
     #[test]
