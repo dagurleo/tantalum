@@ -109,7 +109,7 @@ fn reading(
     out: &mut Vec<u8>,
     f: impl FnOnce(Option<ZView<'_>>, &mut Vec<u8>),
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut reply = Vec::new();
     match read(store, args.key(store), now, session, |set| {
         f(set, &mut reply)
@@ -277,7 +277,7 @@ fn add(
             None => return reply_error(out, NOT_A_FLOAT),
         }
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let result = change(store, args.key(store), now, true, args, |set, args| {
         let (mut added, mut updated, mut processed) = (0, 0, 0);
         let mut last = None;
@@ -338,12 +338,12 @@ fn add(
 /// `ZREM key member [member ...]`
 pub(super) fn zrem(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let removed = change(store, args.key(store), now, false, args, |set, args| {
         let Some(set) = set else {
             return Ok(0);
@@ -674,7 +674,7 @@ fn range_command(
             None => return reply_error(out, BAD_LEX_RANGE),
         },
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let source = args.key_at(store, first);
     if !store_into {
         // Written straight from the set, under its lock.
@@ -828,7 +828,14 @@ pub(super) fn zlexcount(
 }
 
 /// `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE` and `ZREMRANGEBYLEX key min max`
-fn remove_range(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, by: By) -> Reply {
+fn remove_range(
+    ctx: &Context,
+    session: &Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    by: By,
+) -> Reply {
     let (min, max) = (args.get(2), args.get(3));
     let bounds = match by {
         By::Rank => match (resp::parse_int(min), resp::parse_int(max)) {
@@ -844,7 +851,7 @@ fn remove_range(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, 
             None => return reply_error(out, BAD_LEX_RANGE),
         },
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let removed = change(store, args.key(store), now, false, args, |set, _| {
         let Some(set) = set else {
             return Ok(0);
@@ -865,32 +872,32 @@ fn remove_range(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, 
 
 pub(super) fn zremrangebyrank(
     c: &Context,
-    _: &mut Session,
+    s: &mut Session,
     n: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    remove_range(c, n, a, o, By::Rank)
+    remove_range(c, s, n, a, o, By::Rank)
 }
 
 pub(super) fn zremrangebyscore(
     c: &Context,
-    _: &mut Session,
+    s: &mut Session,
     n: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    remove_range(c, n, a, o, By::Score)
+    remove_range(c, s, n, a, o, By::Score)
 }
 
 pub(super) fn zremrangebylex(
     c: &Context,
-    _: &mut Session,
+    s: &mut Session,
     n: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    remove_range(c, n, a, o, By::Lex)
+    remove_range(c, s, n, a, o, By::Lex)
 }
 
 /// Pops up to `count` lowest (or highest, if `max`) entries.
@@ -924,7 +931,7 @@ fn pop_command(
         },
         _ => None,
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let popped = change(store, args.key(store), now, false, args, |set, _| {
         Ok(set
             .as_mut()
@@ -1046,7 +1053,7 @@ fn mpop(
     } else {
         None
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     for k in keys.clone() {
         let popped = change(store, args.key_at(store, k), now, false, args, |set, _| {
             Ok(set
@@ -1091,7 +1098,7 @@ fn blocking_pop(
             return Attempt::Done;
         }
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let keys = 1..args.len() - 1;
     for k in keys.clone() {
         let popped = change(store, args.key_at(store, k), now, false, args, |set, _| {
@@ -1429,7 +1436,7 @@ fn algebra(
     if numkeys > args.len() - at - 1 {
         return reply_error(out, SYNTAX_ERROR);
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let Ok(inputs) = read_inputs(store, now, session, args, at + 1..at + 1 + numkeys) else {
         return reply_error(out, WRONGTYPE);
     };
@@ -1567,7 +1574,7 @@ pub(super) fn zintercard(
     if numkeys > args.len() - 2 {
         return reply_error(out, SYNTAX_ERROR);
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let Ok(inputs) = read_inputs(store, now, session, args, 2..2 + numkeys) else {
         return reply_error(out, WRONGTYPE);
     };

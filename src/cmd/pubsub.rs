@@ -79,6 +79,9 @@ fn subscribe_to(
     reply: &[u8],
 ) -> Reply {
     let resp3 = session.resp3;
+    if !session.is_subscribed() {
+        ctx.update_client(session.id, |client| client.pubsub = true);
+    }
     let subscriptions = session.subscriptions(&ctx.pubsub);
     for i in 1..args.len() {
         subscriptions.add(to, args.get(i));
@@ -92,6 +95,7 @@ fn subscribe_to(
 
 /// Unsubscribes from the channels (or patterns) given, or from all of them.
 fn unsubscribe_from(
+    ctx: &Context,
     session: &mut Session,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -134,7 +138,11 @@ fn unsubscribe_from(
         resp::write_bulk(out, name);
         resp::write_integer(out, count as i64);
     }
+    let was = session.is_subscribed();
     session.end_subscriptions(false);
+    if was && !session.is_subscribed() {
+        ctx.update_client(session.id, |client| client.pubsub = false);
+    }
     Reply::Written
 }
 
@@ -173,35 +181,35 @@ pub(super) fn ssubscribe(
 
 /// `UNSUBSCRIBE [channel ...]`
 pub(super) fn unsubscribe(
-    _: &Context,
+    c: &Context,
     s: &mut Session,
     _: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    unsubscribe_from(s, a, o, To::Channels, b"unsubscribe")
+    unsubscribe_from(c, s, a, o, To::Channels, b"unsubscribe")
 }
 
 /// `PUNSUBSCRIBE [pattern ...]`
 pub(super) fn punsubscribe(
-    _: &Context,
+    c: &Context,
     s: &mut Session,
     _: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    unsubscribe_from(s, a, o, To::Patterns, b"punsubscribe")
+    unsubscribe_from(c, s, a, o, To::Patterns, b"punsubscribe")
 }
 
 /// `SUNSUBSCRIBE [shardchannel ...]`
 pub(super) fn sunsubscribe(
-    _: &Context,
+    c: &Context,
     s: &mut Session,
     _: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    unsubscribe_from(s, a, o, To::ShardChannels, b"sunsubscribe")
+    unsubscribe_from(c, s, a, o, To::ShardChannels, b"sunsubscribe")
 }
 
 /// `PUBLISH channel message`: how many received it.
@@ -308,12 +316,14 @@ pub(super) fn reset(
 ) -> Reply {
     session.end_subscriptions(true);
     session.multi = None;
+    session.select(ctx, 0);
     session.watching = None;
     session.name = None;
     session.set_resp3(false);
     ctx.update_client(session.id, |client| {
         client.name = None;
         client.resp3 = false;
+        client.pubsub = false;
     });
     session.set_authenticated(!ctx.has_password());
     out.extend_from_slice(b"+RESET\r\n");

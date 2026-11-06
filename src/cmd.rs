@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 pub use crate::blocking::Blocked;
-use crate::context::{Context, Session};
+use crate::context::{Context, KillFilter, Session};
 use crate::glob;
 use crate::resp;
 use crate::store::{
@@ -222,6 +222,8 @@ static COMMANDS: &[Command] = &[
     Command { name: "sort", arity: -2, flags: &["write", "denyoom"], keys: ONE_KEY, run: sort::sort },
     Command { name: "sort_ro", arity: -2, flags: &["readonly"], keys: ONE_KEY, run: sort::sort_ro },
     Command { name: "copy", arity: -3, flags: &["write", "denyoom"], keys: (1, 2, 1), run: keys::copy },
+    Command { name: "move", arity: 3, flags: &["write", "fast"], keys: (1, 1, 1), run: keys::move_key },
+    Command { name: "swapdb", arity: 3, flags: &["write", "fast"], keys: NO_KEYS, run: keys::swapdb },
     Command { name: "object", arity: -2, flags: &[], keys: NO_KEYS, run: keys::object },
     Command { name: "hget", arity: 3, flags: &["readonly", "fast"], keys: ONE_KEY, run: hash::hget },
     Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], keys: ONE_KEY, run: hash::hset },
@@ -442,7 +444,10 @@ pub fn spawn_expirer(
                 std::thread::sleep(interval);
                 let Some(ctx) = ctx.upgrade() else { break };
                 let now = ctx.store.now();
-                ctx.store.expire_cycle(now);
+                for db in ctx.store.live() {
+                    db.expire_cycle(now);
+                }
+                ctx.note_memory_peak();
                 if ctx.store.has_ready() {
                     serve_ready(&ctx, now);
                 }
@@ -457,7 +462,7 @@ pub fn spawn_expirer(
 fn serve_ready(ctx: &Context, now: Millis) {
     match ctx.aof() {
         Some(aof) => {
-            let turn = aof.turn(false);
+            let turn = aof.turn(false, 0);
             crate::blocking::serve_ready(ctx, turn.now);
         }
         None => crate::blocking::serve_ready(ctx, now),
@@ -515,7 +520,7 @@ fn logged(
     // Scripts and transactions log their commands' writes, and MSET its
     // pairs, as a group.
     let grouped = !command.writes() || matches!(command.name, "mset" | "msetnx");
-    let mut turn = aof.turn(grouped);
+    let mut turn = aof.turn(grouped, session.db);
     let now = turn.now;
     let start = out.len();
     let reply = (command.run)(ctx, session, now, args, out);
@@ -599,7 +604,7 @@ fn get(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let null = session.null();
     let (reply, hit) = store.get_key(args.key(store), now, |value| match value {
         None => {
@@ -628,7 +633,7 @@ fn mget(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let keys: Vec<Key<'_>> = (1..args.len()).map(|i| args.key_at(store, i)).collect();
     resp::write_array_header(out, keys.len());
     for (i, &key) in keys.iter().enumerate() {
@@ -692,7 +697,7 @@ fn set(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut cond = Condition::Always;
     let mut want_previous = false;
     let mut keep_ttl = false;
@@ -763,18 +768,24 @@ fn set(
     Reply::Written
 }
 
-fn setex(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    set_expiring(&ctx.store, now, args, out, TtlUnit::Seconds, "setex")
-}
-
-fn psetex(
+fn setex(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    set_expiring(&ctx.store, now, args, out, TtlUnit::Millis, "psetex")
+    set_expiring(ctx.db(session), now, args, out, TtlUnit::Seconds, "setex")
+}
+
+fn psetex(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    set_expiring(ctx.db(session), now, args, out, TtlUnit::Millis, "psetex")
 }
 
 /// `SETEX key seconds value` and `PSETEX key milliseconds value`.
@@ -804,8 +815,14 @@ fn set_expiring(
     Reply::Written
 }
 
-fn setnx(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    let store = &*ctx.store;
+fn setnx(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let store = ctx.db(session);
     let result = store.set_key(
         args.key(store),
         args.get(2),
@@ -824,12 +841,18 @@ fn setnx(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut
 /// `MSET key value [key value ...]`. Each key is written on its own, so
 /// unlike Redis, other clients can see some keys written before the rest,
 /// and an OOM error can come after some were.
-fn mset(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+fn mset(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
     if args.len().is_multiple_of(2) {
         wrong_arity(out, "mset");
         return Reply::Written;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let keys: Vec<Key<'_>> = (1..args.len())
         .step_by(2)
         .map(|i| args.key_at(store, i))
@@ -860,8 +883,14 @@ fn mset(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut 
 
 /// `DEL` and `UNLINK`. Big values are always freed after the shard lock is
 /// released, so the two are the same.
-fn del(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    let store = &*ctx.store;
+fn del(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let store = ctx.db(session);
     let removed: i64 = (1..args.len())
         .map(|i| {
             update(store, args.key_at(store, i), now, |current| match current {
@@ -876,12 +905,12 @@ fn del(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut V
 
 fn exists(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let found: i64 = (1..args.len())
         .map(|i| {
             update(store, args.key_at(store, i), now, |current| {
@@ -900,7 +929,7 @@ fn getdel(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let value = update(store, args.key(store), now, |current| match current {
         Some(current) if current.value.kind() != Kind::String => (Update::Touch, Err(())),
         Some(current) => (Update::Delete, Ok(Some(current.value.share()))),
@@ -917,7 +946,7 @@ fn getex(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut persist = false;
     let mut ttl: Option<(TtlUnit, &[u8])> = None;
     let mut i = 2;
@@ -960,42 +989,56 @@ fn getex(
 
 fn expire(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    set_expiry(&ctx.store, now, args, out, TtlUnit::Seconds, "expire")
+    set_expiry(ctx.db(session), now, args, out, TtlUnit::Seconds, "expire")
 }
 
 fn pexpire(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    set_expiry(&ctx.store, now, args, out, TtlUnit::Millis, "pexpire")
+    set_expiry(ctx.db(session), now, args, out, TtlUnit::Millis, "pexpire")
 }
 
 fn expireat(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    set_expiry(&ctx.store, now, args, out, TtlUnit::UnixSeconds, "expireat")
+    set_expiry(
+        ctx.db(session),
+        now,
+        args,
+        out,
+        TtlUnit::UnixSeconds,
+        "expireat",
+    )
 }
 
 fn pexpireat(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    set_expiry(&ctx.store, now, args, out, TtlUnit::UnixMillis, "pexpireat")
+    set_expiry(
+        ctx.db(session),
+        now,
+        args,
+        out,
+        TtlUnit::UnixMillis,
+        "pexpireat",
+    )
 }
 
 /// `EXPIRE key seconds [NX | XX | GT | LT]` and its millisecond and Unix
@@ -1085,32 +1128,44 @@ fn expire_target(store: &Store, now: Millis, unit: TtlUnit, n: i64) -> Option<Mi
     }
 }
 
-fn ttl(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    reply_expiry(&ctx.store, now, args, out, TtlUnit::Seconds)
+fn ttl(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    reply_expiry(ctx.db(session), now, args, out, TtlUnit::Seconds)
 }
 
-fn pttl(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    reply_expiry(&ctx.store, now, args, out, TtlUnit::Millis)
+fn pttl(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    reply_expiry(ctx.db(session), now, args, out, TtlUnit::Millis)
 }
 
 fn expiretime(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    reply_expiry(&ctx.store, now, args, out, TtlUnit::UnixSeconds)
+    reply_expiry(ctx.db(session), now, args, out, TtlUnit::UnixSeconds)
 }
 
 fn pexpiretime(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    reply_expiry(&ctx.store, now, args, out, TtlUnit::UnixMillis)
+    reply_expiry(ctx.db(session), now, args, out, TtlUnit::UnixMillis)
 }
 
 /// `TTL`, `PTTL`, `EXPIRETIME` and `PEXPIRETIME`: -2 if the key doesn't
@@ -1142,12 +1197,12 @@ fn reply_expiry(
 
 fn persist(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let removed = update(store, args.key(store), now, |current| match current {
         Some(Current {
             expiry: Expiry::At(_),
@@ -1159,23 +1214,35 @@ fn persist(
     Reply::Written
 }
 
-fn incr(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    incr_by(&ctx.store, now, args, out, 1)
+fn incr(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    incr_by(ctx.db(session), now, args, out, 1)
 }
 
-fn decr(ctx: &Context, _: &mut Session, now: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    incr_by(&ctx.store, now, args, out, -1)
+fn decr(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    incr_by(ctx.db(session), now, args, out, -1)
 }
 
 fn incrby(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
     match resp::parse_int(args.get(2)) {
-        Some(delta) => incr_by(&ctx.store, now, args, out, delta),
+        Some(delta) => incr_by(ctx.db(session), now, args, out, delta),
         None => {
             resp::write_error(out, NOT_AN_INTEGER);
             Reply::Written
@@ -1185,13 +1252,13 @@ fn incrby(
 
 fn decrby(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
     match resp::parse_int(args.get(2)).map(i64::checked_neg) {
-        Some(Some(delta)) => incr_by(&ctx.store, now, args, out, delta),
+        Some(Some(delta)) => incr_by(ctx.db(session), now, args, out, delta),
         Some(None) => {
             resp::write_error(out, b"ERR decrement would overflow");
             Reply::Written
@@ -1233,16 +1300,26 @@ fn incr_by(store: &Store, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, delta
     Reply::Written
 }
 
-/// `FLUSHALL` and `FLUSHDB` (there is one database), `ASYNC` or `SYNC`.
-/// Freeing happens outside the shard locks either way.
-fn flush(ctx: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+/// `FLUSHALL` and `FLUSHDB`, `ASYNC` or `SYNC`. Freeing happens outside the
+/// shard locks either way.
+fn flush(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
     let mode_ok =
         |arg: &[u8]| arg.eq_ignore_ascii_case(b"ASYNC") || arg.eq_ignore_ascii_case(b"SYNC");
     if args.len() > 2 || (args.len() == 2 && !mode_ok(args.get(1))) {
         resp::write_error(out, SYNTAX_ERROR);
         return Reply::Written;
     }
-    ctx.store.clear();
+    if args.get(0).eq_ignore_ascii_case(b"FLUSHALL") {
+        ctx.store.live().for_each(Store::clear);
+    } else {
+        ctx.db(session).clear();
+    }
     out.extend_from_slice(resp::OK);
     Reply::Written
 }
@@ -1351,14 +1428,40 @@ fn echo(_: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Vec<
     Reply::Written
 }
 
-/// Some clients send `SELECT 0` on connect. There is only one database.
-fn select(_: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    match resp::parse_int(args.get(1)) {
-        Some(0) => out.extend_from_slice(resp::OK),
-        Some(_) => resp::write_error(out, b"ERR DB index is out of range"),
-        None => resp::write_error(out, NOT_AN_INTEGER),
+/// `SELECT index`: the database this connection's commands use from now on.
+fn select(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    if let Some(index) = db_index(ctx, args.get(1), out) {
+        session.select(ctx, index);
+        crate::aof::select(index as usize);
+        out.extend_from_slice(resp::OK);
     }
     Reply::Written
+}
+
+/// The database numbered `arg`: or, if it isn't one, writes the error.
+fn db_index(ctx: &Context, arg: &[u8], out: &mut Vec<u8>) -> Option<u32> {
+    let Some(index) = resp::parse_int(arg) else {
+        resp::write_error(out, NOT_AN_INTEGER);
+        return None;
+    };
+    if i32::try_from(index).is_err() {
+        resp::write_error(
+            out,
+            b"ERR value is out of range, value must between -2147483648 and 2147483647",
+        );
+        return None;
+    }
+    if !(0..ctx.store.databases() as i64).contains(&index) {
+        resp::write_error(out, b"ERR DB index is out of range");
+        return None;
+    }
+    Some(index as u32)
 }
 
 /// `TIME`: the Unix time, in seconds and microseconds.
@@ -1372,8 +1475,14 @@ fn time(_: &Context, _: &mut Session, _: Millis, _: &Args<'_>, out: &mut Vec<u8>
     Reply::Written
 }
 
-fn dbsize(ctx: &Context, _: &mut Session, _: Millis, _: &Args<'_>, out: &mut Vec<u8>) -> Reply {
-    resp::write_integer(out, ctx.store.len() as i64);
+fn dbsize(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    resp::write_integer(out, ctx.db(session).len() as i64);
     Reply::Written
 }
 
@@ -1527,7 +1636,7 @@ fn valid_client_attr(value: &[u8], what: &str, out: &mut Vec<u8>) -> bool {
     valid
 }
 
-/// `CLIENT SETNAME | GETNAME | ID | SETINFO | LIST | INFO`: what client
+/// `CLIENT SETNAME | GETNAME | ID | SETINFO | LIST | INFO | KILL`: what client
 /// libraries send on connect, and what job queues read to find their
 /// workers.
 fn client(
@@ -1591,32 +1700,122 @@ fn client(
         resp::write_verbatim_text(out, &line, session.resp3);
     } else if is(b"LIST") {
         client_list(ctx, session, args, out);
+    } else if is(b"KILL") {
+        return client_kill(ctx, session, args, out);
     } else {
         unknown_subcommand(out, sub, "CLIENT");
     }
     Reply::Written
 }
 
+/// `CLIENT KILL addr:port`, which replies OK and can close the caller's own
+/// connection, or `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port]
+/// [LADDR addr:port] [SKIPME yes|no]`, which replies how many it closed.
+fn client_kill(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+    let mut filter = KillFilter {
+        addr: None,
+        laddr: None,
+        id: 0,
+        pubsub: None,
+        none: false,
+        skip_me: true,
+    };
+    let n = args.len();
+    if n < 3 {
+        resp::write_error(
+            out,
+            b"ERR wrong number of arguments for 'client|kill' command",
+        );
+        return Reply::Written;
+    }
+    if n == 3 {
+        filter.addr = Some(args.get(2));
+        filter.skip_me = false;
+    } else if n % 2 == 1 {
+        // An option without its value (Redis reads them in pairs).
+        resp::write_error(out, SYNTAX_ERROR);
+        return Reply::Written;
+    }
+    if n > 3 {
+        let mut i = 2;
+        while i < n {
+            let (option, value) = (args.get(i), args.get(i + 1));
+            let is = |name: &[u8]| option.eq_ignore_ascii_case(name);
+            if is(b"ID") {
+                match resp::parse_int(value) {
+                    Some(id) if id >= 1 => filter.id = id as u64,
+                    _ => {
+                        resp::write_error(out, b"ERR client-id should be greater than 0");
+                        return Reply::Written;
+                    }
+                }
+            } else if is(b"TYPE") {
+                let kind = |name: &[u8]| value.eq_ignore_ascii_case(name);
+                if kind(b"NORMAL") {
+                    filter.pubsub = Some(false);
+                } else if kind(b"PUBSUB") {
+                    filter.pubsub = Some(true);
+                } else if kind(b"MASTER") || kind(b"REPLICA") || kind(b"SLAVE") {
+                    filter.none = true;
+                } else {
+                    let mut msg = b"ERR Unknown client type '".to_vec();
+                    msg.extend_from_slice(value);
+                    msg.push(b'\'');
+                    resp::write_error(out, &msg);
+                    return Reply::Written;
+                }
+            } else if is(b"ADDR") {
+                filter.addr = Some(value);
+            } else if is(b"LADDR") {
+                filter.laddr = Some(value);
+            } else if is(b"USER") {
+                if value != b"default" {
+                    let mut msg = b"ERR No such user '".to_vec();
+                    msg.extend_from_slice(value);
+                    msg.push(b'\'');
+                    resp::write_error(out, &msg);
+                    return Reply::Written;
+                }
+            } else if is(b"SKIPME") {
+                if value.eq_ignore_ascii_case(b"YES") {
+                    filter.skip_me = true;
+                } else if value.eq_ignore_ascii_case(b"NO") {
+                    filter.skip_me = false;
+                } else {
+                    resp::write_error(out, SYNTAX_ERROR);
+                    return Reply::Written;
+                }
+            } else {
+                resp::write_error(out, SYNTAX_ERROR);
+                return Reply::Written;
+            }
+            i += 2;
+        }
+    }
+    let (killed, me_too) = ctx.kill_clients(session.id, &filter);
+    if n > 3 {
+        resp::write_integer(out, killed as i64);
+    } else if killed == 0 {
+        resp::write_error(out, b"ERR No such client");
+    } else {
+        out.extend_from_slice(resp::OK);
+    }
+    if me_too { Reply::Close } else { Reply::Written }
+}
+
 /// `CLIENT LIST [TYPE NORMAL|MASTER|REPLICA|PUBSUB] [ID id [id ...]]`, as
-/// Redis 7.2 reads its arguments. (Only the caller's subscriptions are
-/// known here, so `TYPE PUBSUB` lists the caller if it's subscribed.)
+/// Redis 7.2 reads its arguments.
 fn client_list(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<u8>) {
     let n = args.len();
     let lines = if n == 4 && args.get(2).eq_ignore_ascii_case(b"TYPE") {
         let kind = args.get(3);
         let is = |name: &[u8]| kind.eq_ignore_ascii_case(name);
-        let subscribed = session.is_subscribed();
-        if is(b"NORMAL") {
-            let mut lines = ctx.client_lines(session, &[], "client|list");
-            if subscribed {
-                lines = drop_line(lines, session.id);
-            }
-            lines
-        } else if is(b"PUBSUB") {
-            if subscribed {
-                ctx.client_lines(session, &[session.id], "client|list")
-            } else {
+        if is(b"NORMAL") || is(b"PUBSUB") {
+            let ids = ctx.client_ids(is(b"PUBSUB"));
+            if ids.is_empty() {
                 Vec::new()
+            } else {
+                ctx.client_lines(session, &ids, "client|list")
             }
         } else if is(b"MASTER") || is(b"REPLICA") || is(b"SLAVE") {
             Vec::new()
@@ -1646,17 +1845,6 @@ fn client_list(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
         ctx.client_lines(session, &[], "client|list")
     };
     resp::write_verbatim_text(out, &lines, session.resp3);
-}
-
-/// `lines` without the one for client `id`.
-fn drop_line(lines: Vec<u8>, id: u64) -> Vec<u8> {
-    let prefix = format!("id={id} ");
-    lines
-        .split_inclusive(|&b| b == b'\n')
-        .filter(|line| !line.starts_with(prefix.as_bytes()))
-        .flatten()
-        .copied()
-        .collect()
 }
 
 /// `COMMAND`, `COMMAND COUNT | INFO [name ...] | LIST | DOCS`: enough for
@@ -1752,7 +1940,7 @@ fn config(
         let settings = [
             ("maxmemory", store.maxmemory().to_string()),
             ("maxmemory-policy", store.policy().name().to_string()),
-            ("databases", "1".to_string()),
+            ("databases", store.databases().to_string()),
             // In Redis' "seconds changes" form: save after this long if
             // anything changed.
             (
@@ -1805,12 +1993,12 @@ fn string_or_null(
 /// `TYPE key`
 fn type_of(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let kind = update(store, args.key(store), now, |current| {
         (Update::Peek, current.map(|c| c.value.kind()))
     });
@@ -1990,20 +2178,26 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
     ctx.publish(session);
     let server = ctx.stats();
     let stats = ctx.store.stats();
+    let peak = ctx.note_memory_peak().max(stats.used_memory);
     let mut s = String::new();
     let _ = write!(
         s,
         "# Server\r\nredis_version:{REDIS_VERSION}\r\ntantalum_version:{}\r\nredis_mode:standalone\r\n\
-         process_id:{}\r\nuptime_in_seconds:{}\r\n\r\n\
+         process_id:{}\r\nuptime_in_seconds:{}\r\nuptime_in_days:{}\r\n\r\n\
          # Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\n\r\n\
-         # Memory\r\nused_memory:{}\r\n",
+         # Memory\r\nused_memory:{}\r\nused_memory_human:{}\r\nused_memory_peak:{}\r\n\
+         used_memory_peak_human:{}\r\n",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         server.uptime.as_secs(),
+        server.uptime.as_secs() / 86_400,
         server.connected_clients,
         ctx.settings.maxclients,
         ctx.store.blocked_clients(),
         stats.used_memory,
+        bytes_to_human(stats.used_memory),
+        peak,
+        bytes_to_human(peak),
     );
     // Where used_memory goes: packed entries (and how much of that is live),
     // values too big to pack, hash tables, and connection buffers.
@@ -2071,15 +2265,32 @@ fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut
         ctx.scripting_stats().0,
         ctx.scripting_stats().1,
     );
-    if stats.keys > 0 {
-        let _ = write!(
-            s,
-            "db0:keys={},expires={},avg_ttl=0\r\n",
-            stats.keys, stats.keys_with_ttl
-        );
+    for db in ctx.store.live() {
+        let (keys, with_ttl) = db.key_counts();
+        if keys > 0 {
+            let _ = write!(
+                s,
+                "db{}:keys={keys},expires={with_ttl},avg_ttl=0\r\n",
+                db.index()
+            );
+        }
     }
     resp::write_verbatim_text(out, s.as_bytes(), session.resp3);
     Reply::Written
+}
+
+/// `bytes` as Redis' `INFO` shows them for people.
+fn bytes_to_human(bytes: usize) -> String {
+    let b = bytes as f64;
+    const K: f64 = 1024.0;
+    match bytes {
+        n if n < 1 << 10 => format!("{n}B"),
+        n if n < 1 << 20 => format!("{:.2}K", b / K),
+        n if n < 1 << 30 => format!("{:.2}M", b / K / K),
+        n if n < 1 << 40 => format!("{:.2}G", b / K / K / K),
+        n if n < 1 << 50 => format!("{:.2}T", b / K / K / K / K),
+        _ => format!("{:.2}P", b / K / K / K / K / K),
+    }
 }
 
 #[cfg(target_os = "linux")]

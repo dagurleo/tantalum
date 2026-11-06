@@ -86,6 +86,8 @@ pub struct Context {
     aof: std::sync::OnceLock<Arc<crate::aof::Aof>>,
     /// Who is subscribed to what.
     pub pubsub: Arc<PubSub>,
+    /// The most memory seen in use, as `INFO` reports it.
+    memory_peak: AtomicUsize,
     /// Lua scripts and their interpreter, made on the first one.
     pub(crate) scripting: Scripting,
     started: Instant,
@@ -108,6 +110,7 @@ impl Context {
     pub fn new(store: Arc<Store>, settings: Settings) -> Self {
         Context {
             pubsub: Arc::new(PubSub::new(store.clone())),
+            memory_peak: AtomicUsize::new(0),
             scripting: Scripting::default(),
             store,
             settings,
@@ -123,6 +126,24 @@ impl Context {
             shutting_down: AtomicBool::new(false),
             shutdown: watch::Sender::new(false),
         }
+    }
+
+    /// The database `session` has selected.
+    #[inline]
+    pub(crate) fn db(&self, session: &Session) -> &Store {
+        if session.db == 0 {
+            &self.store
+        } else {
+            self.store.db(session.db as usize)
+        }
+    }
+
+    /// Takes note of how much memory is in use now, as Redis does on a timer:
+    /// the most seen.
+    pub(crate) fn note_memory_peak(&self) -> usize {
+        self.memory_peak
+            .fetch_max(self.store.used_memory(), Relaxed)
+            .max(self.store.used_memory())
     }
 
     /// Logs writes to `aof` from now on (see `aof::start`).
@@ -174,6 +195,8 @@ impl Context {
                     lib_name: None,
                     lib_ver: None,
                     resp3: false,
+                    db: 0,
+                    pubsub: false,
                 },
             );
         }
@@ -217,6 +240,40 @@ impl Context {
         if let Some(client) = self.clients.lock().get_mut(&id) {
             f(client);
         }
+    }
+
+    /// The connections that are (or aren't) subscribed, in order.
+    pub(crate) fn client_ids(&self, pubsub: bool) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .clients
+            .lock()
+            .iter()
+            .filter(|(_, client)| client.pubsub == pubsub)
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// `CLIENT KILL`: closes the connections it picks, but for `me`'s own,
+    /// which the caller closes after its reply. How many it picked, and
+    /// whether `me` was one.
+    pub(crate) fn kill_clients(&self, me: u64, filter: &KillFilter<'_>) -> (usize, bool) {
+        let clients = self.clients.lock();
+        let (mut killed, mut me_too) = (0, false);
+        for (&id, client) in clients.iter() {
+            if !filter.picks(id, me, client) {
+                continue;
+            }
+            killed += 1;
+            if id == me {
+                me_too = true;
+            } else {
+                // SAFETY: as in `shutdown`.
+                unsafe { libc::shutdown(client.dup, libc::SHUT_RDWR) };
+            }
+        }
+        (killed, me_too)
     }
 
     /// `CLIENT LIST` (`ids` empty: every connection, by id) and `CLIENT
@@ -354,6 +411,7 @@ impl Client<'_> {
             in_script: false,
             name: None,
             resp3: false,
+            db: 0,
             commands: 0,
             hits: 0,
             misses: 0,
@@ -400,6 +458,64 @@ pub(crate) struct Registered {
     pub(crate) lib_name: Option<Box<[u8]>>,
     pub(crate) lib_ver: Option<Box<[u8]>>,
     pub(crate) resp3: bool,
+    pub(crate) db: u32,
+    /// Subscribed to something, as `CLIENT LIST` and `CLIENT KILL` go by.
+    pub(crate) pubsub: bool,
+}
+
+/// What `CLIENT KILL` goes by.
+pub(crate) struct KillFilter<'a> {
+    pub(crate) addr: Option<&'a [u8]>,
+    pub(crate) laddr: Option<&'a [u8]>,
+    /// 0 for any.
+    pub(crate) id: u64,
+    /// Subscribed or not; `None` for either.
+    pub(crate) pubsub: Option<bool>,
+    /// A kind of client there's none of here: replicas, a master.
+    pub(crate) none: bool,
+    pub(crate) skip_me: bool,
+}
+
+impl KillFilter<'_> {
+    fn picks(&self, id: u64, me: u64, client: &Registered) -> bool {
+        if self.none || (self.skip_me && id == me) || (self.id != 0 && self.id != id) {
+            return false;
+        }
+        if self.pubsub.is_some_and(|pubsub| pubsub != client.pubsub) {
+            return false;
+        }
+        if self.addr.is_some() || self.laddr.is_some() {
+            let (peer, local) = client.addresses();
+            let differs =
+                |wanted: Option<&[u8]>, is: String| wanted.is_some_and(|w| w != is.as_bytes());
+            if differs(self.addr, peer) || differs(self.laddr, local) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Registered {
+    /// The socket's addresses, the peer's first, as `CLIENT LIST` shows them.
+    fn addresses(&self) -> (String, String) {
+        use std::os::fd::BorrowedFd;
+        let addr = |a: Option<socket2::SockAddr>| {
+            a.and_then(|a| a.as_socket())
+                .map_or_else(|| "?:0".to_string(), |a| a.to_string())
+        };
+        // (No socket: a client made in-process, or one whose fd didn't dup.)
+        let (peer, local) = if self.dup >= 0 {
+            // SAFETY: the duplicate stays open while the client is registered,
+            // which the caller's lock guarantees.
+            let fd = unsafe { BorrowedFd::borrow_raw(self.dup) };
+            let socket = socket2::SockRef::from(&fd);
+            (socket.peer_addr().ok(), socket.local_addr().ok())
+        } else {
+            (None, None)
+        };
+        (addr(peer), addr(local))
+    }
 }
 
 /// One `CLIENT LIST` line, in Redis 7.2's format. What isn't tracked per
@@ -413,21 +529,7 @@ fn client_line(
     now: Duration,
     me: Option<(&Session, &str)>,
 ) {
-    use std::os::fd::BorrowedFd;
-    let addr = |a: Option<socket2::SockAddr>| {
-        a.and_then(|a| a.as_socket())
-            .map_or_else(|| "?:0".to_string(), |a| a.to_string())
-    };
-    // (No socket: a client made in-process, or one whose fd didn't dup.)
-    let (peer, local) = if client.dup >= 0 {
-        // SAFETY: the duplicate stays open while the client is registered,
-        // which the caller's lock guarantees.
-        let fd = unsafe { BorrowedFd::borrow_raw(client.dup) };
-        let socket = socket2::SockRef::from(&fd);
-        (socket.peer_addr().ok(), socket.local_addr().ok())
-    } else {
-        (None, None)
-    };
+    let (peer, local) = client.addresses();
     let text = |v: &Option<Box<[u8]>>| {
         v.as_deref()
             .map_or_else(String::new, |v| String::from_utf8_lossy(v).into_owned())
@@ -436,7 +538,7 @@ fn client_line(
     let subscriptions = session.and_then(|s| s.pubsub.as_deref());
     let count = |to| subscriptions.map_or(0, |s| s.count_of(to));
     let mut flags = String::new();
-    if subscriptions.is_some_and(|s| !s.is_empty()) {
+    if client.pubsub {
         flags.push('P');
     }
     if session.is_some_and(|s| s.multi.is_some()) {
@@ -446,16 +548,17 @@ fn client_line(
         flags.push('N');
     }
     let resp3 = session.map_or(client.resp3, |s| s.resp3);
+    let db = session.map_or(client.db, |s| s.db);
     let multi = session
         .and_then(|s| s.multi.as_ref())
         .map_or(-1, |queue| queue.len() as i64);
     let line = format!(
-        "id={id} addr={} laddr={} fd={} name={} age={} idle=0 flags={flags} db=0 sub={} psub={} \
+        "id={id} addr={} laddr={} fd={} name={} age={} idle=0 flags={flags} db={db} sub={} psub={} \
          ssub={} multi={multi} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 \
          oll=0 omem=0 tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} \
          lib-ver={}\n",
-        addr(peer),
-        addr(local),
+        peer,
+        local,
         client.fd,
         text(&client.name),
         now.saturating_sub(client.connected).as_secs(),
@@ -491,6 +594,8 @@ pub struct Session {
     pub(crate) name: Option<Box<[u8]>>,
     /// Whether the client switched to RESP3 with `HELLO 3`.
     pub(crate) resp3: bool,
+    /// The database it has selected (`SELECT`).
+    pub(crate) db: u32,
     /// Counts not yet added to the server's (see [`Context::publish`]).
     pub(crate) commands: u64,
     pub(crate) hits: u64,
@@ -501,6 +606,14 @@ pub struct Session {
 }
 
 impl Session {
+    /// Uses database `index` from now on.
+    pub(crate) fn select(&mut self, ctx: &Context, index: u32) {
+        if self.db != index {
+            self.db = index;
+            ctx.update_client(self.id, |client| client.db = index);
+        }
+    }
+
     /// The session a script's `redis.call`s run in, as Redis' script client:
     /// authenticated, RESP2 unless the script asks for RESP3, and blocking
     /// commands reply at once.
@@ -516,6 +629,7 @@ impl Session {
             in_script: true,
             name: None,
             resp3: false,
+            db: 0,
             commands: 0,
             hits: 0,
             misses: 0,

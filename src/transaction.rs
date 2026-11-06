@@ -48,11 +48,13 @@ impl Queue {
 
 /// The keys a connection watches. Dropping it stops watching them.
 pub(crate) struct Watching {
+    /// Database 0.
     store: Arc<Store>,
     /// Set when a watched key changes.
     flag: Arc<AtomicBool>,
-    /// Each key, and whether it had expired already when watched.
-    keys: Vec<(Box<[u8]>, bool)>,
+    /// Each key, its database, and whether it had expired already when
+    /// watched.
+    keys: Vec<(usize, Box<[u8]>, bool)>,
 }
 
 impl Watching {
@@ -64,29 +66,31 @@ impl Watching {
         }
     }
 
-    pub(crate) fn add(&mut self, key: &[u8], now: Millis) {
-        if self.keys.iter().any(|(k, _)| **k == *key) {
+    pub(crate) fn add(&mut self, db: usize, key: &[u8], now: Millis) {
+        if self.keys.iter().any(|(d, k, _)| *d == db && **k == *key) {
             return;
         }
-        let expired = self.store.watch(self.store.key(key), &self.flag, now);
-        self.keys.push((key.into(), expired));
+        let store = self.store.db(db);
+        let expired = store.watch(store.key(key), &self.flag, now);
+        self.keys.push((db, key.into(), expired));
     }
 
     /// Whether a watched key changed, or expired since it was watched. For
     /// `EXEC`, holding every shard.
     pub(crate) fn changed(&self, now: Millis) -> bool {
         self.flag.load(Relaxed)
-            || self
-                .keys
-                .iter()
-                .any(|(key, expired)| !expired && self.store.has_expired(self.store.key(key), now))
+            || self.keys.iter().any(|(db, key, expired)| {
+                let store = self.store.db(*db);
+                !expired && store.has_expired(store.key(key), now)
+            })
     }
 }
 
 impl Drop for Watching {
     fn drop(&mut self) {
-        for (key, _) in &self.keys {
-            self.store.unwatch(self.store.key(key), &self.flag);
+        for (db, key, _) in &self.keys {
+            let store = self.store.db(*db);
+            store.unwatch(store.key(key), &self.flag);
         }
     }
 }

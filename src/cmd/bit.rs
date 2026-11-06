@@ -41,7 +41,7 @@ fn read(
     out: &mut Vec<u8>,
     f: impl FnOnce(Option<&[u8]>, &mut Vec<u8>),
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut f = Some(f);
     let mut run =
         |value: Option<&[u8]>, out: &mut Vec<u8>| f.take().expect("runs once")(value, out);
@@ -71,7 +71,7 @@ fn read(
 /// (the same bit, the same length) doesn't count as a write to the key.
 pub(super) fn setbit(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -97,7 +97,7 @@ pub(super) fn setbit(
             bytes[byte] &= !mask;
         }
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let key = args.key(store);
     let edited = store.edit_string(
         key,
@@ -153,7 +153,7 @@ pub(super) fn getbit(
     };
     let byte = (offset >> 3) as usize;
     let mask = 0x80u8 >> (offset & 7);
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (bit, hit) = store.get_key(args.key(store), now, |value| match value {
         None => (Some(false), false),
         Some(v) if v.kind() != Kind::String => (None, true),
@@ -452,7 +452,7 @@ pub(super) fn bitpos(
 /// like a `SET`: whatever it held, and its TTL, are gone.
 pub(super) fn bitop(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -484,7 +484,7 @@ pub(super) fn bitop(
         );
         return Reply::Written;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     store.exclusive(|| {
         let mut sources = Vec::with_capacity(args.len() - 3);
         for i in 3..args.len() {
@@ -871,7 +871,7 @@ fn bitfield_generic(
         return Reply::Written;
     }
     let needed = (highest >> 3) as usize + 1;
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let key = args.key(store);
     let mut reply = Vec::new();
     let edited = store.edit_string(

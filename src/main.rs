@@ -95,6 +95,7 @@ Options:
                     otherwise per-thread]
   --shards <N>      Store shards, rounded up to a power of two
                     [default: 256, or 1 per 4 MB of --maxmemory between 16 and 256]
+  --databases <N>   How many numbered databases there are (SELECT) [default: 16]
   --maxmemory <SIZE>
                     Memory limit, e.g. 100mb or 2gb; 0 is unlimited [default: 0]
   --maxmemory-policy <POLICY>
@@ -259,6 +260,13 @@ fn parse_args() -> Result<Config, String> {
             "--port" => config.port = value.parse().map_err(|_| bad(()))?,
             "--threads" => config.threads = value.parse::<usize>().map_err(|_| bad(()))?.max(1),
             "--shards" => config.store.shards = value.parse().map_err(|_| bad(()))?,
+            "--databases" => {
+                config.store.databases = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&n| n >= 1)
+                    .ok_or_else(|| bad(()))?;
+            }
             "--io" => {
                 config.io = Some(match value.as_str() {
                     "shared" => Io::Shared,
@@ -573,7 +581,7 @@ fn start_aof(ctx: &Context, options: aof::Options) {
 
 /// Loads the snapshot at `path`, if there is one. A damaged one stops the
 /// server, as in Redis: starting empty would overwrite it at the next save.
-fn load_snapshot(store: &store::Store, path: &std::path::Path) {
+fn load_snapshot(store: &Arc<store::Store>, path: &std::path::Path) {
     let started = Instant::now();
     match snapshot::load(store, path) {
         Ok(None) => eprintln!("no snapshot at {} yet: starting empty", path.display()),

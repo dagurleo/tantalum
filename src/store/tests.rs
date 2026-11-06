@@ -2424,3 +2424,82 @@ fn an_edit_counts_as_a_write_only_if_it_says_so() {
             .is_none()
     );
 }
+
+#[test]
+fn databases_share_their_shards_locks() {
+    let store = Arc::new(Store::new(2));
+    let other = store.db(3).clone();
+    let (entered, enter) = std::sync::mpsc::channel();
+    let writer = {
+        let other = other.clone();
+        store.exclusive(|| {
+            // This thread uses them all as always, holding them.
+            other
+                .set(b"mine", b"1", Condition::Always, Expiry::Never, 1, false)
+                .unwrap();
+            let writer = std::thread::spawn(move || {
+                other
+                    .set(b"theirs", b"1", Condition::Always, Expiry::Never, 1, false)
+                    .unwrap();
+                entered.send(()).unwrap();
+            });
+            // Another waits.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(enter.try_recv().is_err(), "it wrote during a transaction");
+            writer
+        })
+    };
+    writer.join().unwrap();
+    assert!(enter.try_recv().is_ok());
+    assert_eq!(other.len(), 2);
+    assert_eq!(store.len(), 0);
+}
+
+#[test]
+fn databases_are_made_when_first_used() {
+    let store = Arc::new(Store::new(2));
+    assert_eq!(store.databases(), 16);
+    assert_eq!(store.live().count(), 1);
+    assert_eq!(store.db(0).index(), 0);
+    assert_eq!(store.db(5).index(), 5);
+    assert_eq!(store.live().map(Store::index).collect::<Vec<_>>(), [0, 5]);
+}
+
+#[test]
+fn database_zero_counts_the_memory_of_all() {
+    let store = Arc::new(Store::new(2));
+    let before = store.used_memory();
+    let other = store.db(1);
+    for i in 0..1_000 {
+        other
+            .set(
+                format!("k{i}").as_bytes(),
+                &[b'v'; 100],
+                Condition::Always,
+                Expiry::Never,
+                1,
+                false,
+            )
+            .unwrap();
+    }
+    other.clear();
+    store.live().for_each(Store::clear);
+    assert!(store.used_memory() <= before + 4096);
+    for i in 0..1_000 {
+        other
+            .set(
+                format!("k{i}").as_bytes(),
+                &[b'v'; 100],
+                Condition::Always,
+                Expiry::Never,
+                1,
+                false,
+            )
+            .unwrap();
+    }
+    let stats = store.stats();
+    assert_eq!(stats.keys, 1_000);
+    assert!(stats.used_memory > 100_000, "{}", stats.used_memory);
+    assert_eq!(other.key_counts(), (1_000, 0));
+    assert_eq!(store.key_counts(), (0, 0));
+}

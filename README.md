@@ -10,8 +10,8 @@ and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 `MGET`/`MSET`, `DEL`, `EXPIRE`/`TTL`, `INCR` and friends), hashes, sets,
 lists, sorted sets, streams, blocking commands, pub/sub, transactions and
 Lua scripts (enough to run [BullMQ](https://bullmq.io), whose jobs cost
-the server about a third of the CPU they cost Redis), and `SCAN`, `KEYS`
-and `RENAME`, with TTLs, eviction, a password, TLS, and optional snapshots
+the server about a third of the CPU they cost Redis), numbered databases, and
+`SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS, and optional snapshots
 and an append-only log on disk. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
@@ -80,7 +80,8 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `BITFIELD key [GET type offset\|SET type offset value\|INCRBY type offset n\|OVERFLOW WRAP\|SAT\|FAIL ...]`, `BITFIELD_RO` | |
 | `MSETNX key value [key value ...]` | Atomic: all or none, with nothing else running meanwhile |
 | `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN]` | |
-| `COPY source destination [DB 0] [REPLACE]`, `TOUCH key [key ...]`, `RANDOMKEY` | `COPY` is atomic, TTL included; there is one database. `RANDOMKEY` is about uniform |
+| `COPY source destination [DB db] [REPLACE]`, `TOUCH key [key ...]`, `RANDOMKEY` | `COPY` is atomic, TTL included. `RANDOMKEY` is about uniform |
+| `SELECT index`, `MOVE key db`, `SWAPDB index1 index2` | Numbered databases, 16 unless `--databases` says otherwise. `MOVE` copies a big collection rather than handing it over, so it takes time in proportion to its size, holding every shard |
 | `OBJECT ENCODING\|FREQ\|IDLETIME\|REFCOUNT key`, `OBJECT HELP` | `ENCODING` is what Redis would use for what's held now, built from nothing (see "Not there yet"). `IDLETIME` is always 0: no last-access time is kept per key. `FREQ` is Redis' error without an LFU policy, as there's none |
 | `SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC\|DESC] [ALPHA] [STORE destination]`, `SORT_RO` | Atomic. Lists, sets and sorted sets, `*->field` for hashes |
 | `HSET key field value [field value ...]`, `HSETNX`, `HMSET` | Hashes keep their fields in the order they were added (as Redis does for small hashes) and keep the key's TTL |
@@ -123,7 +124,8 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `AUTH [username] password` | With `--requirepass` (or `TANTALUM_REQUIREPASS`). One user, `default`, as in Redis without ACLs |
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | RESP3 too: redis-py 8 won't connect without it. For these commands it only changes nulls, maps (`HELLO`, `CONFIG GET`, `HGETALL`), sets (`COMMAND` flags) and `INFO` (verbatim text) |
 | `CLIENT SETNAME\|GETNAME\|ID\|SETINFO` | What client libraries send on connect |
-| `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and subscriptions) reads as 0, `N` or `NULL` |
+| `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, database, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and how many subscriptions) reads as 0, `N` or `NULL` |
+| `CLIENT KILL addr:port`, `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port] [LADDR addr:port] [SKIPME yes\|no]` | Closes other connections at once, and the caller's own after its reply. The only user is `default` |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS]`, `CONFIG GET pattern ...` | For clients and tools that discover commands or read `maxmemory` and the policy. No `CONFIG SET` |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
 | `BGREWRITEAOF` | With `--aof`: rewrites the log on another thread (a new base of the data as it is, and a new, empty log after it). Without `--aof` it's an error, where Redis would write a log anyway |
@@ -136,11 +138,38 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `TIME` | |
 | `EVAL script numkeys [key ...] [arg ...]`, `EVALSHA sha1 ...`, `EVAL_RO`, `EVALSHA_RO` | Lua scripts on Redis 7.2.4's own Lua and libraries (`cjson`, `cmsgpack`, `struct`, `bit`), with its sandbox and `redis` API (`call`, `pcall`, `error_reply`, `status_reply`, `sha1hex`, `log`, `setresp`, ...). A script runs with the whole store to itself, as in Redis. Replies, conversions and errors (with `script: <sha1>, on @user_script:<line>.`) as Redis 7.2.4's; `#!lua flags=no-writes` and the `_RO` forms refuse writes |
 | `SCRIPT LOAD\|EXISTS\|FLUSH\|KILL\|HELP` | `KILL` stops a busy script that hasn't written, from a connection on another thread. `SCRIPT DEBUG NO` only: no Lua debugger |
-| `PING [msg]`, `ECHO msg`, `SELECT 0`, `QUIT`, `RESET` | `RESET` drops subscriptions, a transaction, watched keys, RESP3 and the name, and with a password, authentication |
+| `PING [msg]`, `ECHO msg`, `QUIT`, `RESET` | `RESET` drops subscriptions, a transaction, watched keys, RESP3 and the name, goes back to database 0, and with a password, drops authentication |
 
 Anything else gets `-ERR unknown command ...` and the connection stays open.
 With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
 `-NOAUTH` until the client authenticates.
+
+## Real frameworks' own tests
+
+These are each project's own test suites, unchanged, run against Tantalum and against
+Redis 7.2.4 side by side on Agent37 VMs. Each server is fresh and at the address the suite
+expects, and results are compared test by test (`bench/frameworks/`, whose `results.txt`
+has the details):
+
+| Suite | What ran | Redis 7.2.4 | Tantalum |
+|---|---|---|---|
+| Sidekiq 8.1.7 | All of it, the dashboard's too | 749 pass | 749 pass |
+| Rails 8.1.4.1 | Cache store (681), Action Cable's Redis adapter (25), Active Job with real Sidekiq (12) and Resque (8) workers | 726 pass | 726 pass |
+| Laravel 13.40.0 | Every test file that names Redis, with phpredis and with Predis | 1,363 pass, 19 skipped | the same |
+| Celery 5.7.0 | Integration tests, Redis as broker and as result backend | 394 pass, 5 fail, 10 skipped | the same, the same 5 |
+| Kombu 5.7.0 | Its Redis integration tests | 123 pass | 123 pass |
+| BullMQ 6.5.4 | All of it | 1,111 pass, 3 skipped | the same |
+
+Celery's 5 fail on Redis as well, so they say nothing of the server. Laravel's, Celery's and
+Kombu's counts are of test names, so a test run several times under one name counts once;
+the others are the runners' own totals. Rails pins the `json` gem below 3, as Resque's workers
+can't read their jobs otherwise, with either server. These suites are what brought numbered
+databases (Laravel's tests use databases 5 and 6, Action Cable's and Resque's 12, Sidekiq's
+sharding 6), `CLIENT KILL` and the `INFO` fields Sidekiq's dashboard reads.
+
+To run them, on a machine with Docker: `bench/frameworks/fetch.sh`, then
+`bench/frameworks/run.sh setup SUITE` once, `run.sh SUITE redis`, `run.sh SUITE tantalum`
+and `compare.py` on the two result folders.
 
 ## Design
 
@@ -256,6 +285,18 @@ With a password set, every command except `AUTH`, `HELLO` and `QUIT` gets
   9-10% more than Redis and 10-15% more than Valkey one at a time, and 38-40% and
   36-52% more at pipeline 16 (`bench/agent37/results-stops.txt`). A snapshot holds a
   big hash as bytes as above, still version 2, so a build from before big hashes reads it.
+- **Numbered databases cost database 0 next to nothing.** Each database is a store of
+  its own, made when first selected (about 160 KB of empty shards), with its own tables
+  and segments, so a key takes no byte more for being able to be in one. They all use
+  database 0's shard locks: what holds a shard holds that shard of every database, so
+  `EXEC`, scripts, `MOVE` and `SWAPDB` hold just what they did, however the databases are
+  used, and can't deadlock between them. A command on database 0 pays one comparison for
+  its database and one for each lock, about 12 instructions a command, which doesn't show in
+  its cycles or throughput; a key takes the same in any database (60 bytes of RSS with a 32-byte
+  value, either way), and is as fast. They share one memory limit, and eviction takes from
+  any of them, as in Redis. A snapshot marks where each database other than 0 starts,
+  which only then makes it version 6 (one with just database 0 stays readable by older
+  builds), and the append-only log has a `SELECT` wherever the database changes.
 - **Big hashes, sets and sorted sets don't stop to grow** (`src/big.rs`). One buffer and
   one table would have to grow all at once, copying the buffer and reading every field
   again to hash it: 658 ms at 8M fields, under the shard's lock. So the bytes are in
@@ -1179,9 +1220,9 @@ hit rates share the seeding flaw described above.
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client
   memory.
-- **Pub/sub gaps**: no keyspace notifications, `CLIENT LIST` knows only
-  the caller's subscriptions, and the output limit is fixed at Redis'
-  defaults. The registry's
+- **Pub/sub gaps**: no keyspace notifications, `CLIENT LIST` counts only
+  the caller's subscriptions (it knows who is subscribed), and the output
+  limit is fixed at Redis' defaults. The registry's
   own memory (channel names and their subscriber tables) isn't in
   `used_memory`; subscribers' unsent messages are. `PUBSUB CHANNELS` and multiple patterns' messages come in
   an order of Tantalum's own (Redis' depends on its random hash seed).

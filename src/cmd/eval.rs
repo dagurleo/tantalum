@@ -84,7 +84,7 @@ fn run(
     if native
         && ctx
             .scripting
-            .run_native(ctx, now, args, numkeys as usize, out)
+            .run_native(ctx, session.db, now, args, numkeys as usize, out)
     {
         return Reply::Written;
     }
@@ -101,6 +101,8 @@ fn run(
             out,
         )
     });
+    // Its `SELECT`s were its own, as in Redis.
+    crate::aof::select(session.db as usize);
     Reply::Written
 }
 

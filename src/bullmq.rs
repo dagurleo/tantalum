@@ -87,8 +87,10 @@ enum Value {
 struct Failed(Vec<u8>);
 
 impl<'a> Call<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &'a Context,
+        db: u32,
         now: Millis,
         sha: &'a [u8; 40],
         keys: Vec<&'a [u8]>,
@@ -98,7 +100,10 @@ impl<'a> Call<'a> {
     ) -> Self {
         Call {
             ctx,
-            session: Session::for_script(),
+            session: Session {
+                db,
+                ..Session::for_script()
+            },
             now,
             sha,
             keys,
@@ -130,7 +135,7 @@ impl<'a> Call<'a> {
     /// What `INCR key` will make it, as INCR reads it (`None` if INCR will
     /// fail), without the read counting as a lookup.
     fn next_count(&self, key: &[u8]) -> Option<i64> {
-        let store = &self.ctx.store;
+        let store = self.ctx.db(&self.session);
         store.get_key(store.key(key), self.now, |value| match value {
             None => Some(1),
             Some(v) if v.kind() == Kind::String => resp::parse_int(v.as_bytes())?.checked_add(1),

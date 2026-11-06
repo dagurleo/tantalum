@@ -2,15 +2,13 @@
 //! `RANDOMKEY`, `TOUCH` and `OBJECT`.
 
 use super::set::random_below;
-use super::{
-    Args, INVALID_CURSOR, NOT_AN_INTEGER, OOM, Reply, SYNTAX_ERROR, Scan, ScanOptions, parse_cursor,
-};
+use super::{Args, INVALID_CURSOR, OOM, Reply, SYNTAX_ERROR, Scan, ScanOptions, parse_cursor};
 use crate::collection::Collection;
 use crate::context::{Context, Session};
 use crate::glob;
 use crate::resp;
 use crate::store::{
-    EvictionPolicy, Expiry, Kind, Millis, OutOfMemory, Renamed, Update, ValueRef, View,
+    EvictionPolicy, Expiry, Key, Kind, Millis, OutOfMemory, Renamed, Store, Update, ValueRef, View,
 };
 use crate::{list, set, zset};
 
@@ -19,7 +17,7 @@ use crate::{list, set, zset};
 /// that existed throughout exactly once.
 pub(super) fn scan(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -32,12 +30,14 @@ pub(super) fn scan(
         return Reply::Written;
     };
     let (mut keys, mut found) = (Vec::new(), 0);
-    let next = ctx.store.scan(cursor, options.count, now, |key, kind| {
-        if options.has_type(kind) && options.matches(key) {
-            resp::write_bulk(&mut keys, key);
-            found += 1;
-        }
-    });
+    let next = ctx
+        .db(session)
+        .scan(cursor, options.count, now, |key, kind| {
+            if options.has_type(kind) && options.matches(key) {
+                resp::write_bulk(&mut keys, key);
+                found += 1;
+            }
+        });
     out.extend_from_slice(b"*2\r\n");
     resp::write_bulk(out, itoa::Buffer::new().format(next).as_bytes());
     resp::write_array_header(out, found);
@@ -48,12 +48,12 @@ pub(super) fn scan(
 /// `KEYS pattern`: every key matching it at once, one shard at a time.
 pub(super) fn keys(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let pattern = args.get(1);
     let everything = pattern == b"*";
     let (mut keys, mut found) = (Vec::new(), 0);
@@ -73,27 +73,34 @@ pub(super) fn keys(
 /// `RENAME key newkey`
 pub(super) fn rename(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    rename_key(ctx, now, args, out, false)
+    rename_key(ctx, session, now, args, out, false)
 }
 
 /// `RENAMENX key newkey`: 1 if renamed, 0 if `newkey` exists.
 pub(super) fn renamenx(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    rename_key(ctx, now, args, out, true)
+    rename_key(ctx, session, now, args, out, true)
 }
 
-fn rename_key(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, nx: bool) -> Reply {
-    let store = &*ctx.store;
+fn rename_key(
+    ctx: &Context,
+    session: &Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    nx: bool,
+) -> Reply {
+    let store = ctx.db(session);
     match store.rename(args.key(store), args.key_at(store, 2), nx, now) {
         Ok(Renamed::Done) if nx => resp::write_integer(out, 1),
         Ok(Renamed::Done) => out.extend_from_slice(resp::OK),
@@ -107,12 +114,12 @@ fn rename_key(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, nx
 /// `TOUCH key [key ...]`: how many exist, counting as using them.
 pub(super) fn touch(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut found = 0;
     for i in 1..args.len() {
         let exists = store
@@ -136,7 +143,7 @@ pub(super) fn randomkey(
     _: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut key: Option<Vec<u8>> = None;
     let shard = random_below(store.shard_count()) as u64;
     let from = random_below(u32::MAX as usize) as u64;
@@ -168,6 +175,48 @@ enum Copied {
     Object(Box<Collection>),
 }
 
+/// What's at `key`, to copy: its value and expiry.
+fn read_copy(store: &Store, key: Key<'_>, now: Millis) -> Option<(Copied, Expiry)> {
+    store
+        .update_key(key, now, |current| match current {
+            None => (Update::Peek, None),
+            Some(c) => {
+                let value = match c.value.view() {
+                    View::Bytes(bytes) => Copied::Bytes(c.value.kind(), bytes.to_vec()),
+                    View::Object(object) => Copied::Object(Box::new(object.clone())),
+                };
+                (Update::Touch, Some((value, c.expiry)))
+            }
+        })
+        .unwrap_or(None)
+}
+
+/// Whether `key` holds anything.
+fn exists_in(store: &Store, key: Key<'_>, now: Millis) -> bool {
+    store
+        .update_key(key, now, |current| (Update::Peek, current.is_some()))
+        .unwrap_or(false)
+}
+
+/// Writes what [`read_copy`] read at `key`: false if there's no room for it.
+fn write_copy(store: &Store, key: Key<'_>, (value, expiry): (Copied, Expiry), now: Millis) -> bool {
+    let mut value = Some(value);
+    let written = store.update_key(key, now, |_| {
+        let update = match value.take().expect("written once") {
+            Copied::Bytes(kind, bytes) => Update::Replace(kind, bytes),
+            Copied::Object(object) => Update::Object(*object),
+        };
+        (update, ())
+    });
+    if written.is_err() {
+        return false;
+    }
+    if matches!(expiry, Expiry::At(_)) {
+        let _ = store.update_key(key, now, |_| (Update::Expire(expiry), ()));
+    }
+    true
+}
+
 /// `COPY source destination [DB destination-db] [REPLACE]`: 1 if copied, or 0
 /// if there's no source or (without `REPLACE`) the destination exists. Value
 /// and TTL go together, and nothing else runs meanwhile.
@@ -179,6 +228,7 @@ pub(super) fn copy(
     out: &mut Vec<u8>,
 ) -> Reply {
     let mut replace = false;
+    let mut db = session.db;
     let mut i = 3;
     while i < args.len() {
         let option = args.get(i);
@@ -186,17 +236,9 @@ pub(super) fn copy(
             replace = true;
         } else if option.eq_ignore_ascii_case(b"DB") && i + 1 < args.len() {
             i += 1;
-            match resp::parse_int(args.get(i)) {
-                None => {
-                    resp::write_error(out, NOT_AN_INTEGER);
-                    return Reply::Written;
-                }
-                Some(0) => {}
-                // There is one database, as for `SELECT`.
-                Some(_) => {
-                    resp::write_error(out, b"ERR DB index is out of range");
-                    return Reply::Written;
-                }
+            match super::db_index(ctx, args.get(i), out) {
+                Some(index) => db = index,
+                None => return Reply::Written,
             }
         } else {
             resp::write_error(out, SYNTAX_ERROR);
@@ -204,59 +246,99 @@ pub(super) fn copy(
         }
         i += 1;
     }
-    if args.get(1) == args.get(2) {
+    if db == session.db && args.get(1) == args.get(2) {
         resp::write_error(out, b"ERR source and destination objects are the same");
         return Reply::Written;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
+    let target: &Store = ctx.store.db(db as usize);
     let (from, to) = (args.key(store), args.key_at(store, 2));
     let found = store.exclusive(|| {
-        let source = store
-            .update_key(from, now, |current| match current {
-                None => (Update::Peek, None),
-                Some(c) => {
-                    let value = match c.value.view() {
-                        View::Bytes(bytes) => Copied::Bytes(c.value.kind(), bytes.to_vec()),
-                        View::Object(object) => Copied::Object(Box::new(object.clone())),
-                    };
-                    (Update::Touch, Some((value, c.expiry)))
-                }
-            })
-            .unwrap_or(None);
-        let Some((value, expiry)) = source else {
+        let Some(source) = read_copy(store, from, now) else {
             resp::write_integer(out, 0);
             return false;
         };
-        let exists = store
-            .update_key(to, now, |current| (Update::Peek, current.is_some()))
-            .unwrap_or(false);
-        if exists {
+        if exists_in(target, to, now) {
             if !replace {
                 resp::write_integer(out, 0);
                 return true;
             }
             // So its TTL goes too.
-            let _ = store.update_key(to, now, |_| (Update::Delete, ()));
+            let _ = target.update_key(to, now, |_| (Update::Delete, ()));
         }
-        let mut value = Some(value);
-        let written = store.update_key(to, now, |_| {
-            let update = match value.take().expect("written once") {
-                Copied::Bytes(kind, bytes) => Update::Replace(kind, bytes),
-                Copied::Object(object) => Update::Object(*object),
-            };
-            (update, ())
-        });
-        if written.is_err() {
+        if write_copy(target, to, source, now) {
+            resp::write_integer(out, 1);
+        } else {
             resp::write_error(out, OOM);
-            return true;
         }
-        if matches!(expiry, Expiry::At(_)) {
-            let _ = store.update_key(to, now, |_| (Update::Expire(expiry), ()));
-        }
-        resp::write_integer(out, 1);
         true
     });
     session.count_lookup(found);
+    Reply::Written
+}
+
+/// `MOVE key db`: 1 if it moved there with its TTL, or 0 if there's no such key
+/// here or there is one there. Nothing else runs meanwhile.
+pub(super) fn move_key(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let Some(db) = super::db_index(ctx, args.get(2), out) else {
+        return Reply::Written;
+    };
+    if db == session.db {
+        resp::write_error(out, b"ERR source and destination objects are the same");
+        return Reply::Written;
+    }
+    let store = ctx.db(session);
+    let target: &Store = ctx.store.db(db as usize);
+    let key = args.key(store);
+    store.exclusive(|| {
+        let source = read_copy(store, key, now);
+        match source {
+            Some(source) if !exists_in(target, key, now) => {
+                if write_copy(target, key, source, now) {
+                    let _ = store.update_key(key, now, |_| (Update::Delete, ()));
+                    resp::write_integer(out, 1);
+                } else {
+                    resp::write_error(out, OOM);
+                }
+            }
+            _ => resp::write_integer(out, 0),
+        }
+    });
+    Reply::Written
+}
+
+/// `SWAPDB index1 index2`: each database now holds what the other did.
+pub(super) fn swapdb(
+    ctx: &Context,
+    _: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let index = |arg: &[u8]| resp::parse_int(arg).filter(|&n| i32::try_from(n).is_ok());
+    let Some(a) = index(args.get(1)) else {
+        resp::write_error(out, b"ERR invalid first DB index");
+        return Reply::Written;
+    };
+    let Some(b) = index(args.get(2)) else {
+        resp::write_error(out, b"ERR invalid second DB index");
+        return Reply::Written;
+    };
+    let databases = 0..ctx.store.databases() as i64;
+    if !databases.contains(&a) || !databases.contains(&b) {
+        resp::write_error(out, b"ERR DB index is out of range");
+        return Reply::Written;
+    }
+    if a != b {
+        ctx.store.db(a as usize).swap_with(ctx.store.db(b as usize));
+    }
+    out.extend_from_slice(resp::OK);
     Reply::Written
 }
 
@@ -421,7 +503,7 @@ pub(super) fn object(
         super::wrong_arity(out, &format!("object|{name}"));
         return Reply::Written;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let null = session.null();
     let found = store
         .update_key(args.key_at(store, 2), now, |current| match current {

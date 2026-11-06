@@ -58,10 +58,14 @@ pub(crate) struct ShardLock<T> {
     owner: AtomicUsize,
 }
 
-pub(crate) enum ShardGuard<'a, T> {
-    Locked(MutexGuard<'a, T>),
-    /// Taken again by the thread holding it for a transaction.
-    Held(&'a mut T),
+/// A shard locked: its data, and the lock to release when this drops (none if
+/// this thread holds it for a transaction). Two pointers, so that it comes back
+/// in registers, with nothing to decide to reach the data: most commands take
+/// two of these.
+pub(crate) struct ShardGuard<'a, T> {
+    data: &'a mut T,
+    #[allow(dead_code)]
+    lock: Option<MutexGuard<'a, T>>,
 }
 
 impl<T> ShardLock<T> {
@@ -72,20 +76,23 @@ impl<T> ShardLock<T> {
         }
     }
 
-    pub(crate) fn lock(&self) -> ShardGuard<'_, T> {
-        if EXCLUSIVE.load(Relaxed) != 0 {
-            if self.owner.load(Relaxed) == this_thread() {
-                // SAFETY: this thread holds the mutex (see `hold_all` and
-                // `Partial`, whose guards are never dereferenced) and uses
-                // the data only through guards like this one, one at a time
-                // per shard (no store code locks a shard it already holds).
-                return ShardGuard::Held(unsafe { &mut *self.mutex.data_ptr() });
-            }
-            if holding_some() {
-                unplanned();
-            }
+    /// Its data, for a guard that releases `lock`, if any.
+    #[inline]
+    fn guard<'a>(&'a self, lock: Option<MutexGuard<'a, T>>) -> ShardGuard<'a, T> {
+        ShardGuard {
+            // SAFETY: the caller holds what guards the data: this lock, or the
+            // one standing for it (`lock_for`). It's only reached through guards
+            // like this one, one at a time per shard (no store code locks a
+            // shard it already holds, and `hold_all`'s and `Partial`'s guards
+            // are never dereferenced).
+            data: unsafe { &mut *self.mutex.data_ptr() },
+            lock,
         }
-        ShardGuard::Locked(self.mutex.lock())
+    }
+
+    #[inline]
+    pub(crate) fn lock(&self) -> ShardGuard<'_, T> {
+        self.lock_for(self)
     }
 
     /// Whether this thread holds it for a transaction (see [`hold_all`]).
@@ -93,37 +100,63 @@ impl<T> ShardLock<T> {
         EXCLUSIVE.load(Relaxed) != 0 && self.owner.load(Relaxed) == this_thread()
     }
 
+    #[inline]
     pub(crate) fn try_lock(&self) -> Option<ShardGuard<'_, T>> {
-        self.mutex.try_lock().map(ShardGuard::Locked)
+        self.try_lock_for(self)
     }
 
     /// [`try_lock`](Self::try_lock), or this thread's own if it holds it.
     pub(crate) fn try_lock_here(&self) -> Option<ShardGuard<'_, T>> {
-        if self.held_here() {
-            // SAFETY: as in `lock`.
-            return Some(ShardGuard::Held(unsafe { &mut *self.mutex.data_ptr() }));
+        self.try_lock_here_for(self)
+    }
+
+    /// [`lock`](Self::lock), for the data of `data`, whose own lock nothing
+    /// takes: this lock stands for it, so that what holds this holds that
+    /// too (a numbered database's shard, under database 0's: see `Store`).
+    #[inline]
+    pub(crate) fn lock_for<'a>(&'a self, data: &'a ShardLock<T>) -> ShardGuard<'a, T> {
+        if EXCLUSIVE.load(Relaxed) != 0 {
+            if self.owner.load(Relaxed) == this_thread() {
+                return data.guard(None);
+            }
+            if holding_some() {
+                unplanned();
+            }
         }
-        self.try_lock()
+        data.guard(Some(self.mutex.lock()))
+    }
+
+    /// [`try_lock`](Self::try_lock), as [`lock_for`](Self::lock_for) does.
+    #[inline]
+    pub(crate) fn try_lock_for<'a>(&'a self, data: &'a ShardLock<T>) -> Option<ShardGuard<'a, T>> {
+        Some(data.guard(Some(self.mutex.try_lock()?)))
+    }
+
+    /// [`try_lock_here`](Self::try_lock_here), as [`lock_for`](Self::lock_for) does.
+    pub(crate) fn try_lock_here_for<'a>(
+        &'a self,
+        data: &'a ShardLock<T>,
+    ) -> Option<ShardGuard<'a, T>> {
+        if self.held_here() {
+            return Some(data.guard(None));
+        }
+        self.try_lock_for(data)
     }
 }
 
 impl<T> Deref for ShardGuard<'_, T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &T {
-        match self {
-            ShardGuard::Locked(guard) => guard,
-            ShardGuard::Held(data) => data,
-        }
+        self.data
     }
 }
 
 impl<T> DerefMut for ShardGuard<'_, T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut T {
-        match self {
-            ShardGuard::Locked(guard) => guard,
-            ShardGuard::Held(data) => data,
-        }
+        self.data
     }
 }
 

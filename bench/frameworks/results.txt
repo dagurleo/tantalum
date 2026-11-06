@@ -1,0 +1,258 @@
+Tantalum 0.23.0 and the frameworks' own test suites, 2026-11-06.
+
+Agent37 VMs, 4 vCPU Xeon E-2388G, Linux 7.0. Each suite in a container with a fresh server on
+localhost:6379: Tantalum with no options (4 threads, io_uring), Redis 7.2.4 as the control,
+side by side, compared test by test by compare.py. Sidekiq 8.1.7, Rails 8.1.4.1, Laravel 13.40.0,
+Celery and Kombu 5.7.0, BullMQ 6.5.4.
+
+== Before: 0.22.4, which had one database
+
+Sidekiq: 5 lost (4 sharding tests on database 6; the dashboard's stats wanted uptime_in_days).
+Rails: Action Cable 11 errors (10 on database 12, 1 CLIENT KILL), Resque refused to run (database 12).
+Laravel: 247 lost, all SELECT 5 or 6. With its tests moved to database 0: the same as Redis.
+Kombu: 1 lost (CLIENT KILL ID). Celery and BullMQ: none.
+
+== After, on the final build
+
+Each suite's totals by test name (a test run under one name several times counts once):
+
+=== kombu
+control: 123 passed, 0 failed, 0 skipped
+run:     123 passed, 0 failed, 0 skipped
+pass on control, fail on run: 0
+fail on control, pass on run: 0
+fail on both: 0
+pass on control, never ran on run: 0
+pass on control, skipped on run: 0
+=== celery
+control: 394 passed, 5 failed, 10 skipped
+run:     394 passed, 5 failed, 10 skipped
+pass on control, fail on run: 0
+fail on control, pass on run: 0
+fail on both: 5
+pass on control, never ran on run: 0
+pass on control, skipped on run: 0
+both: t.integration.test_redis_backend::test_pubsub_reentrant_cancel_from_finalizer
+both: t.integration.test_redis_backend::test_pubsub_subscribe_churn_while_draining
+both: t.integration.test_tasks.test_trace_log_arguments::test_task_failed
+both: t.integration.test_tasks.test_trace_log_arguments::test_task_success
+both: t.integration.test_worker::test_pidbox_reset_after_repeated_control_errors
+=== differential
+by hand: 209 commands, 0 differences
+seed 1: 5178 commands so far, 0 differences
+seed 2: 10092 commands so far, 0 differences
+seed 3: 15053 commands so far, 0 differences
+seed 7: 19995 commands so far, 0 differences
+=== laravelcontrol: 1363 passed, 0 failed, 19 skipped
+run:     1363 passed, 0 failed, 19 skipped
+pass on control, fail on run: 0
+fail on control, pass on run: 0
+fail on both: 0
+pass on control, never ran on run: 0
+pass on control, skipped on run: 0
+=== bullmq
+control: 1101 passed, 0 failed, 3 skipped
+run:     1101 passed, 0 failed, 3 skipped
+pass on control, fail on run: 0
+fail on control, pass on run: 0
+fail on both: 0
+pass on control, never ran on run: 0
+pass on control, skipped on run: 0
+=== sidekiq
+control: 743 passed, 0 failed, 0 skipped
+run:     743 passed, 0 failed, 0 skipped
+pass on control, fail on run: 0
+fail on control, pass on run: 0
+fail on both: 0
+pass on control, never ran on run: 2
+pass on control, skipped on run: 0
+=== rails
+control: 725 passed, 0 failed, 0 skipped
+run:     725 passed, 0 failed, 0 skipped
+pass on control, fail on run: 0
+fail on control, pass on run: 0
+fail on both: 0
+pass on control, never ran on run: 1
+pass on control, skipped on run: 0
+
+The runners' own totals on both servers: Sidekiq 749 runs, 0 failures; Rails 681 + 25 + 12 + 8 = 726
+runs, 0 failures; BullMQ 1,114 tests, 0 failures, 3 of them skipped. The tests shown as never run in
+Sidekiq's and Rails' comparisons (not above) did run: a worker's output landed in the middle of
+their lines. Celery's 5 fail on Redis too.
+
+Rails: the `json` gem pinned below 3, or Resque's workers can't read their jobs on either server.
+
+== tools/db-diff.py against Redis 7.2.4
+
+by hand: 209 commands, 0 differences
+seed 1: 5178 commands so far, 0 differences
+seed 2: 10092 commands so far, 0 differences
+seed 3: 15053 commands so far, 0 differences
+seed 7: 19995 commands so far, 0 differences
+
+== Speed guard, 12 rounds (best rounds: other VMs were busy, so medians were noisy)
+
+  memory per key     base   55.362 B   curr   55.362 B    +0.00%
+  hash memory/field  base   27.526 B   curr   27.526 B    +0.00%
+  no pipelining      median  323.1 ->  314.1 ns ( -2.8%)   best  287.2 ->  285.5 ns ( -0.6%)
+  pipeline 16        median  222.4 ->  186.0 ns (-16.4%)   best  171.9 ->  166.9 ns ( -2.9%)
+  scan, per key      median   73.7 ->   67.0 ns ( -9.0%)   best   63.8 ->   64.0 ns ( +0.3%)
+  hashes, pipe 16    median  257.1 ->  235.0 ns ( -8.6%)   best  208.1 ->  204.4 ns ( -1.8%)
+  groups, pipe 16    median  644.7 ->  696.6 ns ( +8.1%)   best  560.9 ->  563.2 ns ( +0.4%)
+  big hash, pipe 16  median  459.4 ->  542.5 ns (+18.1%)   best  399.3 ->  398.4 ns ( -0.2%)
+ok: no slowdown, no memory growth
+
+== End to end, one server thread on CPU 0, memtier 3 x 80 on 1-3, 1M keys, 32 bytes, ops/s
+
+Medians of 4 rounds, epoll, then io_uring, then the new build on database 1, and Redis on 0 and 1.
+
+health, Redis SET P1: ['291873.51']
+SET P1   epoll    333,348 ->    332,157  -0.4%   uring    363,306 ->    361,601  -0.5%   db1    330,798 (-0.4% of db0)   redis db0    288,806 db1    287,198   new vs redis: db0 +15.0% db1 +15.2%
+      rounds epoll old [332823, 334186, 333874, 332223] new [332310, 332004, 329245, 332748]
+GET P1   epoll    340,106 ->    338,706  -0.4%   uring    376,262 ->    368,686  -2.0%   db1    339,648 (+0.3% of db0)   redis db0    307,238 db1    299,659   new vs redis: db0 +10.2% db1 +13.3%
+      rounds epoll old [339450, 335811, 342299, 340762] new [340908, 327373, 341121, 336504]
+SET P16  epoll  2,673,286 ->  2,646,870  -1.0%   uring  3,009,054 ->  2,866,718  -4.7%   db1  2,651,038 (+0.2% of db0)   redis db0  1,603,622 db1  1,593,736   new vs redis: db0 +65.1% db1 +66.3%
+      rounds epoll old [2660333, 2686239, 2660235, 2695131] new [2619554, 2642821, 2650920, 2676590]
+GET P16  epoll  3,051,223 ->  3,074,013  +0.7%   uring  3,534,392 ->  3,520,289  -0.4%   db1  3,026,667 (-1.5% of db0)   redis db0  2,046,120 db1  2,050,220   new vs redis: db0 +50.2% db1 +47.6%
+      rounds epoll old [3043860, 3058203, 3044243, 3088208] new [3071900, 3107032, 3076126, 3048416]
+
+
+io_uring's SET P16 was looked at again: 8 pairs at the same 240 connections, with the server's own
+counters: 2,776,810 -> 2,799,369 ops/s (+0.8%), user instructions +0.45%, user cycles +0.16%, kernel
+cycles -0.31%. So that row's -4.7% was the run's, not the build's.
+
+== The server's own instructions and cycles per command (perf stat), old -> new, 2 pairs
+
+  GET P1, epoll     user instr 3753.1 -> 3770.0 (+0.45%)  user cycles 2953.8 -> 2945.1 (-0.29%)
+  GET P16, epoll    user instr 1518.2 -> 1529.8 (+0.76%)  user cycles  768.0 ->  752.2 (-2.06%)
+  SET P16, epoll    user instr 2336.9 -> 2348.7 (+0.50%)  user cycles  974.6 ->  977.8 (+0.33%)
+  GET P16, uring    user instr 1484.3 -> 1496.1 (+0.79%)  user cycles  594.4 ->  585.8 (-1.45%)
+
+Kernel instructions unchanged. About 12 instructions a command: a comparison for its database, and one
+for each shard lock it takes. An earlier build took 30, as its lock guard had grown to three words and
+no longer came back in registers.
+
+== Raw rounds
+
+== health
+SET P1 291873.51
+== round 1
+old-epoll db0 P1 1:0 332823
+old-uring db0 P1 1:0 370931
+new-epoll db0 P1 1:0 332310
+new-uring db0 P1 1:0 358011
+new-epoll db1 P1 1:0 327907
+redis db0 P1 1:0 291294
+redis db1 P1 1:0 291502
+old-epoll db0 P1 0:1 339450
+old-uring db0 P1 0:1 372400
+new-epoll db0 P1 0:1 340908
+new-uring db0 P1 0:1 367752
+new-epoll db1 P1 0:1 328438
+redis db0 P1 0:1 304054
+redis db1 P1 0:1 298392
+old-epoll db0 P16 1:0 2660333
+old-uring db0 P16 1:0 3042264
+new-epoll db0 P16 1:0 2619554
+new-uring db0 P16 1:0 2815322
+new-epoll db1 P16 1:0 2648455
+redis db0 P16 1:0 1605738
+redis db1 P16 1:0 1610169
+old-epoll db0 P16 0:1 3043860
+old-uring db0 P16 0:1 3467417
+new-epoll db0 P16 0:1 3071900
+new-uring db0 P16 0:1 3541980
+new-epoll db1 P16 0:1 3021787
+redis db0 P16 0:1 2063751
+redis db1 P16 0:1 2018263
+== round 2
+new-epoll db0 P1 1:0 332004
+new-uring db0 P1 1:0 365783
+old-epoll db0 P1 1:0 334186
+old-uring db0 P1 1:0 363999
+new-epoll db1 P1 1:0 334435
+redis db0 P1 1:0 292478
+redis db1 P1 1:0 282332
+new-epoll db0 P1 0:1 327373
+new-uring db0 P1 0:1 359864
+old-epoll db0 P1 0:1 335811
+old-uring db0 P1 0:1 381004
+new-epoll db1 P1 0:1 345161
+redis db0 P1 0:1 309960
+redis db1 P1 0:1 308068
+new-epoll db0 P16 1:0 2642821
+new-uring db0 P16 1:0 2800473
+old-epoll db0 P16 1:0 2686239
+old-uring db0 P16 1:0 2975844
+new-epoll db1 P16 1:0 2672926
+redis db0 P16 1:0 1606074
+redis db1 P16 1:0 1544883
+new-epoll db0 P16 0:1 3107032
+new-uring db0 P16 0:1 3509368
+old-epoll db0 P16 0:1 3058203
+old-uring db0 P16 0:1 3540815
+new-epoll db1 P16 0:1 3054273
+redis db0 P16 0:1 2001579
+redis db1 P16 0:1 2058518
+== round 3
+old-epoll db0 P1 1:0 333874
+old-uring db0 P1 1:0 360941
+new-epoll db0 P1 1:0 329245
+new-uring db0 P1 1:0 353396
+new-epoll db1 P1 1:0 322738
+redis db0 P1 1:0 286067
+redis db1 P1 1:0 296338
+old-epoll db0 P1 0:1 342299
+old-uring db0 P1 0:1 380125
+new-epoll db0 P1 0:1 341121
+new-uring db0 P1 0:1 369621
+new-epoll db1 P1 0:1 337544
+redis db0 P1 0:1 304517
+redis db1 P1 0:1 299385
+old-epoll db0 P16 1:0 2660235
+old-uring db0 P16 1:0 3056853
+new-epoll db0 P16 1:0 2650920
+new-uring db0 P16 1:0 2918114
+new-epoll db1 P16 1:0 2596065
+redis db0 P16 1:0 1583644
+redis db1 P16 1:0 1586963
+old-epoll db0 P16 0:1 3044243
+old-uring db0 P16 0:1 3527970
+new-epoll db0 P16 0:1 3076126
+new-uring db0 P16 0:1 3531210
+new-epoll db1 P16 0:1 2958302
+redis db0 P16 0:1 2043448
+redis db1 P16 0:1 2041923
+== round 4
+new-epoll db0 P1 1:0 332748
+new-uring db0 P1 1:0 365191
+old-epoll db0 P1 1:0 332223
+old-uring db0 P1 1:0 362612
+new-epoll db1 P1 1:0 333688
+redis db0 P1 1:0 286319
+redis db1 P1 1:0 282893
+new-epoll db0 P1 0:1 336504
+new-uring db0 P1 0:1 372510
+old-epoll db0 P1 0:1 340762
+old-uring db0 P1 0:1 369476
+new-epoll db1 P1 0:1 341752
+redis db0 P1 0:1 311233
+redis db1 P1 0:1 299933
+new-epoll db0 P16 1:0 2676590
+new-uring db0 P16 1:0 2964110
+old-epoll db0 P16 1:0 2695131
+old-uring db0 P16 1:0 2954343
+new-epoll db1 P16 1:0 2653622
+redis db0 P16 1:0 1601505
+redis db1 P16 1:0 1600508
+new-epoll db0 P16 0:1 3048416
+new-uring db0 P16 0:1 3438909
+old-epoll db0 P16 0:1 3088208
+old-uring db0 P16 0:1 3566796
+new-epoll db1 P16 0:1 3031547
+redis db0 P16 0:1 2048793
+redis db1 P16 0:1 2060557
+== memory
+RSS KB: at start 8616, with 15 more databases made 11016, each 160
+1M keys of 32 bytes in database 0: 60 B of RSS a key
+1M keys of 32 bytes in database 1: 60 B of RSS a key
