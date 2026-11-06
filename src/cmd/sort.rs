@@ -188,7 +188,7 @@ fn run(
     let Some(mut options) = Options::parse(args, read_only, out) else {
         return Reply::Written;
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let in_script = session.in_script;
     let null = session.null();
     store.exclusive(|| {

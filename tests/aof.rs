@@ -1024,3 +1024,181 @@ fn float_increments_are_logged_as_what_they_set() {
     assert!(!text.contains("INCRBYFLOAT"), "{text}");
     assert!(!text.contains("SORT"), "{text}");
 }
+
+/// What's at `key` in database `db`.
+fn get_in(ctx: &Context, db: &[u8], key: &[u8]) -> Vec<u8> {
+    let mut session = ctx.connect(-1).unwrap().session();
+    run(ctx, &mut session, &[b"SELECT", db]);
+    run(ctx, &mut session, &[b"GET", key])
+}
+
+#[test]
+fn numbered_databases_come_back_from_the_log() {
+    let dir = temp_dir("databases");
+    let (ctx, log, _) = open(&dir.0, Config::default());
+    let mut s = ctx.connect(-1).unwrap().session();
+    run(ctx, &mut s, &[b"SET", b"k", b"zero"]);
+    run(ctx, &mut s, &[b"SELECT", b"2"]);
+    run(ctx, &mut s, &[b"SET", b"k", b"two"]);
+    // A transaction that goes elsewhere, and a script.
+    run(ctx, &mut s, &[b"MULTI"]);
+    run(ctx, &mut s, &[b"SET", b"a", b"still two"]);
+    run(ctx, &mut s, &[b"SELECT", b"3"]);
+    run(ctx, &mut s, &[b"SET", b"k", b"three"]);
+    run(ctx, &mut s, &[b"EXEC"]);
+    run(
+        ctx,
+        &mut s,
+        &[
+            b"EVAL",
+            b"redis.call('SELECT', 4) return redis.call('SET', KEYS[1], 'four')",
+            b"1",
+            b"k",
+        ],
+    );
+    // Still 3, here and in the log.
+    run(ctx, &mut s, &[b"SET", b"b", b"three"]);
+    run(ctx, &mut s, &[b"MOVE", b"b", b"5"]);
+    run(ctx, &mut s, &[b"COPY", b"k", b"c", b"DB", b"6"]);
+    run(ctx, &mut s, &[b"SELECT", b"7"]);
+    run(ctx, &mut s, &[b"SET", b"k", b"seven"]);
+    run(ctx, &mut s, &[b"SELECT", b"8"]);
+    run(ctx, &mut s, &[b"SET", b"k", b"eight"]);
+    run(ctx, &mut s, &[b"SWAPDB", b"7", b"8"]);
+    run(ctx, &mut s, &[b"SELECT", b"9"]);
+    run(ctx, &mut s, &[b"SET", b"gone", b"1"]);
+    run(ctx, &mut s, &[b"FLUSHDB"]);
+    close(&log);
+
+    let check = |ctx: &Context| {
+        assert_eq!(get_in(ctx, b"0", b"k"), b"$4\r\nzero\r\n");
+        assert_eq!(get_in(ctx, b"2", b"k"), b"$3\r\ntwo\r\n");
+        assert_eq!(get_in(ctx, b"2", b"a"), b"$9\r\nstill two\r\n");
+        assert_eq!(get_in(ctx, b"3", b"k"), b"$5\r\nthree\r\n");
+        assert_eq!(get_in(ctx, b"4", b"k"), b"$4\r\nfour\r\n");
+        assert_eq!(get_in(ctx, b"3", b"b"), b"$-1\r\n");
+        assert_eq!(get_in(ctx, b"5", b"b"), b"$5\r\nthree\r\n");
+        assert_eq!(get_in(ctx, b"6", b"c"), b"$5\r\nthree\r\n");
+        assert_eq!(get_in(ctx, b"7", b"k"), b"$5\r\neight\r\n");
+        assert_eq!(get_in(ctx, b"8", b"k"), b"$5\r\nseven\r\n");
+        assert_eq!(get_in(ctx, b"9", b"gone"), b"$-1\r\n");
+    };
+    let (ctx, log, started) = open(&dir.0, Config::default());
+    assert_eq!(started.failed, 0);
+    check(ctx);
+
+    // The log left off in database 9: writes go on where they belong.
+    let mut s = ctx.connect(-1).unwrap().session();
+    run(ctx, &mut s, &[b"SET", b"after", b"zero"]);
+    close(&log);
+    let (ctx, log, started) = open(&dir.0, Config::default());
+    assert_eq!(started.failed, 0);
+    check(ctx);
+    assert_eq!(get_in(ctx, b"0", b"after"), b"$4\r\nzero\r\n");
+    assert_eq!(get_in(ctx, b"9", b"after"), b"$-1\r\n");
+
+    // Through a rewrite, starting a new log in another database.
+    let mut s = ctx.connect(-1).unwrap().session();
+    run(ctx, &mut s, &[b"SELECT", b"10"]);
+    run(ctx, &mut s, &[b"SET", b"before", b"ten"]);
+    assert!(log.rewrite());
+    run(ctx, &mut s, &[b"SET", b"since", b"ten"]);
+    run(ctx, &mut s, &[b"SELECT", b"0"]);
+    run(ctx, &mut s, &[b"SET", b"since", b"zero"]);
+    close(&log);
+    let (ctx, log, started) = open(&dir.0, Config::default());
+    assert_eq!(started.failed, 0);
+    check(ctx);
+    assert_eq!(get_in(ctx, b"10", b"before"), b"$3\r\nten\r\n");
+    assert_eq!(get_in(ctx, b"10", b"since"), b"$3\r\nten\r\n");
+    assert_eq!(get_in(ctx, b"0", b"since"), b"$4\r\nzero\r\n");
+    log.stop();
+}
+
+#[test]
+fn using_only_database_0_logs_no_select() {
+    let dir = temp_dir("database-0");
+    let (ctx, log, _) = open(&dir.0, Config::default());
+    let mut s = ctx.connect(-1).unwrap().session();
+    run(ctx, &mut s, &[b"SELECT", b"0"]);
+    run(ctx, &mut s, &[b"SET", b"k", b"zero"]);
+    close(&log);
+    for entry in std::fs::read_dir(&dir.0).unwrap() {
+        let data = std::fs::read(entry.unwrap().path()).unwrap();
+        assert!(
+            !data.windows(6).any(|w| w == b"SELECT"),
+            "a SELECT in the log"
+        );
+    }
+}
+
+#[test]
+fn a_blocked_client_is_logged_in_its_database() {
+    let dir = temp_dir("database-blocked");
+    let (ctx, log, _) = open(&dir.0, Config::default());
+    let mut s = ctx.connect(-1).unwrap().session();
+    run(ctx, &mut s, &[b"SELECT", b"2"]);
+    run(ctx, &mut s, &[b"RPUSH", b"l", b"a", b"b"]);
+    // BLPOP that finds data, in database 2, after one in database 0.
+    run(ctx, &mut s, &[b"BLPOP", b"l", b"0"]);
+    run(ctx, &mut s, &[b"SELECT", b"0"]);
+    run(ctx, &mut s, &[b"RPUSH", b"l", b"z"]);
+    close(&log);
+    let (ctx, log, started) = open(&dir.0, Config::default());
+    assert_eq!(started.failed, 0);
+    let mut s = ctx.connect(-1).unwrap().session();
+    assert_eq!(
+        run(ctx, &mut s, &[b"LRANGE", b"l", b"0", b"-1"]),
+        b"*1\r\n$1\r\nz\r\n"
+    );
+    run(ctx, &mut s, &[b"SELECT", b"2"]);
+    assert_eq!(
+        run(ctx, &mut s, &[b"LRANGE", b"l", b"0", b"-1"]),
+        b"*1\r\n$1\r\nb\r\n"
+    );
+    log.stop();
+}
+
+#[test]
+fn evictions_are_logged_in_their_databases() {
+    let dir = temp_dir("database-evictions");
+    let config = Config {
+        maxmemory: 400 << 10,
+        policy: EvictionPolicy::AllKeysLru,
+        ..Config::default()
+    };
+    let (ctx, log, _) = open(&dir, config.clone());
+    let mut session = ctx.connect(-1).unwrap().session();
+    let value = vec![b'v'; 1000];
+    // Filling one database evicts from the others too.
+    for db in [b"0", b"1", b"2"] {
+        run(ctx, &mut session, &[b"SELECT", db]);
+        for i in 0..600 {
+            run(
+                ctx,
+                &mut session,
+                &[b"SET", format!("k{i}").as_bytes(), &value],
+            );
+        }
+    }
+    let keys = |ctx: &Context| -> Vec<Vec<Vec<u8>>> {
+        let mut session = ctx.connect(-1).unwrap().session();
+        [b"0", b"1", b"2"]
+            .iter()
+            .map(|db| {
+                run(ctx, &mut session, &[b"SELECT", &db[..]]);
+                let mut keys = common::parse(&run(ctx, &mut session, &[b"KEYS", b"*"])).bulks();
+                keys.sort();
+                keys
+            })
+            .collect()
+    };
+    let before = keys(ctx);
+    let info = String::from_utf8(run(ctx, &mut session, &[b"INFO"])).unwrap();
+    assert!(!info.contains("evicted_keys:0\r"), "it evicted");
+    close(&log);
+    let (again, log2, started) = open(&dir, config);
+    assert_eq!(started.failed, 0);
+    assert_eq!(before, keys(again));
+    close(&log2);
+}

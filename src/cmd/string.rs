@@ -89,7 +89,7 @@ pub(super) fn strlen(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (len, hit) = store.get_key(args.key(store), now, |value| match value {
         None => (Some(0), false),
         Some(v) if v.kind() != Kind::String => (None, true),
@@ -106,12 +106,12 @@ pub(super) fn strlen(
 /// `APPEND key value`: the new length.
 pub(super) fn append(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let value = args.get(2);
     let edited = store.edit_string(
         args.key(store),
@@ -184,7 +184,7 @@ pub(super) fn getrange(
         let part = range(start, end, value.len()).map_or(&[][..], |range| &value[range]);
         resp::write_bulk(out, part);
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (big, hit) = store.get_key(args.key(store), now, |value| match value {
         None => {
             write(&[], out);
@@ -210,7 +210,7 @@ pub(super) fn getrange(
 /// `SETRANGE key offset value`: the new length.
 pub(super) fn setrange(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -223,7 +223,7 @@ pub(super) fn setrange(
         resp::write_error(out, b"ERR offset is out of range");
         return Reply::Written;
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let value = args.get(3);
     let too_long = offset
         .checked_add(value.len())
@@ -279,7 +279,7 @@ pub(super) fn getset(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let result = store.set_key(
         args.key(store),
         args.get(2),
@@ -313,12 +313,12 @@ pub(super) fn getset(
 /// propagates it, so a restart elsewhere can't round it differently.
 pub(super) fn incrbyfloat(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let incr = args.get(2);
     let result = store.update_key(args.key(store), now, |current| {
         let old = match &current {
@@ -351,7 +351,7 @@ pub(super) fn incrbyfloat(
 /// pair by pair, as `MSET` is.
 pub(super) fn msetnx(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -360,7 +360,7 @@ pub(super) fn msetnx(
         super::wrong_arity(out, "msetnx");
         return Reply::Written;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let keys: Vec<Key<'_>> = (1..args.len())
         .step_by(2)
         .map(|i| args.key_at(store, i))
@@ -413,7 +413,7 @@ pub(super) fn lcs(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (Ok(a), Ok(b)) = (
         lcs_string(store, args.key(store), now),
         lcs_string(store, args.key_at(store, 2), now),

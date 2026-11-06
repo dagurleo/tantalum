@@ -127,12 +127,12 @@ fn done<R>(out: &mut Vec<u8>, result: Result<Result<R, &'static [u8]>, OutOfMemo
 /// `SADD key member [member ...]`: how many are new.
 pub(super) fn sadd(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let added = change(store, args.key(store), now, true, args, |set, args| {
         let set = set.get_or_insert_with(|| SetMut::new(args.get(2), args.len() - 2));
         set.reserve(args.len() - 2);
@@ -147,12 +147,12 @@ pub(super) fn sadd(
 /// `SREM key member [member ...]`: how many it removed.
 pub(super) fn srem(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let removed = change(store, args.key(store), now, false, args, |set, args| {
         set.as_mut().map_or(0, |set| {
             (2..args.len()).filter(|&i| set.remove(args.get(i))).count()
@@ -174,7 +174,7 @@ fn reading(
     out: &mut Vec<u8>,
     f: impl FnOnce(Option<SetView<'_>>, &mut Vec<u8>),
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut reply = Vec::new();
     match read(store, args.key(store), now, session, |set| {
         f(set, &mut reply)
@@ -335,7 +335,7 @@ pub(super) fn spop(
         resp::write_error(out, SYNTAX_ERROR);
         return Reply::Written;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let count = match args.len() {
         2 => None,
         _ => match resp::parse_int(args.get(2)) {
@@ -385,12 +385,12 @@ pub(super) fn spop(
 /// `SMOVE source destination member`, atomically.
 pub(super) fn smove(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (from, to, member) = (args.key(store), args.key_at(store, 2), args.get(3));
     let same = args.get(1) == args.get(2);
     let moved = store.update_pair(from, to, now, false, |pair| {
@@ -537,7 +537,7 @@ fn algebra(
     out: &mut Vec<u8>,
     op: Op,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let Ok(sets) = read_all(store, now, session, args, 1..args.len()) else {
         resp::write_error(out, WRONGTYPE);
         return Reply::Written;
@@ -561,7 +561,7 @@ fn algebra_store(
     out: &mut Vec<u8>,
     op: Op,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let Ok(sets) = read_all(store, now, session, args, 2..args.len()) else {
         resp::write_error(out, WRONGTYPE);
         return Reply::Written;
@@ -684,7 +684,7 @@ pub(super) fn sintercard(
             return Reply::Written;
         }
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let Ok(sets) = read_all(store, now, session, args, 2..2 + numkeys) else {
         resp::write_error(out, WRONGTYPE);
         return Reply::Written;

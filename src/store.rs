@@ -42,8 +42,8 @@
 
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::BuildHasher;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -54,7 +54,7 @@ use crate::entry::KeyValue;
 use crate::pages;
 pub use crate::segment::Kind;
 use crate::segment::{self, Body, Header, MAX_USAGE, Payload, Segment};
-use crate::shard_lock::{self, ShardLock};
+use crate::shard_lock::{self, ShardGuard, ShardLock};
 use crate::table::{self, Table};
 
 /// Milliseconds on the store's monotonic clock. Starts at 1; 0 means "no expiry".
@@ -180,6 +180,9 @@ pub struct Config {
     /// commands can be run again at the times they first ran at (the
     /// append-only log replays its commands so: see `aof.rs`).
     pub unix_clock: bool,
+    /// How many numbered databases there are (`SELECT`); 0 means 16, as in
+    /// Redis.
+    pub databases: usize,
 }
 
 /// A write was refused because it would exceed `maxmemory`.
@@ -1406,6 +1409,30 @@ pub struct Store {
     client_memory: AtomicI64,
     flush_bytes: usize,
     ready: Ready,
+    /// Which numbered database this is (`SELECT`).
+    index: u32,
+    /// Database 0, to any other. Each database is a store of its own but for
+    /// the shard locks, which all use database 0's so that what holds a shard
+    /// holds that shard of every one: `EXEC`, scripts and `MOVE` hold what
+    /// they always held, and what's in other databases costs database 0
+    /// nothing. Database 0 also counts for all of them: memory, keys ready for
+    /// blocked clients, and whether it's loading. (This and `others` keep
+    /// each other alive, which is for as long as the server runs.)
+    base: Option<Arc<Store>>,
+    /// The other databases, to database 0, made when first used.
+    others: Box<[OnceLock<Arc<Store>>]>,
+}
+
+fn new_shards(n: usize) -> Box<[Shard]> {
+    (0..n)
+        .map(|_| Shard {
+            inner: ShardLock::new(ShardInner::default()),
+            footprint: AtomicUsize::new(0),
+            with_ttl: AtomicUsize::new(0),
+            table_base: AtomicUsize::new(0),
+            table_buckets: AtomicUsize::new(0),
+        })
+        .collect()
 }
 
 /// The shards a native script holds while it runs (`Store::script_shards`).
@@ -1464,7 +1491,8 @@ impl ScriptShards<'_> {
 #[repr(align(128))]
 struct Ready {
     pending: AtomicBool,
-    keys: Mutex<Vec<Box<[u8]>>>,
+    /// Each with its database.
+    keys: Mutex<Vec<(u32, Box<[u8]>)>>,
     /// Clients blocked right now.
     blocked: AtomicI64,
 }
@@ -1500,16 +1528,12 @@ impl Store {
             0 => MAX_FLUSH_BYTES,
             limit => (limit / n / 64).min(MAX_FLUSH_BYTES),
         };
+        let databases = match config.databases {
+            0 => 16,
+            n => n,
+        };
         Store {
-            shards: (0..n)
-                .map(|_| Shard {
-                    inner: ShardLock::new(ShardInner::default()),
-                    footprint: AtomicUsize::new(0),
-                    with_ttl: AtomicUsize::new(0),
-                    table_base: AtomicUsize::new(0),
-                    table_buckets: AtomicUsize::new(0),
-                })
-                .collect(),
+            shards: new_shards(n),
             shard_mask: n - 1,
             hasher: if config.fixed_seed {
                 Hasher::fixed()
@@ -1535,7 +1559,130 @@ impl Store {
             client_memory: AtomicI64::new(0),
             flush_bytes,
             ready: Ready::default(),
+            index: 0,
+            base: None,
+            others: (1..databases).map(|_| OnceLock::new()).collect(),
         }
+    }
+
+    /// Database 0, for what it counts for all of them (see `base`).
+    #[inline]
+    fn base(&self) -> &Store {
+        self.base.as_deref().unwrap_or(self)
+    }
+
+    /// How many databases there are.
+    pub fn databases(&self) -> usize {
+        self.base().others.len() + 1
+    }
+
+    /// Which database this is.
+    pub fn index(&self) -> usize {
+        self.index as usize
+    }
+
+    /// Database `index`, of database 0: made if it hasn't been used yet.
+    pub fn db(self: &Arc<Self>, index: usize) -> &Arc<Store> {
+        if index == 0 {
+            return self;
+        }
+        self.others[index - 1].get_or_init(|| {
+            Arc::new(Store {
+                shards: new_shards(self.shards.len()),
+                shard_mask: self.shard_mask,
+                hasher: self.hasher.clone(),
+                epoch: self.epoch,
+                clock_start: self.clock_start,
+                unix_base: self.unix_base,
+                loading: AtomicBool::new(false),
+                maxmemory: self.maxmemory,
+                policy: self.policy,
+                used: AtomicI64::new(0),
+                client_memory: AtomicI64::new(0),
+                flush_bytes: self.flush_bytes,
+                ready: Ready::default(),
+                index: index as u32,
+                base: Some(self.clone()),
+                others: Box::default(),
+            })
+        })
+    }
+
+    /// The databases made so far, database 0 first.
+    pub fn live(&self) -> impl Iterator<Item = &Store> {
+        let base = self.base();
+        std::iter::once(base).chain(base.others.iter().filter_map(|db| db.get().map(|db| &**db)))
+    }
+
+    /// Locks `shard`, one of this database's.
+    #[inline]
+    fn lock<'a>(&'a self, shard: &'a Shard) -> ShardGuard<'a, ShardInner> {
+        match &self.base {
+            None => shard.inner.lock(),
+            Some(base) => base.same_shard(self, shard).inner.lock_for(&shard.inner),
+        }
+    }
+
+    /// Tries to lock `shard`, one of this database's, without waiting.
+    #[inline]
+    fn try_lock<'a>(&'a self, shard: &'a Shard) -> Option<ShardGuard<'a, ShardInner>> {
+        match &self.base {
+            None => shard.inner.try_lock(),
+            Some(base) => base
+                .same_shard(self, shard)
+                .inner
+                .try_lock_for(&shard.inner),
+        }
+    }
+
+    /// [`try_lock`](Self::try_lock), or this thread's own if it holds it.
+    fn try_lock_here<'a>(&'a self, shard: &'a Shard) -> Option<ShardGuard<'a, ShardInner>> {
+        match &self.base {
+            None => shard.inner.try_lock_here(),
+            Some(base) => base
+                .same_shard(self, shard)
+                .inner
+                .try_lock_here_for(&shard.inner),
+        }
+    }
+
+    /// This database's shard in the place `shard` has in `db`.
+    fn same_shard(&self, db: &Store, shard: &Shard) -> &Shard {
+        let at = shard as *const Shard as usize - db.shards.as_ptr() as usize;
+        &self.shards[at / std::mem::size_of::<Shard>()]
+    }
+
+    /// Swaps what this database holds with what `other` does, for `SWAPDB`:
+    /// clients blocked on or watching a key stay with its database's number,
+    /// and hear if it now has something else.
+    pub(crate) fn swap_with(&self, other: &Store) {
+        self.exclusive(|| {
+            for i in 0..self.shards.len() {
+                let mut a = self.lock(&self.shards[i]);
+                let mut b = other.lock(&other.shards[i]);
+                let (a, b) = (&mut *a, &mut *b);
+                for (one, another) in [(&*a, &*b), (&*b, &*a)] {
+                    for key in one.watched.keys() {
+                        let hash = slot_hash(&self.hasher, key);
+                        if one.lookup(hash, key).is_some() || another.lookup(hash, key).is_some() {
+                            one.mark_watchers(key, false);
+                        }
+                    }
+                }
+                std::mem::swap(a, b);
+                std::mem::swap(&mut a.waiting, &mut b.waiting);
+                std::mem::swap(&mut a.watched, &mut b.watched);
+                self.sync_usage(&self.shards[i], a, true);
+                other.sync_usage(&other.shards[i], b, true);
+                for (db, inner) in [(self, &*a), (other, &*b)] {
+                    for key in inner.waiting.keys() {
+                        if inner.lookup(slot_hash(&self.hasher, key), key).is_some() {
+                            db.queue_ready(key);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Current time on the store clock.
@@ -1545,7 +1692,7 @@ impl Store {
 
     /// While loading, writes aren't held to `maxmemory` (see `loading`).
     pub(crate) fn set_loading(&self, loading: bool) {
-        self.loading.store(loading, Relaxed);
+        self.base().loading.store(loading, Relaxed);
     }
 
     /// Unix time in milliseconds at store-clock time `now`, for `XADD`'s
@@ -1567,13 +1714,14 @@ impl Store {
     /// Accounted memory in bytes (approximate; see module docs), connection
     /// buffers included.
     pub fn used_memory(&self) -> usize {
-        (self.used.load(Relaxed) + self.client_memory.load(Relaxed)).max(0) as usize
+        let base = self.base();
+        (base.used.load(Relaxed) + base.client_memory.load(Relaxed)).max(0) as usize
     }
 
     /// Counts memory the connections use (their buffers) as used, so that
     /// eviction and the limit leave room for it, as Redis does.
     pub fn add_client_memory(&self, delta: isize) {
-        self.client_memory.fetch_add(delta as i64, Relaxed);
+        self.base().client_memory.fetch_add(delta as i64, Relaxed);
     }
 
     /// Whether usage is within 10% of `maxmemory`.
@@ -1613,7 +1761,7 @@ impl Store {
         inner.unflushed += footprint as isize - inner.reported as isize;
         inner.reported = footprint;
         if inner.unflushed != 0 && (force || inner.unflushed.unsigned_abs() > self.flush_bytes) {
-            self.used.fetch_add(inner.unflushed as i64, Relaxed);
+            self.base().used.fetch_add(inner.unflushed as i64, Relaxed);
             inner.unflushed = 0;
         }
     }
@@ -1638,7 +1786,7 @@ impl Store {
     /// shard another thread holds rather than wait for it.
     pub fn prefetch_entry(&self, key: KeyHash) {
         let (hash, index) = self.locate(key);
-        let Some(inner) = self.shards[index].inner.try_lock() else {
+        let Some(inner) = self.try_lock(&self.shards[index]) else {
             return;
         };
         inner.table.find(hash, |slot| {
@@ -1704,7 +1852,7 @@ impl Store {
         let shard = &self.shards[index];
         let expired;
         let result = {
-            let mut guard = shard.inner.lock();
+            let mut guard = self.lock(shard);
             let inner = &mut *guard;
             let Some((loc, header)) = inner.lookup(hash, key) else {
                 return f(None);
@@ -1815,7 +1963,7 @@ impl Store {
         let shard = &self.shards[index];
         let mut attempts = 0;
         loop {
-            let mut guard = shard.inner.lock();
+            let mut guard = self.lock(shard);
             let inner = &mut *guard;
             let existing = inner.lookup(hash, key);
             let live = existing
@@ -1872,7 +2020,9 @@ impl Store {
                 // itself is what this write adds (a new segment's untouched
                 // capacity is free).
                 let needed = external_size + entry_len;
-                if self.used_memory() + needed > self.maxmemory && !self.loading.load(Relaxed) {
+                if self.used_memory() + needed > self.maxmemory
+                    && !self.base().loading.load(Relaxed)
+                {
                     drop(guard);
                     attempts += 1;
                     if !self.make_room(index, hash, needed, now) {
@@ -1985,8 +2135,8 @@ impl Store {
         if grows && !self.room_for(ia, hash_a, a.bytes.len() + b.bytes.len(), now) {
             return Err(OutOfMemory);
         }
-        let mut low = self.shards[ia.min(ib)].inner.lock();
-        let mut high = (ia != ib).then(|| self.shards[ia.max(ib)].inner.lock());
+        let mut low = self.lock(&self.shards[ia.min(ib)]);
+        let mut high = (ia != ib).then(|| self.lock(&self.shards[ia.max(ib)]));
         let mut pair = Pair {
             store: self,
             low: &mut low,
@@ -2031,7 +2181,7 @@ impl Store {
         let incoming = incoming + 64;
         self.maxmemory == 0
             || self.used_memory() + incoming <= self.maxmemory
-            || self.loading.load(Relaxed)
+            || self.base().loading.load(Relaxed)
             || self.make_room(home, seed, incoming, now)
     }
 
@@ -2053,7 +2203,7 @@ impl Store {
         let mut attempts = 0;
         loop {
             let mut garbage = Vec::new();
-            let mut guard = shard.inner.lock();
+            let mut guard = self.lock(shard);
             let inner = &mut *guard;
             let (existing, mut changed) = inner.lookup_live(hash, key, now, &mut garbage);
             let (update, result) = view(inner, existing.as_ref().map(|(loc, h)| (*loc, h)));
@@ -2121,7 +2271,7 @@ impl Store {
         let key = key.bytes;
         let shard = &self.shards[index];
         let mut garbage = Vec::new();
-        let mut guard = shard.inner.lock();
+        let mut guard = self.lock(shard);
         let inner = &mut *guard;
         let (existing, expired) = inner.lookup_live(hash, key, now, &mut garbage);
         let result = existing.and_then(|(loc, header)| {
@@ -2316,7 +2466,7 @@ impl Store {
         if may_evict
             && self.maxmemory != 0
             && self.used_memory() + needed > self.maxmemory
-            && !self.loading.load(Relaxed)
+            && !self.base().loading.load(Relaxed)
         {
             return Err(Retry::NeedRoom(needed));
         }
@@ -2342,7 +2492,7 @@ impl Store {
     pub fn clear(&self) {
         for shard in self.shards.iter() {
             let old = {
-                let mut guard = shard.inner.lock();
+                let mut guard = self.lock(shard);
                 let inner = &mut *guard;
                 // What this shard has added to the global counter so far.
                 let flushed = inner.reported as i64 - inner.unflushed as i64;
@@ -2359,7 +2509,7 @@ impl Store {
                 }
                 empty.watched = std::mem::take(&mut inner.watched);
                 let old = std::mem::replace(inner, empty);
-                self.used.fetch_sub(flushed, Relaxed);
+                self.base().used.fetch_sub(flushed, Relaxed);
                 self.sync_usage(shard, inner, true);
                 old
             };
@@ -2377,11 +2527,15 @@ impl Store {
 
     /// Queues `key` for the clients blocked on it, once.
     fn queue_ready(&self, key: &[u8]) {
-        let mut keys = self.ready.keys.lock();
-        if !keys.iter().any(|queued| **queued == *key) {
-            keys.push(key.into());
+        let ready = &self.base().ready;
+        let mut keys = ready.keys.lock();
+        if !keys
+            .iter()
+            .any(|(db, queued)| *db == self.index && **queued == *key)
+        {
+            keys.push((self.index, key.into()));
         }
-        self.ready.pending.store(true, Relaxed);
+        ready.pending.store(true, Relaxed);
     }
 
     /// After a write to `key` that may serve clients blocked on it without
@@ -2391,14 +2545,14 @@ impl Store {
             return;
         }
         let (_, index) = self.locate(key.hash);
-        let inner = self.shards[index].inner.lock();
+        let inner = self.lock(&self.shards[index]);
         self.created(&inner, key.bytes);
     }
 
     /// Registers `waiter` as blocked on `key`, after those already there.
     pub(crate) fn wait_on(&self, key: Key<'_>, waiter: &Arc<Waiter>) {
         let (_, index) = self.locate(key.hash);
-        let mut inner = self.shards[index].inner.lock();
+        let mut inner = self.lock(&self.shards[index]);
         inner
             .waiting
             .entry(key.bytes.into())
@@ -2410,7 +2564,7 @@ impl Store {
     /// [`Store::unwatch`] with `flag` ends it.
     pub(crate) fn wake_on_change(self: &Arc<Self>, key: Key<'_>, flag: &Arc<AtomicBool>) {
         let (_, index) = self.locate(key.hash);
-        let mut inner = self.shards[index].inner.lock();
+        let mut inner = self.lock(&self.shards[index]);
         inner
             .watched
             .entry(key.bytes.into())
@@ -2425,7 +2579,7 @@ impl Store {
     /// Deregisters `waiter` from `key`.
     pub(crate) fn stop_waiting(&self, key: Key<'_>, waiter: &Arc<Waiter>) {
         let (_, index) = self.locate(key.hash);
-        let mut inner = self.shards[index].inner.lock();
+        let mut inner = self.lock(&self.shards[index]);
         if let Some(waiters) = inner.waiting.get_mut(key.bytes) {
             waiters.retain(|w| !Arc::ptr_eq(w, waiter));
             if waiters.is_empty() {
@@ -2443,8 +2597,9 @@ impl Store {
         self.ready.pending.load(Relaxed)
     }
 
-    /// Takes a key that was created while clients were blocked on it.
-    pub(crate) fn take_ready(&self) -> Option<Box<[u8]>> {
+    /// Takes a key that was created while clients were blocked on it, and
+    /// its database. (Of database 0, as is [`has_ready`](Self::has_ready).)
+    pub(crate) fn take_ready(&self) -> Option<(usize, Box<[u8]>)> {
         if !self.has_ready() {
             return None;
         }
@@ -2453,7 +2608,7 @@ impl Store {
         if keys.is_empty() {
             self.ready.pending.store(false, Relaxed);
         }
-        key
+        key.map(|(db, key)| (db as usize, key))
     }
 
     /// The first client blocked on `key` that it now has data for, or that
@@ -2487,7 +2642,7 @@ impl Store {
     /// the key had expired already.
     pub(crate) fn watch(&self, key: Key<'_>, flag: &Arc<AtomicBool>, now: Millis) -> bool {
         let (hash, index) = self.locate(key.hash);
-        let mut inner = self.shards[index].inner.lock();
+        let mut inner = self.lock(&self.shards[index]);
         let expired = inner
             .lookup(hash, key.bytes)
             .is_some_and(|(_, header)| header.is_expired(now));
@@ -2505,7 +2660,7 @@ impl Store {
 
     pub(crate) fn unwatch(&self, key: Key<'_>, flag: &Arc<AtomicBool>) {
         let (_, index) = self.locate(key.hash);
-        let mut inner = self.shards[index].inner.lock();
+        let mut inner = self.lock(&self.shards[index]);
         if let Some(watchers) = inner.watched.get_mut(key.bytes) {
             watchers.retain(|w| !Arc::ptr_eq(&w.flag, flag));
             if watchers.is_empty() {
@@ -2520,7 +2675,7 @@ impl Store {
     /// Whether `key` is there but expired by `now` (not removed yet).
     pub(crate) fn has_expired(&self, key: Key<'_>, now: Millis) -> bool {
         let (hash, index) = self.locate(key.hash);
-        let inner = self.shards[index].inner.lock();
+        let inner = self.lock(&self.shards[index]);
         inner
             .lookup(hash, key.bytes)
             .is_some_and(|(_, header)| header.is_expired(now))
@@ -2528,12 +2683,12 @@ impl Store {
 
     /// Counts clients blocking (`delta` 1) or done (-1), for `INFO`.
     pub(crate) fn count_blocked(&self, delta: i64) {
-        self.ready.blocked.fetch_add(delta, Relaxed);
+        self.base().ready.blocked.fetch_add(delta, Relaxed);
     }
 
     /// Clients blocked right now.
     pub fn blocked_clients(&self) -> usize {
-        self.ready.blocked.load(Relaxed).max(0) as usize
+        self.base().ready.blocked.load(Relaxed).max(0) as usize
     }
 
     /// The shards a native script runs holding: every one if this thread
@@ -2541,6 +2696,7 @@ impl Store {
     /// taken in order. The script asks for the rest ([`ScriptShards::hold`])
     /// before it uses their keys.
     pub(crate) fn script_shards(&self, start: &[usize]) -> ScriptShards<'_> {
+        let store = self.base();
         if shard_lock::holding_all() {
             return ScriptShards(Shards::All);
         }
@@ -2550,10 +2706,10 @@ impl Store {
         wanted.dedup();
         for &i in &wanted {
             // Ascending, so each is waited for.
-            held.take(i, &self.shards[i].inner);
+            held.take(i, &store.shards[i].inner);
         }
         ScriptShards(Shards::Some {
-            store: self,
+            store,
             held,
             wanted,
         })
@@ -2567,7 +2723,7 @@ impl Store {
         if shard_lock::holding_all() {
             return f();
         }
-        let _holding = shard_lock::hold_all(self.shards.iter().map(|s| &s.inner));
+        let _holding = shard_lock::hold_all(self.base().shards.iter().map(|s| &s.inner));
         f()
     }
 
@@ -2596,7 +2752,7 @@ impl Store {
         let mut from = cursor as u32;
         let mut left = count.max(1);
         while shard < self.shards.len() {
-            let inner = self.shards[shard].inner.lock();
+            let inner = self.lock(&self.shards[shard]);
             let want = left.max(inner.table.len() / 1024);
             let (taken, next) = inner.scan(from, want, now, &mut f);
             drop(inner);
@@ -2639,8 +2795,8 @@ impl Store {
         let mut attempts = 0;
         loop {
             let mut garbage = Vec::new();
-            let mut low = self.shards[a.min(b)].inner.lock();
-            let mut high = (a != b).then(|| self.shards[a.max(b)].inner.lock());
+            let mut low = self.lock(&self.shards[a.min(b)]);
+            let mut high = (a != b).then(|| self.lock(&self.shards[a.max(b)]));
             let (src, mut dst): (&mut ShardInner, Option<&mut ShardInner>) =
                 match high.as_deref_mut() {
                     None => (&mut *low, None),
@@ -2782,7 +2938,7 @@ impl Store {
         now: Millis,
         mut f: impl FnMut(&[u8], Kind, &[u8], Millis),
     ) {
-        let inner = self.shards[index].inner.lock();
+        let inner = self.lock(&self.shards[index]);
         for seg in inner.segments.iter().flatten() {
             for (_, header) in seg.entries() {
                 if header.is_dead() || header.is_expired(now) {
@@ -2814,7 +2970,7 @@ impl Store {
     /// Calls `f` with the key and kind of every live entry in shard
     /// `index`, under its lock.
     pub fn for_each_key(&self, index: usize, now: Millis, mut f: impl FnMut(&[u8], Kind)) {
-        let inner = self.shards[index].inner.lock();
+        let inner = self.lock(&self.shards[index]);
         for seg in inner.segments.iter().flatten() {
             for (_, header) in seg.entries() {
                 if !header.is_dead() && !header.is_expired(now) {
@@ -2828,7 +2984,9 @@ impl Store {
 
     /// How many changes commands have made so far (see `Mem::writes`).
     pub fn changes(&self) -> u64 {
-        self.shards.iter().map(|s| s.inner.lock().mem.writes).sum()
+        self.live()
+            .flat_map(|db| db.shards.iter().map(move |s| db.lock(s).mem.writes))
+            .sum()
     }
 
     pub fn maxmemory(&self) -> usize {
@@ -2854,14 +3012,21 @@ impl Store {
     /// `MAX_USAGE + 1` sweeps something must be reclaimable; if not, there's
     /// nothing evictable at all (e.g. no TTL keys for volatile-lru).
     fn make_room(&self, home: usize, seed: u32, incoming: usize, now: Millis) -> bool {
+        let made = self.evict_for(home, seed, incoming, now);
+        // Evictions are logged in the database of the one they came from.
+        crate::aof::select(self.index());
+        made
+    }
+
+    fn evict_for(&self, home: usize, seed: u32, incoming: usize, now: Millis) -> bool {
         let volatile_only = match self.policy {
             EvictionPolicy::NoEviction => return false,
             EvictionPolicy::AllKeysLru => false,
             EvictionPolicy::VolatileLru => true,
         };
         // How much a shard has to give: bytes, or for volatile-lru, TTL keys.
-        let weight = |i: usize| {
-            let shard = &self.shards[i];
+        let weight = |(db, i): (&Store, usize)| {
+            let shard = &db.shards[i];
             if volatile_only {
                 shard.with_ttl.load(Relaxed)
             } else {
@@ -2872,37 +3037,46 @@ impl Store {
         let mut freed = 0;
         let mut rng = (u64::from(seed) << 1) | 1;
         // xorshift64: a cheap, good-enough source of shard choices.
-        let mut random_shard = || {
+        // Every database gives, as in Redis, whichever one needs the room.
+        let dbs: Vec<&Store> = self.live().collect();
+        let places = dbs.len() * self.shards.len();
+        let mut random_place = || {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
-            (rng >> 32) as usize & self.shard_mask
+            (rng >> 32) as usize % places
         };
+        let at = |place: usize| (dbs[place / self.shards.len()], place % self.shards.len());
         let mut fruitless = 0;
         let mut sweep: Option<usize> = None;
         while freed < needed {
-            let index = match &mut sweep {
+            let (db, index) = match &mut sweep {
                 Some(next) => {
-                    let index = *next;
-                    *next = (index + 1) & self.shard_mask;
-                    index
+                    let place = *next;
+                    *next = (place + 1) % places;
+                    at(place)
                 }
                 None => {
                     // Start with the writer's shard as one choice, but stop
                     // favoring it once a visit comes up empty.
-                    let a = if fruitless == 0 { home } else { random_shard() };
-                    let b = random_shard();
+                    let a = if fruitless == 0 {
+                        (self, home)
+                    } else {
+                        at(random_place())
+                    };
+                    let b = at(random_place());
                     if weight(b) > weight(a) { b } else { a }
                 }
             };
-            let shard = &self.shards[index];
+            crate::aof::select(db.index());
+            let shard = &db.shards[index];
             let mut garbage = Vec::new();
             // A native script's thread holds only its own shards: it takes
             // others only if they're free, so as never to wait while holding.
             let guard = if shard_lock::holding_some() {
-                shard.inner.try_lock_here()
+                db.try_lock_here(shard)
             } else {
-                Some(shard.inner.lock())
+                Some(db.lock(shard))
             };
             let (reclaimed, released) = match guard {
                 Some(mut guard) => {
@@ -2917,7 +3091,7 @@ impl Store {
                     );
                     inner.shrink_if_sparse();
                     let after = inner.footprint();
-                    self.sync_usage(shard, inner, true);
+                    db.sync_usage(shard, inner, true);
                     (reclaimed, before.saturating_sub(after))
                 }
                 None => (0, 0),
@@ -2929,11 +3103,11 @@ impl Store {
             freed += released;
             fruitless = if reclaimed > 0 { 0 } else { fruitless + 1 };
             match sweep {
-                Some(_) if fruitless > self.shards.len() * (usize::from(MAX_USAGE) + 1) => {
+                Some(_) if fruitless > places * (usize::from(MAX_USAGE) + 1) => {
                     return false;
                 }
                 None if fruitless > EVICT_TRIES.min(self.shards.len()) => {
-                    sweep = Some(random_shard());
+                    sweep = Some(random_place());
                     fruitless = 0;
                 }
                 _ => {}
@@ -2949,7 +3123,7 @@ impl Store {
         for shard in self.shards.iter() {
             let mut garbage = Vec::new();
             {
-                let mut guard = shard.inner.lock();
+                let mut guard = self.lock(shard);
                 let inner = &mut *guard;
                 removed += inner.sweep_expired(now, &self.hasher, &mut garbage);
                 inner.maybe_defrag(self.near_limit(), now, &self.hasher, &mut garbage);
@@ -2963,7 +3137,7 @@ impl Store {
 
     /// Number of keys, including expired keys not yet swept.
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.inner.lock().table.len()).sum()
+        self.shards.iter().map(|s| self.lock(s).table.len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -2972,7 +3146,7 @@ impl Store {
 
     /// Exact figures, unlike [`Store::used_memory`]: it locks every shard.
     pub fn stats(&self) -> Stats {
-        let client_bytes = self.client_memory.load(Relaxed).max(0) as usize;
+        let client_bytes = self.base().client_memory.load(Relaxed).max(0) as usize;
         let mut stats = Stats {
             maxmemory: self.maxmemory,
             policy: self.policy,
@@ -2981,19 +3155,29 @@ impl Store {
             client_bytes,
             ..Stats::default()
         };
-        for shard in self.shards.iter() {
-            let inner = shard.inner.lock();
-            stats.used_memory += inner.footprint();
-            stats.keys += inner.table.len();
-            stats.keys_with_ttl += inner.mem.with_ttl;
-            stats.table_bytes += pages::reserved(inner.table.allocation_size());
-            stats.segment_bytes += inner.mem.segment_resident;
-            stats.live_bytes += inner.mem.live;
-            stats.external_bytes += inner.mem.external;
-            stats.expired_keys += inner.mem.expired;
-            stats.evicted_keys += inner.mem.evicted;
+        for db in self.live() {
+            for shard in db.shards.iter() {
+                let inner = db.lock(shard);
+                stats.used_memory += inner.footprint();
+                stats.keys += inner.table.len();
+                stats.keys_with_ttl += inner.mem.with_ttl;
+                stats.table_bytes += pages::reserved(inner.table.allocation_size());
+                stats.segment_bytes += inner.mem.segment_resident;
+                stats.live_bytes += inner.mem.live;
+                stats.external_bytes += inner.mem.external;
+                stats.expired_keys += inner.mem.expired;
+                stats.evicted_keys += inner.mem.evicted;
+            }
         }
         stats
+    }
+
+    /// This database's keys, and how many of them have a TTL.
+    pub fn key_counts(&self) -> (usize, usize) {
+        self.shards.iter().fold((0, 0), |(keys, with_ttl), shard| {
+            let inner = self.lock(shard);
+            (keys + inner.table.len(), with_ttl + inner.mem.with_ttl)
+        })
     }
 }
 

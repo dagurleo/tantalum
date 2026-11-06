@@ -179,7 +179,7 @@ async fn basic_commands() {
     check(&mut c, &req(&[b"SELECT", b"0"]), b"+OK\r\n").await;
     check(
         &mut c,
-        &req(&[b"SELECT", b"1"]),
+        &req(&[b"SELECT", b"16"]),
         b"-ERR DB index is out of range\r\n",
     )
     .await;
@@ -1110,7 +1110,7 @@ async fn connection_commands() {
             req(&[b"CLIENT", b"SETINFO", b"lib-ver", b"5.0.1"]),
             req(&[b"CLIENT", b"SETINFO", b"color", b"red"]),
             req(&[b"CLIENT", b"SETNAME"]),
-            req(&[b"CLIENT", b"KILL", b"x"]),
+            req(&[b"CLIENT", b"NOPE", b"x"]),
         ]
         .concat(),
         &[
@@ -1124,7 +1124,7 @@ async fn connection_commands() {
             b"+OK\r\n$8\r\nworker-1\r\n+OK\r\n$-1\r\n:1\r\n+OK\r\n+OK\r\n",
             b"-ERR Unrecognized option 'color'\r\n",
             b"-ERR wrong number of arguments for 'client|setname' command\r\n",
-            b"-ERR unknown subcommand 'KILL'. Try CLIENT HELP.\r\n",
+            b"-ERR unknown subcommand 'NOPE'. Try CLIENT HELP.\r\n",
         ]
         .concat(),
     )

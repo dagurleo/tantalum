@@ -234,7 +234,7 @@ impl Scripting {
             let argv = (3 + numkeys..args.len()).map(|i| args.get(i)).collect();
             let start = out.len();
             let shards = ctx.store.script_shards(&[]);
-            let mut call = bullmq::Call::new(ctx, now, &name, keys, argv, out, shards);
+            let mut call = bullmq::Call::new(ctx, caller.db, now, &name, keys, argv, out, shards);
             if let bullmq::Outcome::Done = native(&mut call) {
                 ctx.publish(&mut call.session);
                 self.natives.fetch_add(1, Relaxed);
@@ -249,7 +249,10 @@ impl Scripting {
         let argv = (3 + numkeys..args.len()).map(|i| args.get(i));
         let mut run = Run {
             ctx,
-            session: Session::for_script(),
+            session: Session {
+                db: caller.db,
+                ..Session::for_script()
+            },
             now,
             read_only,
             started: Instant::now(),
@@ -280,6 +283,7 @@ impl Scripting {
     pub(crate) fn run_native(
         &self,
         ctx: &Context,
+        db: u32,
         now: Millis,
         args: &Args<'_>,
         numkeys: usize,
@@ -300,7 +304,7 @@ impl Scripting {
             let keys = (3..3 + numkeys).map(|i| args.get(i)).collect();
             let argv = (3 + numkeys..args.len()).map(|i| args.get(i)).collect();
             let shards = ctx.store.script_shards(&wanted);
-            let mut call = bullmq::Call::new(ctx, now, &name, keys, argv, out, shards);
+            let mut call = bullmq::Call::new(ctx, db, now, &name, keys, argv, out, shards);
             match native(&mut call) {
                 bullmq::Outcome::Done => {
                     // The reads it made count; those of a try it gave up

@@ -34,7 +34,7 @@ fn read(
     out: &mut Vec<u8>,
     f: impl FnOnce(Option<HashView<'_>>, &mut Vec<u8>),
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut f = Some(f);
     let mut run =
         |hash: Option<HashView<'_>>, out: &mut Vec<u8>| f.take().expect("runs once")(hash, out);
@@ -157,12 +157,12 @@ fn write_with<B: Default, R>(
 /// `HSET key field value [field value ...]`: how many fields are new.
 pub(super) fn hset(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    if let Some(added) = set_pairs(&ctx.store, now, args, out, "hset") {
+    if let Some(added) = set_pairs(ctx.db(session), now, args, out, "hset") {
         resp::write_integer(out, added as i64);
     }
     Reply::Written
@@ -171,12 +171,12 @@ pub(super) fn hset(
 /// `HMSET key field value [field value ...]`, the older `HSET`.
 pub(super) fn hmset(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    if set_pairs(&ctx.store, now, args, out, "hmset").is_some() {
+    if set_pairs(ctx.db(session), now, args, out, "hmset").is_some() {
         out.extend_from_slice(resp::OK);
     }
     Reply::Written
@@ -213,12 +213,12 @@ fn set_pairs(
 /// `HSETNX key field value`: 1 if it set the field, 0 if it was there.
 pub(super) fn hsetnx(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let set = write(&ctx.store, now, args, out, 1, true, |edit, args, _| {
+    let set = write(ctx.db(session), now, args, out, 1, true, |edit, args, _| {
         Ok(edit.get(args.get(2)).is_none() && edit.set(args.get(2), args.get(3)))
     });
     if let Some(set) = set {
@@ -230,13 +230,13 @@ pub(super) fn hsetnx(
 /// `HDEL key field [field ...]`: how many it removed.
 pub(super) fn hdel(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
     let removed = write(
-        &ctx.store,
+        ctx.db(session),
         now,
         args,
         out,
@@ -257,7 +257,7 @@ pub(super) fn hdel(
 /// `HINCRBY key field increment`: the new value.
 pub(super) fn hincrby(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -266,20 +266,28 @@ pub(super) fn hincrby(
         resp::write_error(out, NOT_AN_INTEGER);
         return Reply::Written;
     };
-    let value = write(&ctx.store, now, args, out, 1, true, |edit, args, digits| {
-        let field = args.get(2);
-        let old = match edit.get(field) {
-            None => 0,
-            Some(value) => {
-                resp::parse_int(value).ok_or(&b"ERR hash value is not an integer"[..])?
-            }
-        };
-        let new = old
-            .checked_add(delta)
-            .ok_or(&b"ERR increment or decrement would overflow"[..])?;
-        edit.set(field, digits.format(new).as_bytes());
-        Ok(new)
-    });
+    let value = write(
+        ctx.db(session),
+        now,
+        args,
+        out,
+        1,
+        true,
+        |edit, args, digits| {
+            let field = args.get(2);
+            let old = match edit.get(field) {
+                None => 0,
+                Some(value) => {
+                    resp::parse_int(value).ok_or(&b"ERR hash value is not an integer"[..])?
+                }
+            };
+            let new = old
+                .checked_add(delta)
+                .ok_or(&b"ERR increment or decrement would overflow"[..])?;
+            edit.set(field, digits.format(new).as_bytes());
+            Ok(new)
+        },
+    );
     if let Some(value) = value {
         resp::write_integer(out, value);
     }
@@ -290,7 +298,7 @@ pub(super) fn hincrby(
 /// (see `aof::record`).
 pub(super) fn hincrbyfloat(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -306,16 +314,24 @@ pub(super) fn hincrbyfloat(
         }
         Ok(_) => {}
     }
-    let reply = write_with::<Vec<u8>, _>(&ctx.store, now, args, out, 1, true, |edit, args, sum| {
-        let field = args.get(2);
-        *sum = add_floats(edit.get(field), args.get(3)).map_err(|e| match e {
-            FloatError::BadCurrent => &b"ERR hash value is not a float"[..],
-            _ => &b"ERR increment would produce NaN or Infinity"[..],
-        })?;
-        let sum: &[u8] = sum;
-        edit.set(field, sum);
-        Ok(sum.to_vec())
-    });
+    let reply = write_with::<Vec<u8>, _>(
+        ctx.db(session),
+        now,
+        args,
+        out,
+        1,
+        true,
+        |edit, args, sum| {
+            let field = args.get(2);
+            *sum = add_floats(edit.get(field), args.get(3)).map_err(|e| match e {
+                FloatError::BadCurrent => &b"ERR hash value is not a float"[..],
+                _ => &b"ERR increment would produce NaN or Infinity"[..],
+            })?;
+            let sum: &[u8] = sum;
+            edit.set(field, sum);
+            Ok(sum.to_vec())
+        },
+    );
     if let Some(sum) = reply {
         resp::write_bulk(out, &sum);
     }

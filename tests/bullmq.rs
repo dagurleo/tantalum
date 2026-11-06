@@ -925,6 +925,49 @@ fn a_steady_queue_runs_natively() {
     assert_eq!(lua, 0, "calls sent back to Lua");
 }
 
+#[test]
+fn native_scripts_use_the_database_selected() {
+    let ctx: &'static Context = Box::leak(Box::new(Context::new(
+        Arc::new(Store::new(16)),
+        Settings::default(),
+    )));
+    let mut session = ctx.connect(-1).unwrap().session();
+    let mut run = |args: &[&[u8]]| common::execute(ctx, &mut session, 1_780_000_000_000, args);
+    run(&[b"SCRIPT", b"LOAD", &script("addStandardJob-9")]);
+    run(&[b"SELECT", b"3"]);
+    let keys = queue_keys(
+        "q",
+        &[
+            "wait",
+            "paused",
+            "meta",
+            "id",
+            "completed",
+            "delayed",
+            "active",
+            "events",
+            "marker",
+        ],
+    );
+    let add = sha("addStandardJob-9");
+    let args = M::Arr(vec![
+        s("bull:q:"),
+        s(""),
+        s("job"),
+        M::Int(1_780_000_000_000),
+    ])
+    .bytes();
+    let opts = M::Map(vec![]).bytes();
+    let mut call: Vec<&[u8]> = vec![b"EVALSHA", &add, b"9"];
+    call.extend(keys.iter().map(Vec::as_slice));
+    call.extend([&args[..], b"{}", &opts]);
+    assert_eq!(run(&call), b"$1\r\n1\r\n");
+    assert_eq!(ctx.scripting_stats(), (1, 0), "it ran natively");
+    assert_eq!(run(&[b"LLEN", b"bull:q:wait"]), b":1\r\n");
+    run(&[b"SELECT", b"0"]);
+    assert_eq!(run(&[b"DBSIZE"]), b":0\r\n");
+}
+
 /// One queue's keys, in addStandardJob's, moveToActive's or
 /// moveToFinished's order.
 fn queue_keys(queue: &str, names: &[&str]) -> Vec<Vec<u8>> {

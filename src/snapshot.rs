@@ -41,18 +41,21 @@ use crate::stream::BigStream;
 use crate::{collection, hash};
 
 /// The header, with the version in its next-to-last byte.
-const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 5\n";
+const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 6\n";
 const VERSION_AT: usize = MAGIC.len() - 2;
 const MAGIC_V1: &[u8] = b"TANTALUM SNAPSHOT 1\n";
 const MAGIC_V2: &[u8] = b"TANTALUM SNAPSHOT 2\n";
 const MAGIC_V3: &[u8] = b"TANTALUM SNAPSHOT 3\n";
 const MAGIC_V4: &[u8] = b"TANTALUM SNAPSHOT 4\n";
+const MAGIC_V5: &[u8] = b"TANTALUM SNAPSHOT 5\n";
 const STRING: u8 = 1;
 const HASH: u8 = 2;
 const LIST: u8 = 3;
 const SET: u8 = 4;
 const ZSET: u8 = 5;
 const STREAM: u8 = 6;
+/// The records after it are in the database numbered next: until then, in 0.
+const DB: u8 = 7;
 const END: u8 = 0;
 
 /// A record's tag and the first format version that has it.
@@ -166,24 +169,36 @@ fn write_file(
     out.inner.write_all(&magic)?;
     let mut keys = 0u64;
     let mut buf = Vec::new();
-    for shard in 0..store.shard_count() {
-        buf.clear();
-        store.for_each_live(shard, now, |key, kind, value, deadline| {
-            let (tag, version) = tag_of(kind, value);
-            magic[VERSION_AT] = magic[VERSION_AT].max(version);
-            buf.push(tag);
-            put_varint(&mut buf, key.len() as u64);
-            buf.extend_from_slice(key);
-            put_varint(&mut buf, value.len() as u64);
-            buf.extend_from_slice(value);
-            let expires = match deadline {
-                NO_EXPIRY => 0,
-                deadline => unix(deadline).max(1) as u64,
-            };
-            put_varint(&mut buf, expires);
-            keys += 1;
-        });
-        out.write_all(&buf)?;
+    for db in store.live() {
+        if db.index() != 0 {
+            if db.is_empty() {
+                continue;
+            }
+            magic[VERSION_AT] = magic[VERSION_AT].max(b'6');
+            buf.clear();
+            buf.push(DB);
+            put_varint(&mut buf, db.index() as u64);
+            out.write_all(&buf)?;
+        }
+        for shard in 0..db.shard_count() {
+            buf.clear();
+            db.for_each_live(shard, now, |key, kind, value, deadline| {
+                let (tag, version) = tag_of(kind, value);
+                magic[VERSION_AT] = magic[VERSION_AT].max(version);
+                buf.push(tag);
+                put_varint(&mut buf, key.len() as u64);
+                buf.extend_from_slice(key);
+                put_varint(&mut buf, value.len() as u64);
+                buf.extend_from_slice(value);
+                let expires = match deadline {
+                    NO_EXPIRY => 0,
+                    deadline => unix(deadline).max(1) as u64,
+                };
+                put_varint(&mut buf, expires);
+                keys += 1;
+            });
+            out.write_all(&buf)?;
+        }
     }
     out.write_all(&[END])?;
     out.write_all(&keys.to_le_bytes())?;
@@ -216,7 +231,7 @@ pub struct Loaded {
 /// Loads the snapshot at `path` into `store`: `Ok(None)` if there's none.
 /// The checksum is verified before anything is loaded, so a damaged file
 /// loads nothing.
-pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
+pub fn load(store: &Arc<Store>, path: &Path) -> io::Result<Option<Loaded>> {
     load_file(store, path, None)
 }
 
@@ -225,7 +240,7 @@ pub fn load(store: &Store, path: &Path) -> io::Result<Option<Loaded>> {
 /// kept (the log's commands, run at their own times, may still use them;
 /// they expire after).
 pub(crate) fn load_base(
-    store: &Store,
+    store: &Arc<Store>,
     path: &Path,
     time: crate::store::Millis,
 ) -> io::Result<Option<Loaded>> {
@@ -233,7 +248,7 @@ pub(crate) fn load_base(
 }
 
 fn load_file(
-    store: &Store,
+    store: &Arc<Store>,
     path: &Path,
     base_time: Option<crate::store::Millis>,
 ) -> io::Result<Option<Loaded>> {
@@ -254,7 +269,8 @@ fn load_file(
         MAGIC_V2 => 2,
         MAGIC_V3 => 3,
         MAGIC_V4 => 4,
-        MAGIC => 5,
+        MAGIC_V5 => 5,
+        MAGIC => 6,
         _ if magic.starts_with(&MAGIC[..VERSION_AT]) => {
             return Err(invalid(
                 "a snapshot from a newer Tantalum: upgrade to load it",
@@ -269,10 +285,24 @@ fn load_file(
     let mut loaded = Loaded::default();
     let (mut key, mut value) = (Vec::new(), Vec::new());
     let mut records = 0u64;
+    let mut db = store;
     loop {
         let mut tag = [0];
         reader.read_exact(&mut tag)?;
         let kind = match tag[0] {
+            DB if version >= 6 => {
+                let index = read_varint(&mut reader)? as usize;
+                if index >= store.databases() {
+                    return Err(invalid(format!(
+                        "it has database {index}, but this server has {}: start it with \
+                         --databases {}",
+                        store.databases(),
+                        index + 1
+                    )));
+                }
+                db = store.db(index);
+                continue;
+            }
             STRING => Kind::String,
             HASH if version >= 2 => Kind::Hash,
             LIST if version >= 3 => Kind::List,
@@ -307,7 +337,7 @@ fn load_file(
             }
             t => Expiry::At(store.deadline_from_unix_ms(now, t as i64)),
         };
-        match store.restore(&key, kind, &value, expiry, now) {
+        match db.restore(&key, kind, &value, expiry, now) {
             Ok(()) => loaded.keys += 1,
             Err(_) => loaded.dropped += 1,
         }
@@ -549,7 +579,7 @@ mod tests {
         let path = temp_path("roundtrip");
         let s = filled();
         assert_eq!(save(&s, &path).unwrap(), 5_004);
-        let t = Store::new(4);
+        let t = Arc::new(Store::new(4));
         let loaded = load(&t, &path).unwrap().unwrap();
         assert_eq!(
             loaded,
@@ -632,7 +662,7 @@ mod tests {
                 .unwrap()
                 .starts_with(b"TANTALUM SNAPSHOT 2\n")
         );
-        let t = Store::new(2);
+        let t = Arc::new(Store::new(2));
         load(&t, &path).unwrap();
         assert_eq!(kind_and_value(&t, b"h"), Some((Kind::Hash, packed)));
         let big = t.get_with(b"h", now, |v| {
@@ -667,7 +697,7 @@ mod tests {
         assert_eq!(save(&s, &path).unwrap(), 5_005);
         // Hashes need version 2, no more.
         assert!(fs::read(&path).unwrap().starts_with(MAGIC_V2));
-        let t = Store::new(4);
+        let t = Arc::new(Store::new(4));
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 5_005);
         assert_eq!(kind_and_value(&t, b"h"), Some((Kind::Hash, small)));
         assert_eq!(kind_and_value(&t, b"big"), Some((Kind::Hash, big)));
@@ -679,7 +709,10 @@ mod tests {
         let u = filled();
         save(&u, &path).unwrap();
         assert!(fs::read(&path).unwrap().starts_with(MAGIC_V1));
-        assert_eq!(load(&Store::new(1), &path).unwrap().unwrap().keys, 5_004);
+        assert_eq!(
+            load(&Arc::new(Store::new(1)), &path).unwrap().unwrap().keys,
+            5_004
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -721,7 +754,7 @@ mod tests {
         .unwrap();
         assert_eq!(save(&s, &path).unwrap(), 5_007);
         assert!(fs::read(&path).unwrap().starts_with(MAGIC_V3));
-        let t = Store::new(4);
+        let t = Arc::new(Store::new(4));
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 5_007);
         assert_eq!(kind_and_value(&t, b"ints"), Some((Kind::Set, ints)));
         assert_eq!(kind_and_value(&t, b"strings"), Some((Kind::Set, strings)));
@@ -787,7 +820,7 @@ mod tests {
                 .starts_with(b"TANTALUM SNAPSHOT 5\n")
         );
 
-        let t = Store::new(2);
+        let t = Arc::new(Store::new(2));
         load(&t, &path).unwrap();
         let back = t
             .update_collection(t.key(b"groups"), now, false, |entry| match entry {
@@ -839,7 +872,7 @@ mod tests {
         record.extend_from_slice(&value);
         put_varint(&mut record, 0);
         fs::write(&path, file_of(b"TANTALUM SNAPSHOT 4\n", &record, 1)).unwrap();
-        let s = Store::new(2);
+        let s = Arc::new(Store::new(2));
         assert_eq!(load(&s, &path).unwrap().unwrap().keys, 1);
         assert_eq!(s.len(), 1);
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -897,7 +930,7 @@ mod tests {
         }
         assert_eq!(save(&s, &path).unwrap(), 2);
         assert!(fs::read(&path).unwrap().starts_with(MAGIC_V4));
-        let t = Store::new(4);
+        let t = Arc::new(Store::new(4));
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
         let mut reloaded = t
             .update_collection(t.key(b"s"), t.now(), false, |entry| {
@@ -954,7 +987,7 @@ mod tests {
         save(&s, &path).unwrap();
         // No streams: still version 3, which 0.14 reads.
         assert!(fs::read(&path).unwrap().starts_with(MAGIC_V3));
-        let t = Store::new(4);
+        let t = Arc::new(Store::new(4));
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
         assert_eq!(
             kind_and_value(&t, b"small"),
@@ -1000,7 +1033,7 @@ mod tests {
         })
         .unwrap();
         save(&s, &path).unwrap();
-        let t = Store::new(4);
+        let t = Arc::new(Store::new(4));
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 2);
         assert_eq!(
             kind_and_value(&t, b"small"),
@@ -1027,7 +1060,7 @@ mod tests {
     fn loads_version_1_from_before_hashes() {
         let path = temp_path("v1");
         fs::write(&path, include_bytes!("../tests/data/v1.snapshot")).unwrap();
-        let t = Store::new(4);
+        let t = Arc::new(Store::new(4));
         let loaded = load(&t, &path).unwrap().unwrap();
         assert_eq!(
             loaded,
@@ -1077,7 +1110,7 @@ mod tests {
         };
         // The good one loads...
         fs::write(&path, file_of(MAGIC, &record(HASH, &good), 1)).unwrap();
-        let t = Store::new(1);
+        let t = Arc::new(Store::new(1));
         load(&t, &path).unwrap();
         assert_eq!(kind_and_value(&t, b"h"), Some((Kind::Hash, good.clone())));
         for (what, file) in [
@@ -1091,10 +1124,10 @@ mod tests {
             ),
             ("an empty hash", file_of(MAGIC, &record(HASH, b"\x00"), 1)),
             ("an unknown kind", file_of(MAGIC, &record(9, b"x"), 1)),
-            ("a newer version", file_of(b"TANTALUM SNAPSHOT 6\n", &[], 0)),
+            ("a newer version", file_of(b"TANTALUM SNAPSHOT 7\n", &[], 0)),
         ] {
             fs::write(&path, file).unwrap();
-            let err = load(&Store::new(1), &path).unwrap_err();
+            let err = load(&Arc::new(Store::new(1)), &path).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}: {err}");
         }
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
@@ -1103,7 +1136,7 @@ mod tests {
     #[test]
     fn missing_file_loads_nothing() {
         let path = temp_path("missing");
-        assert_eq!(load(&Store::new(1), &path).unwrap(), None);
+        assert_eq!(load(&Arc::new(Store::new(1)), &path).unwrap(), None);
     }
 
     #[test]
@@ -1122,7 +1155,7 @@ mod tests {
             ("extended", [&good[..], b"x"].concat()),
         ] {
             fs::write(&path, &bytes).unwrap();
-            let t = Store::new(1);
+            let t = Arc::new(Store::new(1));
             assert!(load(&t, &path).is_err(), "{what} not detected");
             assert_eq!(t.len(), 0, "{what}: loaded keys from a bad file");
         }
@@ -1147,7 +1180,7 @@ mod tests {
             .unwrap();
         save(&s, &path).unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        let t = Store::new(1);
+        let t = Arc::new(Store::new(1));
         let loaded = load(&t, &path).unwrap().unwrap();
         assert_eq!((loaded.keys, loaded.expired), (1, 1));
         assert_eq!(get(&t, b"stays").as_deref(), Some(&b"y"[..]));
@@ -1155,15 +1188,74 @@ mod tests {
     }
 
     #[test]
+    fn numbered_databases_come_back() {
+        let path = temp_path("databases");
+        let s = Arc::new(Store::new(2));
+        s.set(b"k", b"zero", Condition::Always, Expiry::Never, 1, false)
+            .unwrap();
+        s.db(3)
+            .set(b"k", b"three", Condition::Always, Expiry::Never, 1, false)
+            .unwrap();
+        s.db(15)
+            .set(
+                b"other",
+                b"fifteen",
+                Condition::Always,
+                Expiry::Never,
+                1,
+                false,
+            )
+            .unwrap();
+        // Made but empty: it isn't written.
+        s.db(7);
+        assert_eq!(save(&s, &path).unwrap(), 3);
+        assert_eq!(&fs::read(&path).unwrap()[..MAGIC.len()], MAGIC);
+
+        let t = Arc::new(Store::new(4));
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 3);
+        assert_eq!(get(&t, b"k").unwrap(), b"zero");
+        assert_eq!(get(t.db(3), b"k").unwrap(), b"three");
+        assert_eq!(get(t.db(15), b"other").unwrap(), b"fifteen");
+        assert_eq!(t.db(3).len(), 1);
+        assert_eq!(t.db(7).len(), 0);
+        assert_eq!(t.len(), 1);
+
+        // On a server with fewer, it says what to do.
+        let few = Arc::new(Store::with_config(Config {
+            databases: 4,
+            ..Config::default()
+        }));
+        let err = load(&few, &path).unwrap_err().to_string();
+        assert!(err.contains("--databases 16"), "{err}");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn only_database_0_stays_at_the_version_it_needs() {
+        let path = temp_path("database-0");
+        let s = Arc::new(Store::new(2));
+        s.set(b"k", b"zero", Condition::Always, Expiry::Never, 1, false)
+            .unwrap();
+        // Made and empty, it changes nothing: an older build can read this.
+        s.db(3);
+        save(&s, &path).unwrap();
+        assert_eq!(&fs::read(&path).unwrap()[..MAGIC_V1.len()], MAGIC_V1);
+        let t = Arc::new(Store::new(2));
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 1);
+        assert_eq!(get(&t, b"k").unwrap(), b"zero");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn a_full_store_drops_the_rest() {
         let path = temp_path("full");
         save(&filled(), &path).unwrap();
-        let t = Store::with_config(Config {
+        let t = Arc::new(Store::with_config(Config {
             shards: 1,
             maxmemory: 64 * 1024,
             policy: crate::store::EvictionPolicy::NoEviction,
             ..Config::default()
-        });
+        }));
         let loaded = load(&t, &path).unwrap().unwrap();
         assert!(loaded.keys > 0 && loaded.dropped > 0, "{loaded:?}");
         assert_eq!(loaded.keys + loaded.dropped, 5_004);

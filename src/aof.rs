@@ -104,6 +104,9 @@ struct Pending {
     spare: Vec<u8>,
     /// The last time written to the current log (0: none yet).
     time: Millis,
+    /// The database the current log's commands are in by now: its last
+    /// `SELECT`, or 0 at its start.
+    db: u32,
 }
 
 /// The base and logs that make up the data, in the manifest.
@@ -279,6 +282,8 @@ pub struct Started {
     pub truncated: u64,
     /// Whether it started a new log (none yet in DIR).
     pub created: bool,
+    /// The database the last log left off in: it goes on from there.
+    last_db: u32,
 }
 
 /// Whether `dir` holds a log (its manifest).
@@ -309,6 +314,7 @@ pub fn start(ctx: &Context, options: Options) -> io::Result<(Arc<Aof>, Started)>
                 started.commands += replayed.commands;
                 started.failed += replayed.failed;
                 started.truncated += replayed.truncated;
+                started.last_db = replayed.db;
             }
             let current = OpenOptions::new()
                 .append(true)
@@ -345,7 +351,10 @@ pub fn start(ctx: &Context, options: Options) -> io::Result<(Arc<Aof>, Started)>
     let aof = Arc::new(Aof {
         options,
         store,
-        pending: Mutex::new(Pending::default()),
+        pending: Mutex::new(Pending {
+            db: started.last_db,
+            ..Pending::default()
+        }),
         files: Mutex::new(Files {
             manifest,
             current_len: current.metadata()?.len(),
@@ -385,7 +394,7 @@ impl Aof {
     /// this one does (and what its scripts' or transaction's commands do,
     /// with `grouped`) is logged at store-clock time `now`, which must be
     /// taken once the turn has come (see the module docs).
-    pub(crate) fn turn(&self, grouped: bool) -> Turn<'_> {
+    pub(crate) fn turn(&self, grouped: bool, db: u32) -> Turn<'_> {
         let mut pending = self.pending.lock();
         let now = self.store.now();
         let active = Active {
@@ -393,6 +402,7 @@ impl Aof {
             now,
             grouped,
             open: false,
+            db,
         };
         let previous = ACTIVE.replace(Some(active));
         debug_assert!(previous.is_none(), "a write turn inside another");
@@ -555,6 +565,7 @@ impl Aof {
             files.current = current;
             files.logged = HEADER.len() as u64;
             pending.time = 0;
+            pending.db = 0;
             let time = self.store.now();
             let tmp = dir.join(format!("{}.tmp", base_name(n)));
             snapshot::write_base(&self.store, time, &tmp)?;
@@ -644,6 +655,8 @@ struct Active {
     grouped: bool,
     /// `MULTI` written.
     open: bool,
+    /// The database what's logged now is in.
+    db: u32,
 }
 
 thread_local! {
@@ -680,8 +693,22 @@ fn push<'a>(args: impl ExactSizeIterator<Item = &'a [u8]>) {
             push_command(&mut pending.buf, [TIME, time.as_bytes()].into_iter());
             pending.time = active.now;
         }
+        if pending.db != active.db {
+            let db = active.db.to_string();
+            push_command(
+                &mut pending.buf,
+                [&b"SELECT"[..], db.as_bytes()].into_iter(),
+            );
+            pending.db = active.db;
+        }
         push_command(&mut pending.buf, args);
     });
+}
+
+/// What this thread logs from now on, if it's taking a write turn, is in
+/// database `db`.
+pub(crate) fn select(db: usize) {
+    with_active(|_, active| active.db = db as u32);
 }
 
 /// Whether this thread is taking a write turn (the log is on).
@@ -802,6 +829,8 @@ struct Replayed {
     commands: u64,
     failed: u64,
     truncated: u64,
+    /// The database it left off in.
+    db: u32,
 }
 
 /// Runs a log's commands again into `ctx`'s store, each at its time. A
@@ -820,6 +849,8 @@ fn replay(ctx: &Context, path: &Path, last: bool) -> io::Result<Replayed> {
     }
     let mut session = Session::for_replay();
     let mut replayed = Replayed::default();
+    // Where the last whole record (or group) left its database.
+    let mut good_db = 0;
     let mut now: Millis = ctx.store.now();
     let mut pos = HEADER.len();
     // Where the last whole record (or group) ends.
@@ -861,12 +892,14 @@ fn replay(ctx: &Context, path: &Path, last: bool) -> io::Result<Replayed> {
             }
             if group.is_none() {
                 good = pos;
+                good_db = session.db;
             }
         }
         Ok::<_, io::Error>(())
     })();
     ctx.store.set_loading(false);
     result?;
+    replayed.db = good_db;
     if good < data.len() {
         // The server stopped in the middle of writing a record, or a
         // script's or transaction's group: in the log it went on writing,

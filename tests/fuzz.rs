@@ -81,6 +81,8 @@ const COMMANDS: &[&[u8]] = &[
     b"PING",
     b"ECHO",
     b"SELECT",
+    b"MOVE",
+    b"SWAPDB",
     b"DBSIZE",
     b"INFO",
     b"AUTH",

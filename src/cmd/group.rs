@@ -268,7 +268,7 @@ fn xreadgroup_attempt(
         return error(out, b"ERR Missing GROUP option for XREADGROUP");
     };
     let streams = (args.len() - streams_at) / 2;
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let request = GroupRead {
         group,
         consumer,
@@ -410,7 +410,7 @@ enum GroupReply {
 /// `XGROUP CREATE|SETID|DESTROY|CREATECONSUMER|DELCONSUMER|HELP ...`
 pub(super) fn xgroup(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -468,7 +468,7 @@ pub(super) fn xgroup(
             return reply_error(out, &subcommand_syntax_error(args, "XGROUP"));
         }
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let key = args.key_at(store, 2);
     let (key_name, group_name) = (args.get(2), args.get(3));
     let time = unix_now(store, now);
@@ -585,7 +585,7 @@ pub(super) fn xgroup(
 /// `XSETID key last-id [ENTRIESADDED entries-added] [MAXDELETEDID max-deleted-id]`
 pub(super) fn xsetid(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -623,7 +623,7 @@ pub(super) fn xsetid(
         }
         i += 2;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let result = changing(store, args.key(store), now, false, |stream| {
         let Some(stream) = stream else {
             return (Done::Nothing, Err(b"ERR no such key".to_vec()));
@@ -662,7 +662,7 @@ pub(super) fn xack(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let group_name = args.get(2);
     let mut hit = false;
     let result = changing(store, args.key(store), now, false, |stream| {
@@ -751,7 +751,7 @@ pub(super) fn xpending(
             consumer = Some(args.get(at + 3));
         }
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (key_name, group_name) = (args.get(1), args.get(2));
     let time = unix_now(store, now);
     let null = session.null();
@@ -924,7 +924,7 @@ pub(super) fn xclaim(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (key_name, group_name) = (args.get(1), args.get(2));
     let time = unix_now(store, now);
     let mut hit = false;
@@ -1037,7 +1037,7 @@ pub(super) fn xautoclaim(
         }
         j += 1;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let (key_name, group_name) = (args.get(1), args.get(2));
     let time = unix_now(store, now);
     let mut hit = false;
@@ -1303,7 +1303,7 @@ pub(super) fn xinfo(
         write_help(out, XINFO_HELP);
         return Reply::Written;
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let resp3 = session.resp3;
     let null = session.null();
     let time = unix_now(store, now);

@@ -71,7 +71,7 @@ pub(super) fn watch(
         .watching
         .get_or_insert_with(|| Box::new(Watching::new(&ctx.store)));
     for i in 1..args.len() {
-        watching.add(args.get(i), now);
+        watching.add(session.db as usize, args.get(i), now);
     }
     out.extend_from_slice(resp::OK);
     Reply::Written

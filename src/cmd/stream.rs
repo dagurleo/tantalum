@@ -223,7 +223,7 @@ pub(super) fn xadd(
         }
         Ok(id)
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let key = args.key(store);
     let added = change(store, key, now, true, |stream| match stream {
         None if parsed.no_mkstream => (Done::Nothing, Ok(None)),
@@ -270,7 +270,7 @@ pub(super) fn xlen(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     match read(store, args.key(store), now, session, |s| {
         s.map_or(0, BigStream::len)
     }) {
@@ -352,7 +352,7 @@ fn range_command(
             return reply_error(out, SYNTAX_ERROR);
         }
     }
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let reply = read(store, args.key(store), now, session, |stream| {
         let Some(stream) = stream else {
             return b"*0\r\n".to_vec();
@@ -405,12 +405,12 @@ pub(super) fn xrevrange(
 /// `XDEL key id [id ...]`: how many were there.
 pub(super) fn xdel(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     // A missing key is 0 before any ID is checked, as in Redis.
     let deleted = change(store, args.key(store), now, false, |stream| {
         let Some(stream) = stream else {
@@ -442,7 +442,7 @@ pub(super) fn xdel(
 /// `XTRIM key MAXLEN|MINID [=|~] threshold [LIMIT count]`: how many went.
 pub(super) fn xtrim(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -452,7 +452,7 @@ pub(super) fn xtrim(
         Err(msg) => return reply_error(out, msg),
     };
     let how = parsed.trim.expect("XTRIM has a strategy");
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let trimmed = change(store, args.key(store), now, false, |stream| {
         let Some(stream) = stream else {
             return (Done::Nothing, 0);
@@ -561,7 +561,7 @@ fn xread_attempt(
         return error(out, SYNTAX_ERROR);
     }
     let streams = (args.len() - streams_at) / 2;
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     // Every key's type, then its ID, before anything is read.
     let mut ids = Vec::with_capacity(streams);
     let mut dollar = false;

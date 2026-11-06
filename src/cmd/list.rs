@@ -76,7 +76,7 @@ fn reading(
     out: &mut Vec<u8>,
     f: impl FnOnce(Option<ListView<'_>>, &mut Vec<u8>),
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let mut reply = Vec::new();
     match read(store, args.key(store), now, session, |list| {
         f(list, &mut reply)
@@ -179,13 +179,14 @@ fn pop(list: &mut ListMut<'_>, end: End) -> Option<Vec<u8>> {
 /// `LPUSH`/`RPUSH` (and with `only_existing`, `LPUSHX`/`RPUSHX`).
 fn push_command(
     ctx: &Context,
+    session: &Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
     end: End,
     only_existing: bool,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let len = change(store, args.key(store), now, true, args, |list, args| {
         if list.is_none() && only_existing {
             return Ok(0);
@@ -205,42 +206,42 @@ fn push_command(
 
 pub(super) fn lpush(
     c: &Context,
-    _: &mut Session,
+    s: &mut Session,
     n: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    push_command(c, n, a, o, End::Left, false)
+    push_command(c, s, n, a, o, End::Left, false)
 }
 
 pub(super) fn rpush(
     c: &Context,
-    _: &mut Session,
+    s: &mut Session,
     n: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    push_command(c, n, a, o, End::Right, false)
+    push_command(c, s, n, a, o, End::Right, false)
 }
 
 pub(super) fn lpushx(
     c: &Context,
-    _: &mut Session,
+    s: &mut Session,
     n: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    push_command(c, n, a, o, End::Left, true)
+    push_command(c, s, n, a, o, End::Left, true)
 }
 
 pub(super) fn rpushx(
     c: &Context,
-    _: &mut Session,
+    s: &mut Session,
     n: Millis,
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    push_command(c, n, a, o, End::Right, true)
+    push_command(c, s, n, a, o, End::Right, true)
 }
 
 /// `LPOP`/`RPOP key [count]`
@@ -263,7 +264,7 @@ fn pop_command(
         },
         _ => None,
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let popped = change(store, args.key(store), now, false, args, |list, _| {
         let Some(list) = list else {
             return Ok(None);
@@ -379,12 +380,12 @@ pub(super) fn lindex(
 /// `LSET key index element`: the key first, then the index.
 pub(super) fn lset(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let set = change(store, args.key(store), now, true, args, |list, args| {
         let Some(list) = list else {
             return Err(NO_SUCH_KEY);
@@ -409,7 +410,7 @@ pub(super) fn lset(
 /// no pivot, 0 if there's no list.
 pub(super) fn linsert(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -422,7 +423,7 @@ pub(super) fn linsert(
     } else {
         return reply_error(out, SYNTAX_ERROR);
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let len = change(store, args.key(store), now, true, args, |list, args| {
         let Some(list) = list else {
             return Ok(0);
@@ -444,7 +445,7 @@ pub(super) fn linsert(
 /// `LREM key count element`
 pub(super) fn lrem(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -452,7 +453,7 @@ pub(super) fn lrem(
     let Some(count) = resp::parse_int(args.get(2)) else {
         return reply_error(out, NOT_AN_INTEGER);
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let removed = change(store, args.key(store), now, false, args, |list, args| {
         let Some(list) = list else {
             return Ok(0);
@@ -474,7 +475,7 @@ pub(super) fn lrem(
 /// `LTRIM key start stop`
 pub(super) fn ltrim(
     ctx: &Context,
-    _: &mut Session,
+    session: &mut Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -483,7 +484,7 @@ pub(super) fn ltrim(
     else {
         return reply_error(out, NOT_AN_INTEGER);
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let trimmed = change(store, args.key(store), now, false, args, |list, _| {
         if let Some(list) = list {
             let range = range(start, stop, list.len());
@@ -599,7 +600,7 @@ pub(super) fn lmove(
     let (Some(from), Some(to)) = (end_of(args.get(3)), end_of(args.get(4))) else {
         return reply_error(out, SYNTAX_ERROR);
     };
-    match move_element(ctx, now, args, from, to) {
+    match move_element(ctx, session, now, args, from, to) {
         Ok(Some(element)) => resp::write_bulk(out, &element),
         Ok(None) => out.extend_from_slice(session.null()),
         Err(msg) => resp::write_error(out, msg),
@@ -615,7 +616,7 @@ pub(super) fn rpoplpush(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    match move_element(ctx, now, args, End::Right, End::Left) {
+    match move_element(ctx, session, now, args, End::Right, End::Left) {
         Ok(Some(element)) => resp::write_bulk(out, &element),
         Ok(None) => out.extend_from_slice(session.null()),
         Err(msg) => resp::write_error(out, msg),
@@ -627,12 +628,13 @@ pub(super) fn rpoplpush(
 /// the element, `None` if the source is empty, or the error to reply.
 fn move_element(
     ctx: &Context,
+    session: &Session,
     now: Millis,
     args: &Args<'_>,
     from: End,
     to: End,
 ) -> Result<Option<Vec<u8>>, &'static [u8]> {
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let moved = store.update_pair(args.key(store), args.key_at(store, 2), now, true, |pair| {
         // In Redis' order: the source's type, its emptiness, then the
         // destination's type.
@@ -678,12 +680,12 @@ pub(super) fn blmove(
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
         let (Some(from), Some(to)) = (end_of(args.get(3)), end_of(args.get(4))) else {
             resp::write_error(out, SYNTAX_ERROR);
             return Attempt::Done;
         };
-        blocking_move(ctx, now, args, out, from, to, 5)
+        blocking_move(ctx, session, now, args, out, from, to, 5)
     })
 }
 
@@ -695,14 +697,16 @@ pub(super) fn brpoplpush(
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
-        blocking_move(ctx, now, args, out, End::Right, End::Left, 3)
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
+        blocking_move(ctx, session, now, args, out, End::Right, End::Left, 3)
     })
 }
 
 /// `LMOVE`, blocking while the source is empty: the timeout comes first.
+#[allow(clippy::too_many_arguments)]
 fn blocking_move(
     ctx: &Context,
+    session: &Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -717,7 +721,7 @@ fn blocking_move(
             return Attempt::Done;
         }
     };
-    match move_element(ctx, now, args, from, to) {
+    match move_element(ctx, session, now, args, from, to) {
         Ok(Some(element)) => resp::write_bulk(out, &element),
         Ok(None) => {
             return Attempt::Wait {
@@ -738,6 +742,7 @@ fn blocking_move(
 /// list, replying its key and the element.
 fn blocking_pop(
     ctx: &Context,
+    session: &Session,
     now: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -750,7 +755,7 @@ fn blocking_pop(
             return Attempt::Done;
         }
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     let keys = 1..args.len() - 1;
     for k in keys.clone() {
         let popped = change(store, args.key_at(store, k), now, false, args, |list, _| {
@@ -787,8 +792,8 @@ pub(super) fn blpop(
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
-        blocking_pop(ctx, now, args, out, End::Left)
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
+        blocking_pop(ctx, session, now, args, out, End::Left)
     })
 }
 
@@ -799,8 +804,8 @@ pub(super) fn brpop(
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
-        blocking_pop(ctx, now, args, out, End::Right)
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
+        blocking_pop(ctx, session, now, args, out, End::Right)
     })
 }
 
@@ -813,7 +818,7 @@ pub(super) fn lmpop(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    if let Attempt::Wait { .. } = mpop(ctx, now, args, out, 1) {
+    if let Attempt::Wait { .. } = mpop(ctx, session, now, args, out, 1) {
         out.extend_from_slice(null_array(session));
     }
     Reply::Written
@@ -827,14 +832,21 @@ pub(super) fn blmpop(
     a: &Args<'_>,
     o: &mut Vec<u8>,
 ) -> Reply {
-    blocking::block(c, s, n, a, o, |ctx, _, now, args, out| {
-        mpop(ctx, now, args, out, 2)
+    blocking::block(c, s, n, a, o, |ctx, session, now, args, out| {
+        mpop(ctx, session, now, args, out, 2)
     })
 }
 
 /// `LMPOP` with its `numkeys` at argument `at`, or `BLMPOP` (at 2, after
 /// the timeout, which is read after the other arguments).
-fn mpop(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, at: usize) -> Attempt {
+fn mpop(
+    ctx: &Context,
+    session: &Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+    at: usize,
+) -> Attempt {
     let error = |out: &mut Vec<u8>, msg: &[u8]| {
         resp::write_error(out, msg);
         Attempt::Done
@@ -872,7 +884,7 @@ fn mpop(ctx: &Context, now: Millis, args: &Args<'_>, out: &mut Vec<u8>, at: usiz
     } else {
         None
     };
-    let store = &*ctx.store;
+    let store = ctx.db(session);
     for k in keys.clone() {
         let popped = change(store, args.key_at(store, k), now, false, args, |list, _| {
             let Some(list) = list else {

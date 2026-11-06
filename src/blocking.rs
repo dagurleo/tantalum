@@ -104,6 +104,8 @@ pub struct Waiter {
     attempt: Try,
     client: u64,
     resp3: bool,
+    /// The database it's blocked in.
+    db: u32,
     /// Its connection's socket, for the writer to send the reply on (-1:
     /// none, or one only its connection may write to: TLS, a subscriber).
     socket: RawFd,
@@ -215,6 +217,7 @@ impl Waiter {
             in_script: false,
             name: None,
             resp3: self.resp3,
+            db: self.db,
             commands: 0,
             hits: 0,
             misses: 0,
@@ -251,6 +254,7 @@ impl Waiter {
         if !crate::aof::logging() {
             return;
         }
+        crate::aof::select(self.db as usize);
         let args = Args::new(&self.buf, &self.ranges);
         if let Some(command) = crate::cmd::find_write_command(args.get(0)) {
             crate::aof::record(command, &args, reply);
@@ -348,6 +352,7 @@ pub(crate) fn block(
         attempt,
         client: session.id,
         resp3: session.resp3,
+        db: session.db,
         // A subscriber's connection writes messages while it waits.
         socket: if session.pubsub.is_none() {
             session.socket
@@ -358,7 +363,7 @@ pub(crate) fn block(
         waker: Mutex::new(None),
         on_change: on_change.then(|| Arc::new(AtomicBool::new(false))),
     });
-    let store = &ctx.store;
+    let store = ctx.store.db(session.db as usize);
     let blocked = Blocked {
         waiter,
         store: store.clone(),
@@ -388,8 +393,8 @@ pub(crate) fn block(
 /// Serves the clients waiting on keys that got data. Commands call this
 /// after running when [`Store::has_ready`].
 pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
-    let store = &*ctx.store;
-    while let Some(key) = store.take_ready() {
+    while let Some((db, key)) = ctx.store.take_ready() {
+        let store = ctx.store.db(db);
         let key = store.key(&key);
         // Stream readers all read what came: one that found nothing new
         // doesn't mean the next won't.
@@ -531,6 +536,7 @@ mod tests {
         Waiter {
             state: AtomicU8::new(ARMING),
             kind: Kind::List,
+            db: 0,
             buf: Box::new([]),
             ranges: Box::new([]),
             keys: 0..0,

@@ -771,6 +771,9 @@ async fn handle_uring(
         // Whether a command blocked, during which more may have been read.
         let mut blocked_meanwhile = false;
         loop {
+            // Prefetching in the database it has selected. (A `SELECT` in the
+            // batch only makes the rest of its prefetching useless.)
+            let store = ctx.db(&session);
             let parsed = batch.parse(&rbuf, pos, store);
             for i in 0..batch.len() {
                 batch.prefetch(i, store);
@@ -1305,6 +1308,9 @@ async fn serve_stream(
         // Whether a command blocked, during which more may have been read.
         let mut blocked_meanwhile = false;
         loop {
+            // Prefetching in the database it has selected. (A `SELECT` in the
+            // batch only makes the rest of its prefetching useless.)
+            let store = ctx.db(&session);
             let parsed = batch.parse(&rbuf, pos, store);
             if std::mem::take(&mut read_first)
                 && parsed.is_ok()
