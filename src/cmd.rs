@@ -1342,7 +1342,11 @@ fn save(ctx: &Context, _: &mut Session, _: Millis, _: &Args<'_>, out: &mut Vec<u
 /// `BGSAVE`: writes a snapshot on another thread.
 fn bgsave(ctx: &Context, _: &mut Session, _: Millis, args: &Args<'_>, out: &mut Vec<u8>) -> Reply {
     match &ctx.snapshots {
-        _ if args.len() > 1 => resp::write_error(out, SYNTAX_ERROR),
+        _ if args.len() > 2
+            || (args.len() == 2 && !args.get(1).eq_ignore_ascii_case(b"SCHEDULE")) =>
+        {
+            resp::write_error(out, SYNTAX_ERROR)
+        }
         None => resp::write_error(out, SNAPSHOTS_OFF),
         Some(snapshots) if snapshots.save_in_background() => {
             resp::write_simple(out, b"Background saving started");
@@ -2170,113 +2174,230 @@ fn invalid_expire_time(out: &mut Vec<u8>, name: &str) {
     );
 }
 
-/// `INFO` in Redis' `key:value` format, with the fields tools commonly read.
-/// Sections are accepted but everything is always returned.
-fn info(ctx: &Context, session: &mut Session, _: Millis, _: &Args<'_>, out: &mut Vec<u8>) -> Reply {
+/// `INFO [section ...]` in Redis' `key:value` format, with the fields tools
+/// commonly read. What isn't kept reads as Redis shows it when it's not in use.
+fn info(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
     use std::fmt::Write;
     // Include this connection's latest counts.
     ctx.publish(session);
+    let asked: Vec<Vec<u8>> = (1..args.len())
+        .map(|i| args.get(i).to_ascii_lowercase())
+        .collect();
+    let named = |name: &[u8]| asked.iter().any(|a| a == name);
+    let everything = named(b"all") || named(b"everything");
+    let by_default = asked.is_empty() || named(b"default");
+    // `commandstats` and `latencystats` only when asked for, as in Redis.
+    let wants =
+        |name: &str, default: bool| everything || (by_default && default) || named(name.as_bytes());
     let server = ctx.stats();
     let stats = ctx.store.stats();
     let peak = ctx.note_memory_peak().max(stats.used_memory);
     let mut s = String::new();
-    let _ = write!(
-        s,
-        "# Server\r\nredis_version:{REDIS_VERSION}\r\ntantalum_version:{}\r\nredis_mode:standalone\r\n\
-         process_id:{}\r\nuptime_in_seconds:{}\r\nuptime_in_days:{}\r\n\r\n\
-         # Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\n\r\n\
-         # Memory\r\nused_memory:{}\r\nused_memory_human:{}\r\nused_memory_peak:{}\r\n\
-         used_memory_peak_human:{}\r\n",
-        env!("CARGO_PKG_VERSION"),
-        std::process::id(),
-        server.uptime.as_secs(),
-        server.uptime.as_secs() / 86_400,
-        server.connected_clients,
-        ctx.settings.maxclients,
-        ctx.store.blocked_clients(),
-        stats.used_memory,
-        bytes_to_human(stats.used_memory),
-        peak,
-        bytes_to_human(peak),
-    );
-    // Where used_memory goes: packed entries (and how much of that is live),
-    // values too big to pack, hash tables, and connection buffers.
-    let _ = write!(
-        s,
-        "segment_bytes:{}\r\nsegment_live_bytes:{}\r\nexternal_bytes:{}\r\ntable_bytes:{}\r\n\
-         mem_clients_normal:{}\r\n",
-        stats.segment_bytes,
-        stats.live_bytes,
-        stats.external_bytes,
-        stats.table_bytes,
-        stats.client_bytes,
-    );
-    if let Some(rss) = rss_bytes() {
-        let _ = write!(s, "used_memory_rss:{rss}\r\n");
+    if wants("server", true) {
+        let (os, machine) = uname();
+        let _ = write!(
+            s,
+            "# Server\r\nredis_version:{REDIS_VERSION}\r\ntantalum_version:{}\r\nredis_git_sha1:00000000\r\n\
+             redis_git_dirty:0\r\nredis_mode:standalone\r\nos:{os} {machine}\r\narch_bits:{}\r\n\
+             process_id:{}\r\nrun_id:{}\r\nuptime_in_seconds:{}\r\nuptime_in_days:{}\r\nhz:10\r\n\
+             configured_hz:10\r\n\r\n",
+            env!("CARGO_PKG_VERSION"),
+            usize::BITS,
+            std::process::id(),
+            ctx.run_id(),
+            server.uptime.as_secs(),
+            server.uptime.as_secs() / 86_400,
+        );
     }
-    let _ = write!(
-        s,
-        "maxmemory:{}\r\nmaxmemory_policy:{}\r\n\r\n",
-        stats.maxmemory,
-        stats.policy.name(),
-    );
-    // Redis' field names, so monitoring tools find them.
-    let _ = write!(s, "# Persistence\r\nloading:0\r\n");
-    match &ctx.snapshots {
-        Some(snapshots) => {
-            let status = snapshots.status();
+    if wants("clients", true) {
+        let _ = write!(
+            s,
+            "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\n\
+             tracking_clients:0\r\n\r\n",
+            server.connected_clients,
+            ctx.settings.maxclients,
+            ctx.store.blocked_clients(),
+        );
+    }
+    if wants("memory", true) {
+        let _ = write!(
+            s,
+            "# Memory\r\nused_memory:{}\r\nused_memory_human:{}\r\nused_memory_peak:{}\r\n\
+             used_memory_peak_human:{}\r\n",
+            stats.used_memory,
+            bytes_to_human(stats.used_memory),
+            peak,
+            bytes_to_human(peak),
+        );
+        // Where used_memory goes: packed entries (and how much of that is live),
+        // values too big to pack, hash tables, and connection buffers.
+        let _ = write!(
+            s,
+            "segment_bytes:{}\r\nsegment_live_bytes:{}\r\nexternal_bytes:{}\r\ntable_bytes:{}\r\n\
+             mem_clients_normal:{}\r\n",
+            stats.segment_bytes,
+            stats.live_bytes,
+            stats.external_bytes,
+            stats.table_bytes,
+            stats.client_bytes,
+        );
+        if let Some(rss) = rss_bytes() {
             let _ = write!(
                 s,
-                "snapshots:on\r\nsnapshot_file:{}\r\nrdb_changes_since_last_save:{}\r\n\
-                 rdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\n",
-                snapshots.path.display(),
-                snapshots.unsaved_changes(),
-                u8::from(snapshots.saving_in_background()),
-                status.last_save,
-                if status.last_ok { "ok" } else { "err" },
+                "used_memory_rss:{rss}\r\nused_memory_rss_human:{}\r\nmem_fragmentation_ratio:{:.2}\r\n",
+                bytes_to_human(rss),
+                rss as f64 / stats.used_memory.max(1) as f64,
             );
         }
-        None => {
-            let _ = write!(s, "snapshots:off\r\n");
+        let _ = write!(
+            s,
+            "maxmemory:{}\r\nmaxmemory_human:{}\r\nmaxmemory_policy:{}\r\nmem_allocator:mimalloc\r\n\r\n",
+            stats.maxmemory,
+            bytes_to_human(stats.maxmemory),
+            stats.policy.name(),
+        );
+    }
+    if wants("persistence", true) {
+        // Redis' field names, so monitoring tools find them.
+        let _ = write!(s, "# Persistence\r\nloading:0\r\nasync_loading:0\r\n");
+        match &ctx.snapshots {
+            Some(snapshots) => {
+                let status = snapshots.status();
+                let _ = write!(
+                    s,
+                    "snapshots:on\r\nsnapshot_file:{}\r\nrdb_changes_since_last_save:{}\r\n\
+                     rdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\n",
+                    snapshots.path.display(),
+                    snapshots.unsaved_changes(),
+                    u8::from(snapshots.saving_in_background()),
+                    status.last_save,
+                    if status.last_ok { "ok" } else { "err" },
+                );
+            }
+            None => {
+                let _ = write!(
+                    s,
+                    "snapshots:off\r\nrdb_changes_since_last_save:0\r\nrdb_bgsave_in_progress:0\r\n\
+                     rdb_last_save_time:{}\r\nrdb_last_bgsave_status:ok\r\n",
+                    unix_seconds() - server.uptime.as_secs() as i64,
+                );
+            }
         }
+        match ctx.aof() {
+            Some(aof) => s.push_str(&aof.info()),
+            None => s.push_str("aof_enabled:0\r\naof_rewrite_in_progress:0\r\n"),
+        }
+        s.push_str("\r\n");
     }
-    match ctx.aof() {
-        Some(aof) => s.push_str(&aof.info()),
-        None => s.push_str("aof_enabled:0\r\n"),
+    if wants("stats", true) {
+        let _ = write!(
+            s,
+            "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
+             rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
+             keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
+             pubsubshard_channels:{}\r\nnative_scripts:{}\r\nnative_script_fallbacks:{}\r\n\r\n",
+            server.total_connections,
+            server.total_commands,
+            server.rejected_connections,
+            stats.expired_keys,
+            stats.evicted_keys,
+            server.keyspace_hits,
+            server.keyspace_misses,
+            ctx.pubsub.channel_count(false),
+            ctx.pubsub.pattern_count(),
+            ctx.pubsub.channel_count(true),
+            ctx.scripting_stats().0,
+            ctx.scripting_stats().1,
+        );
     }
-    s.push_str("\r\n");
-    let _ = write!(
-        s,
-        "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
-         rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
-         keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
-         pubsubshard_channels:{}\r\nnative_scripts:{}\r\nnative_script_fallbacks:{}\r\n\r\n\
-         # Keyspace\r\n",
-        server.total_connections,
-        server.total_commands,
-        server.rejected_connections,
-        stats.expired_keys,
-        stats.evicted_keys,
-        server.keyspace_hits,
-        server.keyspace_misses,
-        ctx.pubsub.channel_count(false),
-        ctx.pubsub.pattern_count(),
-        ctx.pubsub.channel_count(true),
-        ctx.scripting_stats().0,
-        ctx.scripting_stats().1,
-    );
-    for db in ctx.store.live() {
-        let (keys, with_ttl) = db.key_counts();
-        if keys > 0 {
-            let _ = write!(
-                s,
-                "db{}:keys={keys},expires={with_ttl},avg_ttl=0\r\n",
-                db.index()
-            );
+    if wants("replication", true) {
+        let _ = write!(
+            s,
+            "# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_failover_state:no-failover\r\n\
+             master_replid:{}\r\nmaster_replid2:0000000000000000000000000000000000000000\r\n\
+             master_repl_offset:0\r\nsecond_repl_offset:-1\r\nrepl_backlog_active:0\r\n\
+             repl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:0\r\nrepl_backlog_histlen:0\r\n\r\n",
+            ctx.run_id(),
+        );
+    }
+    if wants("cpu", true) {
+        let (user, system) = cpu_seconds();
+        let _ = write!(
+            s,
+            "# CPU\r\nused_cpu_sys:{system:.6}\r\nused_cpu_user:{user:.6}\r\nused_cpu_sys_children:0.000000\r\n\
+             used_cpu_user_children:0.000000\r\n\r\n",
+        );
+    }
+    if wants("modules", true) {
+        s.push_str("# Modules\r\n\r\n");
+    }
+    if wants("commandstats", false) {
+        s.push_str("# Commandstats\r\n\r\n");
+    }
+    if wants("errorstats", true) {
+        s.push_str("# Errorstats\r\n\r\n");
+    }
+    if wants("latencystats", false) {
+        s.push_str("# Latencystats\r\n\r\n");
+    }
+    if wants("cluster", true) {
+        s.push_str("# Cluster\r\ncluster_enabled:0\r\n\r\n");
+    }
+    if wants("keyspace", true) {
+        s.push_str("# Keyspace\r\n");
+        for db in ctx.store.live() {
+            let (keys, with_ttl) = db.key_counts();
+            if keys > 0 {
+                let _ = write!(
+                    s,
+                    "db{}:keys={keys},expires={with_ttl},avg_ttl=0\r\n",
+                    db.index()
+                );
+            }
         }
     }
     resp::write_verbatim_text(out, s.as_bytes(), session.resp3);
     Reply::Written
+}
+
+/// The system's name and machine, as `uname` gives them.
+fn uname() -> (String, String) {
+    // SAFETY: `utsname` is plain bytes, and `uname` fills in what it's given.
+    let name = unsafe {
+        let mut name: libc::utsname = std::mem::zeroed();
+        libc::uname(&mut name);
+        name
+    };
+    let text = |field: &[libc::c_char]| {
+        let bytes: Vec<u8> = field
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c as u8)
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    (
+        format!("{} {}", text(&name.sysname), text(&name.release)),
+        text(&name.machine),
+    )
+}
+
+/// The CPU the process has used, in seconds: in user code, and in the system.
+fn cpu_seconds() -> (f64, f64) {
+    // SAFETY: `rusage` is plain numbers, and `getrusage` fills in what it's given.
+    let usage = unsafe {
+        let mut usage: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+        usage
+    };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    (seconds(usage.ru_utime), seconds(usage.ru_stime))
 }
 
 /// `bytes` as Redis' `INFO` shows them for people.
