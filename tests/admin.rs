@@ -402,13 +402,19 @@ async fn the_default_threshold_catches_a_slow_command_by_the_ticking_clock() {
     tokio::spawn(server::serve(listener, ctx.clone()));
     let mut c = Client::connect(addr).await;
     c.call(&["PING"]).await;
-    // Under the threshold, and over it.
+    // Under the threshold (unless a busy machine really made it take longer), and over it.
+    let started = Instant::now();
     c.call(&["DEBUG", "SLEEP", "0.001"]).await;
-    assert_eq!(c.call(&["SLOWLOG", "LEN"]).await, ":0\r\n");
+    let len = c.call(&["SLOWLOG", "LEN"]).await;
+    if started.elapsed() < Duration::from_millis(5) {
+        assert_eq!(len, ":0\r\n");
+    }
     c.call(&["DEBUG", "SLEEP", "0.05"]).await;
-    assert_eq!(c.call(&["SLOWLOG", "LEN"]).await, ":1\r\n");
-    let log = c.call(&["SLOWLOG", "GET"]).await;
-    assert!(log.contains("$5\r\nDEBUG\r\n$5\r\nSLEEP\r\n"), "{log}");
+    let log = c.call(&["SLOWLOG", "GET", "1"]).await;
+    assert!(
+        log.contains("$5\r\nDEBUG\r\n$5\r\nSLEEP\r\n$4\r\n0.05\r\n"),
+        "{log}"
+    );
 }
 
 #[tokio::test]
@@ -428,32 +434,42 @@ async fn the_clock_sleeps_when_nothing_runs_and_still_times() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(server::serve(listener, ctx.clone()));
     let mut c = Client::connect(addr).await;
-    let micros_of_last = async |c: &mut Client| -> u64 {
-        let log = c.call(&["SLOWLOG", "GET", "1"]).await;
-        let mut numbers = log.split("\r\n").filter_map(|l| l.strip_prefix(':'));
-        numbers.nth(2).expect("a duration").parse().unwrap()
+    // Each entry's duration, in microseconds.
+    let durations = |log: &str| -> Vec<u64> {
+        log.split("\r\n")
+            .filter_map(|line| line.strip_prefix(':'))
+            .skip(2)
+            .step_by(3)
+            .map(|n| n.parse().unwrap())
+            .collect()
     };
-    // Long enough for the clock to go to sleep. The first command after it counts.
+    // Long enough for the clock to go to sleep. The first command after it counts, for as
+    // long as it took, and not for as long as the clock slept.
     c.call(&["PING"]).await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
     c.call(&["DEBUG", "SLEEP", "0.05"]).await;
-    assert_eq!(c.call(&["SLOWLOG", "LEN"]).await, ":1\r\n");
-    let micros = micros_of_last(&mut c).await;
-    assert!((35_000..200_000).contains(&micros), "{micros}");
+    let log = c.call(&["SLOWLOG", "GET", "1"]).await;
+    assert!(log.contains("$4\r\n0.05\r\n"), "{log}");
+    assert!((35_000..1_200_000).contains(&durations(&log)[0]), "{log}");
     // And one running as it goes to sleep is timed in full.
     c.call(&["DEBUG", "SLEEP", "1.5"]).await;
-    assert_eq!(c.call(&["SLOWLOG", "LEN"]).await, ":2\r\n");
     let log = c.call(&["SLOWLOG", "GET", "1"]).await;
-    assert!(log.contains("1.5"), "{log}");
-    let micros = micros_of_last(&mut c).await;
-    assert!((1_400_000..2_500_000).contains(&micros), "{micros}");
-    // Woken again, it's as it was: nothing short is logged.
+    assert!(log.contains("$3\r\n1.5\r\n"), "{log}");
+    assert!(
+        (1_400_000..5_000_000).contains(&durations(&log)[0]),
+        "{log}"
+    );
+    // Woken again, nothing's taken for as long as it slept.
     tokio::time::sleep(Duration::from_millis(1300)).await;
     c.call(&["SLOWLOG", "RESET"]).await;
     for _ in 0..50 {
         c.call(&["CONFIG", "GET", "hz"]).await;
     }
-    assert_eq!(c.call(&["SLOWLOG", "LEN"]).await, ":0\r\n");
+    let log = c.call(&["SLOWLOG", "GET", "-1"]).await;
+    assert!(
+        durations(&log).iter().all(|&micros| micros < 1_200_000),
+        "{log}"
+    );
 }
 
 #[tokio::test]

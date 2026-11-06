@@ -2758,6 +2758,19 @@ impl Store {
         self.base().ready.blocked.load(Relaxed).max(0) as usize
     }
 
+    /// Clients really waiting now, for tests to go by. `blocked_clients` counts one from
+    /// before its command's last look at its keys, as a write must know to wake it, so a
+    /// write right then can still be the answer to that look.
+    pub fn clients_waiting(&self) -> usize {
+        self.base()
+            .ready
+            .waiters
+            .lock()
+            .values()
+            .filter(|waiter| waiter.is_waiting())
+            .count()
+    }
+
     /// The shards a native script runs holding: every one if this thread
     /// holds them already (`EXEC`), else none yet but those in `start`,
     /// taken in order. The script asks for the rest ([`ScriptShards::hold`])

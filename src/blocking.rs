@@ -169,6 +169,11 @@ impl Waiter {
         }
     }
 
+    /// Whether it's waiting, past its command's last look at its keys.
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.state.load(Ordering::Acquire) == WAITING
+    }
+
     /// Done arming, unless a key got data meanwhile (then `false`, to try
     /// again).
     fn arm(&self) -> bool {
