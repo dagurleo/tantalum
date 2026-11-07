@@ -1,233 +1,208 @@
-# Tantalum 0.24.0 (c96ce6b), one build for every line. In this run the script's own version line failed (the "error" below): fixed since.
+# Tantalum 0.25.0, one build for every line.
 == VM health: Redis SET, one core, should be about 270k
-Totals 292177.96
+Totals 291844.15
 == examples
 # 7.0.0-38-generic, 4 CPUs, Intel(R) Xeon(R) E-2388G CPU @ 3.20GHz
-# error: --version needs a value; Redis server v=8.10.3; Valkey server v=9.1.3
+# Redis server v=8.10.3; Valkey server v=9.1.3
 # server on CPU 0, memtier 3 x 80 clients on 1-3; 1000000 items, 3 rounds of 12 s, persistence off
+# Tantalum 0.25.0
 # example: cache
-memory cache tantalum rss_mb 1025.2 bytes_per_item 1065.5
-memory cache tantalum-uring rss_mb 1026.0 bytes_per_item 1066.3
-memory cache redis rss_mb 1322.5 bytes_per_item 1372.8
-memory cache valkey rss_mb 1329.1 bytes_per_item 1380.5
+memory cache tantalum rss_mb 1024.7 bytes_per_item 1065.3
+memory cache tantalum-uring rss_mb 1025.9 bytes_per_item 1066.5
+memory cache redis rss_mb 1321.1 bytes_per_item 1371.3
+memory cache valkey rss_mb 1329.5 bytes_per_item 1380.9
 check same DBSIZE: 1000000
 check same STRLEN memtier-1: 1024
-cache round 1 tantalum P1 ops 280879 misses 0.00 p50 0.79100 p99 1.44700 kb_per_op 1.0436
-cache round 1 tantalum P16 ops 713723 misses 0.00 p50 5.15100 p99 9.66300 kb_per_op 1.0436
-cache round 1 tantalum-uring P1 ops 230662 misses 0.00 p50 0.88700 p99 2.55900 kb_per_op 1.0436
-cache round 1 tantalum-uring P16 ops 1386152 misses 0.00 p50 2.76700 p99 3.48700 kb_per_op 1.0436
-cache round 1 redis P1 ops 257484 misses 0.00 p50 0.90300 p99 1.79900 kb_per_op 1.0436
-cache round 1 redis P16 ops 1094116 misses 0.00 p50 2.97500 p99 5.47100 kb_per_op 1.0436
-cache round 1 valkey P1 ops 258750 misses 0.00 p50 0.90300 p99 1.79900 kb_per_op 1.0436
-cache round 1 valkey P16 ops 1074734 misses 0.00 p50 3.00700 p99 5.43900 kb_per_op 1.0436
-cache round 2 tantalum-uring P1 ops 291529 misses 0.00 p50 0.79900 p99 1.08700 kb_per_op 1.0436
-cache round 2 tantalum-uring P16 ops 1004338 misses 0.00 p50 3.56700 p99 7.10300 kb_per_op 1.0436
-cache round 2 redis P1 ops 183909 misses 0.00 p50 1.03100 p99 3.29500 kb_per_op 1.0436
-cache round 2 redis P16 ops 880512 misses 0.00 p50 4.12700 p99 8.95900 kb_per_op 1.0436
-cache round 2 valkey P1 ops 189719 misses 0.00 p50 1.04700 p99 3.40700 kb_per_op 1.0436
-cache round 2 valkey P16 ops 731837 misses 0.00 p50 4.83100 p99 11.45500 kb_per_op 1.0436
-cache round 2 tantalum P1 ops 275173 misses 0.00 p50 0.81500 p99 1.35100 kb_per_op 1.0436
-cache round 2 tantalum P16 ops 1115333 misses 0.00 p50 3.37500 p99 5.66300 kb_per_op 1.0436
-cache round 3 redis P1 ops 259212 misses 0.00 p50 0.89500 p99 1.79100 kb_per_op 1.0436
-cache round 3 redis P16 ops 1095136 misses 0.00 p50 2.95900 p99 5.43900 kb_per_op 1.0436
-cache round 3 valkey P1 ops 258752 misses 0.00 p50 0.90300 p99 1.80700 kb_per_op 1.0436
-cache round 3 valkey P16 ops 1067760 misses 0.00 p50 3.03900 p99 5.63100 kb_per_op 1.0436
-cache round 3 tantalum P1 ops 286522 misses 0.00 p50 0.78300 p99 1.27100 kb_per_op 1.0436
-cache round 3 tantalum P16 ops 1158053 misses 0.00 p50 3.26300 p99 4.41500 kb_per_op 1.0436
-cache round 3 tantalum-uring P1 ops 290353 misses 0.00 p50 0.79900 p99 1.07100 kb_per_op 1.0436
-cache round 3 tantalum-uring P16 ops 1289635 misses 0.00 p50 2.95900 p99 3.74300 kb_per_op 1.0436
+cache round 1 tantalum P1 ops 287680 misses 0.00 p50 0.78300 p99 1.32700 kb_per_op 1.0436
+cache round 1 tantalum P16 ops 1250170 misses 0.00 p50 3.03900 p99 4.19100 kb_per_op 1.0436
+cache round 1 tantalum-uring P1 ops 292742 misses 0.00 p50 0.79100 p99 1.36700 kb_per_op 1.0436
+cache round 1 tantalum-uring P16 ops 1410673 misses 0.00 p50 2.68700 p99 3.40700 kb_per_op 1.0436
+cache round 1 redis P1 ops 257444 misses 0.00 p50 0.90300 p99 1.79900 kb_per_op 1.0436
+cache round 1 redis P16 ops 1074164 misses 0.00 p50 3.02300 p99 5.59900 kb_per_op 1.0436
+cache round 1 valkey P1 ops 255596 misses 0.00 p50 0.90300 p99 1.81500 kb_per_op 1.0436
+cache round 1 valkey P16 ops 1066675 misses 0.00 p50 3.02300 p99 5.50300 kb_per_op 1.0436
+cache round 2 tantalum-uring P1 ops 307966 misses 0.00 p50 0.77500 p99 0.94300 kb_per_op 1.0436
+cache round 2 tantalum-uring P16 ops 1465351 misses 0.00 p50 2.60700 p99 3.07100 kb_per_op 1.0436
+cache round 2 redis P1 ops 259350 misses 0.00 p50 0.89500 p99 1.78300 kb_per_op 1.0436
+cache round 2 redis P16 ops 1090199 misses 0.00 p50 2.97500 p99 5.37500 kb_per_op 1.0436
+cache round 2 valkey P1 ops 258313 misses 0.00 p50 0.89500 p99 1.80700 kb_per_op 1.0436
+cache round 2 valkey P16 ops 1064949 misses 0.00 p50 3.02300 p99 5.47100 kb_per_op 1.0436
+cache round 2 tantalum P1 ops 296082 misses 0.00 p50 0.76700 p99 1.20700 kb_per_op 1.0436
+cache round 2 tantalum P16 ops 1280194 misses 0.00 p50 2.97500 p99 3.75900 kb_per_op 1.0436
+cache round 3 redis P1 ops 256316 misses 0.00 p50 0.89500 p99 1.79900 kb_per_op 1.0436
+cache round 3 redis P16 ops 1086030 misses 0.00 p50 2.99100 p99 5.40700 kb_per_op 1.0436
+cache round 3 valkey P1 ops 259140 misses 0.00 p50 0.90300 p99 1.79900 kb_per_op 1.0436
+cache round 3 valkey P16 ops 1060339 misses 0.00 p50 3.03900 p99 5.53500 kb_per_op 1.0436
+cache round 3 tantalum P1 ops 295377 misses 0.00 p50 0.77500 p99 1.20700 kb_per_op 1.0436
+cache round 3 tantalum P16 ops 1310753 misses 0.00 p50 2.92700 p99 3.40700 kb_per_op 1.0436
+cache round 3 tantalum-uring P1 ops 298011 misses 0.00 p50 0.79100 p99 1.11100 kb_per_op 1.0436
+cache round 3 tantalum-uring P16 ops 1418174 misses 0.00 p50 2.68700 p99 3.24700 kb_per_op 1.0436
 # example: sessions
-memory sessions tantalum rss_mb 154.7 bytes_per_item 152.9
-memory sessions tantalum-uring rss_mb 155.1 bytes_per_item 153.2
-memory sessions redis rss_mb 194.8 bytes_per_item 190.5
-memory sessions valkey rss_mb 196.2 bytes_per_item 192.5
+memory sessions tantalum rss_mb 154.5 bytes_per_item 152.8
+memory sessions tantalum-uring rss_mb 154.8 bytes_per_item 153.1
+memory sessions redis rss_mb 195.0 bytes_per_item 190.5
+memory sessions valkey rss_mb 196.3 bytes_per_item 192.5
 check same DBSIZE: 1000000
 check same HGETALL session:12345: user
-sessions round 1 tantalum P1 ops 303241 misses 0.00 p50 0.71900 p99 1.15900 kb_per_op 0.1827
-sessions round 1 tantalum P16 ops 2021308 misses 0.00 p50 1.84700 p99 2.68700 kb_per_op 0.1827
-sessions round 1 tantalum-uring P1 ops 313776 misses 0.00 p50 0.75100 p99 1.22300 kb_per_op 0.1827
-sessions round 1 tantalum-uring P16 ops 1994763 misses 0.00 p50 1.86300 p99 3.08700 kb_per_op 0.1827
-sessions round 1 redis P1 ops 253141 misses 0.00 p50 0.91100 p99 1.83900 kb_per_op 0.1827
-sessions round 1 redis P16 ops 998814 misses 0.00 p50 3.83900 p99 5.27900 kb_per_op 0.1827
-sessions round 1 valkey P1 ops 217489 misses 0.00 p50 1.05500 p99 2.15900 kb_per_op 0.1827
-sessions round 1 valkey P16 ops 778175 misses 0.00 p50 5.05500 p99 6.49500 kb_per_op 0.1827
-sessions round 2 tantalum-uring P1 ops 321861 misses 0.00 p50 0.73500 p99 1.15100 kb_per_op 0.1827
-sessions round 2 tantalum-uring P16 ops 2012110 misses 0.00 p50 1.82300 p99 3.55100 kb_per_op 0.1827
-sessions round 2 redis P1 ops 255135 misses 0.00 p50 0.91100 p99 1.82300 kb_per_op 0.1827
-sessions round 2 redis P16 ops 1002862 misses 0.00 p50 3.79100 p99 6.11100 kb_per_op 0.1827
-sessions round 2 valkey P1 ops 220322 misses 0.00 p50 1.03900 p99 2.09500 kb_per_op 0.1827
-sessions round 2 valkey P16 ops 792428 misses 0.00 p50 4.95900 p99 6.39900 kb_per_op 0.1827
-sessions round 2 tantalum P1 ops 309379 misses 0.00 p50 0.70300 p99 1.13500 kb_per_op 0.1827
-sessions round 2 tantalum P16 ops 2031084 misses 0.00 p50 1.83100 p99 2.73500 kb_per_op 0.1827
-sessions round 3 redis P1 ops 252807 misses 0.00 p50 0.91900 p99 1.84700 kb_per_op 0.1827
-sessions round 3 redis P16 ops 1007708 misses 0.00 p50 3.80700 p99 5.15100 kb_per_op 0.1827
-sessions round 3 valkey P1 ops 217938 misses 0.00 p50 1.05500 p99 2.12700 kb_per_op 0.1827
-sessions round 3 valkey P16 ops 784345 misses 0.00 p50 4.99100 p99 6.68700 kb_per_op 0.1827
-sessions round 3 tantalum P1 ops 300615 misses 0.00 p50 0.71900 p99 1.17500 kb_per_op 0.1827
-sessions round 3 tantalum P16 ops 2008688 misses 0.00 p50 1.83900 p99 2.86300 kb_per_op 0.1827
-sessions round 3 tantalum-uring P1 ops 314160 misses 0.00 p50 0.75900 p99 0.89500 kb_per_op 0.1827
-sessions round 3 tantalum-uring P16 ops 1962750 misses 0.00 p50 1.86300 p99 3.74300 kb_per_op 0.1827
+sessions round 1 tantalum P1 ops 305138 misses 0.00 p50 0.71100 p99 1.16700 kb_per_op 0.1827
+sessions round 1 tantalum P16 ops 2004930 misses 0.00 p50 1.86300 p99 2.71900 kb_per_op 0.1827
+sessions round 1 tantalum-uring P1 ops 316346 misses 0.00 p50 0.74300 p99 1.17500 kb_per_op 0.1827
+sessions round 1 tantalum-uring P16 ops 1994977 misses 0.00 p50 1.86300 p99 3.23100 kb_per_op 0.1827
+sessions round 1 redis P1 ops 247192 misses 0.00 p50 0.93500 p99 1.88700 kb_per_op 0.1827
+sessions round 1 redis P16 ops 977264 misses 0.00 p50 3.90300 p99 6.01500 kb_per_op 0.1827
+sessions round 1 valkey P1 ops 217652 misses 0.00 p50 1.06300 p99 2.15900 kb_per_op 0.1827
+sessions round 1 valkey P16 ops 762462 misses 0.00 p50 5.15100 p99 6.91100 kb_per_op 0.1827
+sessions round 2 tantalum-uring P1 ops 322279 misses 0.00 p50 0.74300 p99 0.94300 kb_per_op 0.1827
+sessions round 2 tantalum-uring P16 ops 2043808 misses 0.00 p50 1.81500 p99 3.10300 kb_per_op 0.1827
+sessions round 2 redis P1 ops 253835 misses 0.00 p50 0.91100 p99 1.83100 kb_per_op 0.1827
+sessions round 2 redis P16 ops 1004692 misses 0.00 p50 3.82300 p99 4.99100 kb_per_op 0.1827
+sessions round 2 valkey P1 ops 220621 misses 0.00 p50 1.05500 p99 2.11100 kb_per_op 0.1827
+sessions round 2 valkey P16 ops 779030 misses 0.00 p50 4.99100 p99 7.26300 kb_per_op 0.1827
+sessions round 2 tantalum P1 ops 308330 misses 0.00 p50 0.70300 p99 1.16700 kb_per_op 0.1827
+sessions round 2 tantalum P16 ops 2037138 misses 0.00 p50 1.82300 p99 2.76700 kb_per_op 0.1827
+sessions round 3 redis P1 ops 253954 misses 0.00 p50 0.90300 p99 1.83100 kb_per_op 0.1827
+sessions round 3 redis P16 ops 1004021 misses 0.00 p50 3.82300 p99 5.02300 kb_per_op 0.1827
+sessions round 3 valkey P1 ops 221059 misses 0.00 p50 1.04700 p99 2.11100 kb_per_op 0.1827
+sessions round 3 valkey P16 ops 785457 misses 0.00 p50 4.99100 p99 6.49500 kb_per_op 0.1827
+sessions round 3 tantalum P1 ops 309946 misses 0.00 p50 0.70300 p99 1.12700 kb_per_op 0.1827
+sessions round 3 tantalum P16 ops 2001429 misses 0.00 p50 1.86300 p99 2.79900 kb_per_op 0.1827
+sessions round 3 tantalum-uring P1 ops 316530 misses 0.00 p50 0.75100 p99 1.15900 kb_per_op 0.1827
+sessions round 3 tantalum-uring P16 ops 1995816 misses 0.00 p50 1.87100 p99 3.05500 kb_per_op 0.1827
 # example: limiter
 check same EVALSHA a8f0924ce08e3fe56440ef4d1a154707d5969816 1 check:1: 1
 check same EVALSHA a8f0924ce08e3fe56440ef4d1a154707d5969816 1 check:1: 2
-limiter round 1 tantalum P1 ops 145424 misses 0.00 p50 1.60700 p99 1.94300 kb_per_op 0.0904
-limiter round 1 tantalum P16 ops 252093 misses 0.00 p50 15.23100 p99 15.99900 kb_per_op 0.0908
-limiter round 1 tantalum-uring P1 ops 156039 misses 0.00 p50 1.51900 p99 1.83100 kb_per_op 0.0905
-limiter round 1 tantalum-uring P16 ops 256426 misses 0.00 p50 14.97500 p99 15.74300 kb_per_op 0.0909
-limiter round 1 redis P1 ops 222920 misses 0.00 p50 1.03900 p99 2.09500 kb_per_op 0.0905
-limiter round 1 redis P16 ops 624662 misses 0.00 p50 6.68700 p99 7.80700 kb_per_op 0.0913
-limiter round 1 valkey P1 ops 208640 misses 0.00 p50 1.10300 p99 2.22300 kb_per_op 0.0905
-limiter round 1 valkey P16 ops 556146 misses 0.00 p50 7.55100 p99 8.70300 kb_per_op 0.0912
-limiter round 2 tantalum-uring P1 ops 155473 misses 0.00 p50 1.53500 p99 1.71900 kb_per_op 0.0905
-limiter round 2 tantalum-uring P16 ops 255697 misses 0.00 p50 14.97500 p99 15.93500 kb_per_op 0.0909
-limiter round 2 redis P1 ops 219684 misses 0.00 p50 1.05500 p99 2.11100 kb_per_op 0.0905
-limiter round 2 redis P16 ops 622516 misses 0.00 p50 6.71900 p99 7.93500 kb_per_op 0.0913
-limiter round 2 valkey P1 ops 209024 misses 0.00 p50 1.11100 p99 2.22300 kb_per_op 0.0905
-limiter round 2 valkey P16 ops 555877 misses 0.00 p50 7.61500 p99 8.76700 kb_per_op 0.0912
-limiter round 2 tantalum P1 ops 148660 misses 0.00 p50 1.60700 p99 1.79100 kb_per_op 0.0904
-limiter round 2 tantalum P16 ops 251106 misses 0.00 p50 15.29500 p99 16.06300 kb_per_op 0.0909
-limiter round 3 redis P1 ops 217760 misses 0.00 p50 1.05500 p99 2.12700 kb_per_op 0.0905
-limiter round 3 redis P16 ops 623813 misses 0.00 p50 6.75100 p99 7.74300 kb_per_op 0.0913
-limiter round 3 valkey P1 ops 207893 misses 0.00 p50 1.11100 p99 2.23900 kb_per_op 0.0905
-limiter round 3 valkey P16 ops 554979 misses 0.00 p50 7.39100 p99 8.57500 kb_per_op 0.0912
-limiter round 3 tantalum P1 ops 149076 misses 0.00 p50 1.59900 p99 1.78300 kb_per_op 0.0904
-limiter round 3 tantalum P16 ops 251575 misses 0.00 p50 15.29500 p99 16.38300 kb_per_op 0.0909
-limiter round 3 tantalum-uring P1 ops 155796 misses 0.00 p50 1.53500 p99 1.69500 kb_per_op 0.0905
-limiter round 3 tantalum-uring P16 ops 253853 misses 0.00 p50 15.03900 p99 16.63900 kb_per_op 0.0909
+limiter round 1 tantalum P1 ops 254098 misses 0.00 p50 0.94300 p99 1.19100 kb_per_op 0.0906
+limiter round 1 tantalum P16 ops 830554 misses 0.00 p50 4.60700 p99 5.15100 kb_per_op 0.0914
+limiter round 1 tantalum-uring P1 ops 266900 misses 0.00 p50 0.88700 p99 1.28700 kb_per_op 0.0906
+limiter round 1 tantalum-uring P16 ops 842025 misses 0.00 p50 4.54300 p99 5.08700 kb_per_op 0.0914
+limiter round 1 redis P1 ops 221671 misses 0.00 p50 1.04700 p99 2.11100 kb_per_op 0.0905
+limiter round 1 redis P16 ops 627438 misses 0.00 p50 6.68700 p99 7.64700 kb_per_op 0.0913
+limiter round 1 valkey P1 ops 209095 misses 0.00 p50 1.11100 p99 2.22300 kb_per_op 0.0905
+limiter round 1 valkey P16 ops 560368 misses 0.00 p50 7.42300 p99 8.51100 kb_per_op 0.0913
+limiter round 2 tantalum-uring P1 ops 265625 misses 0.00 p50 0.88700 p99 1.11900 kb_per_op 0.0906
+limiter round 2 tantalum-uring P16 ops 840614 misses 0.00 p50 4.54300 p99 5.15100 kb_per_op 0.0914
+limiter round 2 redis P1 ops 220628 misses 0.00 p50 1.04700 p99 2.12700 kb_per_op 0.0905
+limiter round 2 redis P16 ops 625474 misses 0.00 p50 6.52700 p99 7.64700 kb_per_op 0.0913
+limiter round 2 valkey P1 ops 209694 misses 0.00 p50 1.10300 p99 2.22300 kb_per_op 0.0905
+limiter round 2 valkey P16 ops 561304 misses 0.00 p50 7.42300 p99 8.51100 kb_per_op 0.0913
+limiter round 2 tantalum P1 ops 258403 misses 0.00 p50 0.91900 p99 1.12700 kb_per_op 0.0906
+limiter round 2 tantalum P16 ops 829214 misses 0.00 p50 4.60700 p99 5.37500 kb_per_op 0.0914
+limiter round 3 redis P1 ops 219514 misses 0.00 p50 1.04700 p99 2.11100 kb_per_op 0.0905
+limiter round 3 redis P16 ops 627392 misses 0.00 p50 6.68700 p99 7.67900 kb_per_op 0.0913
+limiter round 3 valkey P1 ops 211496 misses 0.00 p50 1.10300 p99 2.20700 kb_per_op 0.0905
+limiter round 3 valkey P16 ops 560593 misses 0.00 p50 7.48700 p99 8.57500 kb_per_op 0.0913
+limiter round 3 tantalum P1 ops 257308 misses 0.00 p50 0.92700 p99 1.26300 kb_per_op 0.0906
+limiter round 3 tantalum P16 ops 830070 misses 0.00 p50 4.60700 p99 5.31100 kb_per_op 0.0914
+limiter round 3 tantalum-uring P1 ops 266935 misses 0.00 p50 0.87100 p99 1.23900 kb_per_op 0.0906
+limiter round 3 tantalum-uring P16 ops 835634 misses 0.00 p50 4.54300 p99 5.66300 kb_per_op 0.0914
 # example: leaderboard
-memory leaderboard tantalum rss_mb 53.4 bytes_per_item 46.6
-memory leaderboard tantalum-uring rss_mb 53.8 bytes_per_item 47.0
-memory leaderboard redis rss_mb 82.9 bytes_per_item 72.9
-memory leaderboard valkey rss_mb 83.1 bytes_per_item 73.9
+memory leaderboard tantalum rss_mb 53.2 bytes_per_item 46.4
+memory leaderboard tantalum-uring rss_mb 57.4 bytes_per_item 50.9
+memory leaderboard redis rss_mb 83.1 bytes_per_item 73.0
+memory leaderboard valkey rss_mb 83.0 bytes_per_item 73.9
 check same ZCARD board: 1000000
 check same ZREVRANK board player:12345: 399508
 check same ZREVRANGE board 0 9 WITHSCORES: player:4959
-leaderboard round 1 tantalum P1 ops 243295 misses 0.00 p50 0.97500 p99 1.29500 kb_per_op 0.1296
-leaderboard round 1 tantalum P16 ops 706873 misses 0.00 p50 5.40700 p99 6.36700 kb_per_op 0.1296
-leaderboard round 1 tantalum-uring P1 ops 251946 misses 0.00 p50 0.93500 p99 1.22300 kb_per_op 0.1296
-leaderboard round 1 tantalum-uring P16 ops 706507 misses 0.00 p50 5.34300 p99 6.97500 kb_per_op 0.1296
-leaderboard round 1 redis P1 ops 238897 misses 0.00 p50 0.97500 p99 1.95100 kb_per_op 0.1296
-leaderboard round 1 redis P16 ops 699323 misses 0.00 p50 5.63100 p99 6.94300 kb_per_op 0.1296
-leaderboard round 1 valkey P1 ops 239055 misses 0.00 p50 0.96700 p99 1.94300 kb_per_op 0.1296
-leaderboard round 1 valkey P16 ops 727795 misses 0.00 p50 5.37500 p99 6.62300 kb_per_op 0.1296
-leaderboard round 2 tantalum-uring P1 ops 251105 misses 0.00 p50 0.93500 p99 1.38300 kb_per_op 0.1296
-leaderboard round 2 tantalum-uring P16 ops 719925 misses 0.00 p50 5.27900 p99 6.27100 kb_per_op 0.1296
-leaderboard round 2 redis P1 ops 238302 misses 0.00 p50 0.96700 p99 1.95100 kb_per_op 0.1296
-leaderboard round 2 redis P16 ops 701125 misses 0.00 p50 5.59900 p99 7.00700 kb_per_op 0.1296
-leaderboard round 2 valkey P1 ops 239005 misses 0.00 p50 0.97500 p99 1.95100 kb_per_op 0.1296
-leaderboard round 2 valkey P16 ops 726473 misses 0.00 p50 5.40700 p99 6.71900 kb_per_op 0.1296
-leaderboard round 2 tantalum P1 ops 245121 misses 0.00 p50 0.96700 p99 1.31900 kb_per_op 0.1296
-leaderboard round 2 tantalum P16 ops 713955 misses 0.00 p50 5.34300 p99 6.23900 kb_per_op 0.1296
-leaderboard round 3 redis P1 ops 232825 misses 0.00 p50 0.97500 p99 1.99900 kb_per_op 0.1296
-leaderboard round 3 redis P16 ops 694628 misses 0.00 p50 5.63100 p99 7.29500 kb_per_op 0.1296
-leaderboard round 3 valkey P1 ops 241068 misses 0.00 p50 0.95900 p99 1.93500 kb_per_op 0.1296
-leaderboard round 3 valkey P16 ops 725079 misses 0.00 p50 5.40700 p99 6.81500 kb_per_op 0.1296
-leaderboard round 3 tantalum P1 ops 247607 misses 0.00 p50 0.95900 p99 1.37500 kb_per_op 0.1296
-leaderboard round 3 tantalum P16 ops 716504 misses 0.00 p50 5.34300 p99 6.23900 kb_per_op 0.1296
-leaderboard round 3 tantalum-uring P1 ops 257173 misses 0.00 p50 0.92700 p99 1.21500 kb_per_op 0.1296
-leaderboard round 3 tantalum-uring P16 ops 705245 misses 0.00 p50 5.40700 p99 6.43100 kb_per_op 0.1296
+leaderboard round 1 tantalum P1 ops 241087 misses 0.00 p50 0.97500 p99 1.35900 kb_per_op 0.1296
+leaderboard round 1 tantalum P16 ops 697346 misses 0.00 p50 5.43900 p99 6.65500 kb_per_op 0.1296
+leaderboard round 1 tantalum-uring P1 ops 252984 misses 0.00 p50 0.94300 p99 1.19100 kb_per_op 0.1296
+leaderboard round 1 tantalum-uring P16 ops 700234 misses 0.00 p50 5.43900 p99 6.39900 kb_per_op 0.1296
+leaderboard round 1 redis P1 ops 235796 misses 0.00 p50 0.98300 p99 1.97500 kb_per_op 0.1296
+leaderboard round 1 redis P16 ops 683737 misses 0.00 p50 5.75900 p99 7.26300 kb_per_op 0.1296
+leaderboard round 1 valkey P1 ops 238779 misses 0.00 p50 0.97500 p99 1.95100 kb_per_op 0.1296
+leaderboard round 1 valkey P16 ops 708451 misses 0.00 p50 5.50300 p99 7.45500 kb_per_op 0.1296
+leaderboard round 2 tantalum-uring P1 ops 255783 misses 0.00 p50 0.93500 p99 1.08700 kb_per_op 0.1296
+leaderboard round 2 tantalum-uring P16 ops 708595 misses 0.00 p50 5.37500 p99 6.36700 kb_per_op 0.1296
+leaderboard round 2 redis P1 ops 232516 misses 0.00 p50 0.99900 p99 1.99900 kb_per_op 0.1296
+leaderboard round 2 redis P16 ops 678622 misses 0.00 p50 5.82300 p99 7.23100 kb_per_op 0.1296
+leaderboard round 2 valkey P1 ops 236618 misses 0.00 p50 0.98300 p99 1.96700 kb_per_op 0.1296
+leaderboard round 2 valkey P16 ops 705355 misses 0.00 p50 5.59900 p99 6.84700 kb_per_op 0.1296
+leaderboard round 2 tantalum P1 ops 245161 misses 0.00 p50 0.97500 p99 1.37500 kb_per_op 0.1296
+leaderboard round 2 tantalum P16 ops 692583 misses 0.00 p50 5.50300 p99 6.52700 kb_per_op 0.1296
+leaderboard round 3 redis P1 ops 231491 misses 0.00 p50 0.99100 p99 1.99900 kb_per_op 0.1296
+leaderboard round 3 redis P16 ops 673321 misses 0.00 p50 5.85500 p99 7.32700 kb_per_op 0.1296
+leaderboard round 3 valkey P1 ops 236001 misses 0.00 p50 0.98300 p99 1.96700 kb_per_op 0.1296
+leaderboard round 3 valkey P16 ops 701680 misses 0.00 p50 5.59900 p99 7.07100 kb_per_op 0.1296
+leaderboard round 3 tantalum P1 ops 242710 misses 0.00 p50 0.98300 p99 1.31900 kb_per_op 0.1296
+leaderboard round 3 tantalum P16 ops 690970 misses 0.00 p50 5.53500 p99 6.59100 kb_per_op 0.1296
+leaderboard round 3 tantalum-uring P1 ops 250295 misses 0.00 p50 0.95100 p99 1.12700 kb_per_op 0.1296
+leaderboard round 3 tantalum-uring P16 ops 694400 misses 0.00 p50 5.50300 p99 6.52700 kb_per_op 0.1296
 # example: feed
-memory feed tantalum rss_mb 185.2 bytes_per_item 36.9
-memory feed tantalum-uring rss_mb 185.6 bytes_per_item 37.0
-memory feed redis rss_mb 189.9 bytes_per_item 37.1
-memory feed valkey rss_mb 189.3 bytes_per_item 37.0
+memory feed tantalum rss_mb 184.6 bytes_per_item 36.9
+memory feed tantalum-uring rss_mb 185.2 bytes_per_item 37.0
+memory feed redis rss_mb 190.3 bytes_per_item 37.1
+memory feed valkey rss_mb 189.2 bytes_per_item 37.0
 check same DBSIZE: 100000
 check same LLEN feed:12345: 50
 check same LRANGE feed:12345 0 19: post-0012345-00-abcdefghijklmnopq
-feed round 1 tantalum P1 ops 255304 misses 0.00 p50 0.91100 p99 1.41500 kb_per_op 0.6769
-feed round 1 tantalum P16 ops 728298 misses 0.00 p50 5.21500 p99 6.78300 kb_per_op 0.6698
-feed round 1 tantalum-uring P1 ops 266379 misses 0.00 p50 0.89500 p99 1.12700 kb_per_op 0.6768
-feed round 1 tantalum-uring P16 ops 847353 misses 0.00 p50 4.47900 p99 6.14300 kb_per_op 0.6692
-feed round 1 redis P1 ops 248281 misses 0.00 p50 0.89500 p99 1.85500 kb_per_op 0.6770
-feed round 1 redis P16 ops 876246 misses 0.00 p50 4.31900 p99 6.23900 kb_per_op 0.6693
-feed round 1 valkey P1 ops 245938 misses 0.00 p50 0.92700 p99 1.88700 kb_per_op 0.6770
-feed round 1 valkey P16 ops 844095 misses 0.00 p50 4.47900 p99 6.78300 kb_per_op 0.6694
-feed round 2 tantalum-uring P1 ops 252122 misses 0.00 p50 0.92700 p99 1.37500 kb_per_op 0.6655
-feed round 2 tantalum-uring P16 ops 826566 misses 0.00 p50 4.54300 p99 6.75100 kb_per_op 0.6647
-feed round 2 redis P1 ops 254919 misses 0.00 p50 0.89500 p99 1.80700 kb_per_op 0.6655
-feed round 2 redis P16 ops 879758 misses 0.00 p50 4.31900 p99 6.20700 kb_per_op 0.6647
-feed round 2 valkey P1 ops 250899 misses 0.00 p50 0.91100 p99 1.83900 kb_per_op 0.6656
-feed round 2 valkey P16 ops 853729 misses 0.00 p50 4.44700 p99 6.36700 kb_per_op 0.6647
-feed round 2 tantalum P1 ops 214177 misses 0.00 p50 0.96700 p99 2.46300 kb_per_op 0.6660
-feed round 2 tantalum P16 ops 742155 misses 0.00 p50 5.15100 p99 6.62300 kb_per_op 0.6650
-feed round 3 redis P1 ops 247372 misses 0.00 p50 0.92700 p99 1.86300 kb_per_op 0.6643
-feed round 3 redis P16 ops 853023 misses 0.00 p50 4.38300 p99 8.63900 kb_per_op 0.6641
-feed round 3 valkey P1 ops 250605 misses 0.00 p50 0.90300 p99 1.83100 kb_per_op 0.6643
-feed round 3 valkey P16 ops 847469 misses 0.00 p50 4.47900 p99 6.62300 kb_per_op 0.6641
-feed round 3 tantalum P1 ops 255212 misses 0.00 p50 0.91100 p99 1.41500 kb_per_op 0.6645
-feed round 3 tantalum P16 ops 734595 misses 0.00 p50 5.15100 p99 7.87100 kb_per_op 0.6642
-feed round 3 tantalum-uring P1 ops 263957 misses 0.00 p50 0.90300 p99 1.12700 kb_per_op 0.6643
-feed round 3 tantalum-uring P16 ops 841019 misses 0.00 p50 4.51100 p99 5.88700 kb_per_op 0.6641
+feed round 1 tantalum P1 ops 272472 misses 0.00 p50 0.81500 p99 1.31100 kb_per_op 0.6768
+feed round 1 tantalum P16 ops 961306 misses 0.00 p50 3.91900 p99 5.56700 kb_per_op 0.6687
+feed round 1 tantalum-uring P1 ops 285447 misses 0.00 p50 0.83900 p99 1.00700 kb_per_op 0.6767
+feed round 1 tantalum-uring P16 ops 1111311 misses 0.00 p50 3.39100 p99 5.88700 kb_per_op 0.6681
+feed round 1 redis P1 ops 250693 misses 0.00 p50 0.91100 p99 1.83100 kb_per_op 0.6769
+feed round 1 redis P16 ops 872910 misses 0.00 p50 4.35100 p99 6.30300 kb_per_op 0.6692
+feed round 1 valkey P1 ops 247545 misses 0.00 p50 0.91900 p99 1.85500 kb_per_op 0.6770
+feed round 1 valkey P16 ops 831604 misses 0.00 p50 4.57500 p99 6.71900 kb_per_op 0.6694
+feed round 2 tantalum-uring P1 ops 285370 misses 0.00 p50 0.83900 p99 0.99100 kb_per_op 0.6649
+feed round 2 tantalum-uring P16 ops 1123255 misses 0.00 p50 3.37500 p99 4.89500 kb_per_op 0.6643
+feed round 2 redis P1 ops 246493 misses 0.00 p50 0.92700 p99 1.86300 kb_per_op 0.6655
+feed round 2 redis P16 ops 803906 misses 0.00 p50 4.54300 p99 11.39100 kb_per_op 0.6647
+feed round 2 valkey P1 ops 243533 misses 0.00 p50 0.92700 p99 1.89500 kb_per_op 0.6656
+feed round 2 valkey P16 ops 842948 misses 0.00 p50 4.51100 p99 6.39900 kb_per_op 0.6648
+feed round 2 tantalum P1 ops 270904 misses 0.00 p50 0.82300 p99 1.31100 kb_per_op 0.6652
+feed round 2 tantalum P16 ops 964372 misses 0.00 p50 3.93500 p99 5.24700 kb_per_op 0.6645
+feed round 3 redis P1 ops 249904 misses 0.00 p50 0.91900 p99 1.84700 kb_per_op 0.6643
+feed round 3 redis P16 ops 852840 misses 0.00 p50 4.44700 p99 6.39900 kb_per_op 0.6641
+feed round 3 valkey P1 ops 245948 misses 0.00 p50 0.92700 p99 1.87100 kb_per_op 0.6644
+feed round 3 valkey P16 ops 839902 misses 0.00 p50 4.51100 p99 6.46300 kb_per_op 0.6641
+feed round 3 tantalum P1 ops 272335 misses 0.00 p50 0.81500 p99 1.30300 kb_per_op 0.6642
+feed round 3 tantalum P16 ops 957104 misses 0.00 p50 3.96700 p99 4.89500 kb_per_op 0.6640
+feed round 3 tantalum-uring P1 ops 288109 misses 0.00 p50 0.82300 p99 1.07100 kb_per_op 0.6640
+feed round 3 tantalum-uring P16 ops 1116295 misses 0.00 p50 3.39100 p99 4.60700 kb_per_op 0.6639
 # example: events
-memory events tantalum rss_mb 48.1 bytes_per_item 41.1
-memory events tantalum-uring rss_mb 48.6 bytes_per_item 41.4
-memory events redis rss_mb 53.9 bytes_per_item 42.6
+memory events tantalum rss_mb 48.2 bytes_per_item 41.1
+memory events tantalum-uring rss_mb 48.6 bytes_per_item 41.8
+memory events redis rss_mb 54.0 bytes_per_item 42.6
 memory events valkey rss_mb 53.6 bytes_per_item 43.0
 check same XLEN events: 1000000
-events round 1 tantalum P1 ops 238025 misses 0.00 p50 0.91900 p99 1.48700 kb_per_op 0.7446
-events round 1 tantalum P16 ops 615792 misses 0.00 p50 6.14300 p99 7.23100 kb_per_op 0.7476
-events round 1 tantalum-uring P1 ops 252384 misses 0.00 p50 0.94300 p99 1.47900 kb_per_op 0.7448
-events round 1 tantalum-uring P16 ops 651782 misses 0.00 p50 5.88700 p99 11.13500 kb_per_op 0.7477
-events round 1 redis P1 ops 168420 misses 0.00 p50 1.26300 p99 2.28700 kb_per_op 0.7434
-events round 1 redis P16 ops 316406 misses 0.00 p50 12.09500 p99 17.91900 kb_per_op 0.7458
-events round 1 valkey P1 ops 166957 misses 0.00 p50 1.27100 p99 2.33500 kb_per_op 0.7434
-events round 1 valkey P16 ops 342754 misses 0.00 p50 11.19900 p99 15.10300 kb_per_op 0.7461
-events round 2 tantalum-uring P1 ops 254382 misses 0.00 p50 0.94300 p99 1.17500 kb_per_op 0.7449
-events round 2 tantalum-uring P16 ops 651956 misses 0.00 p50 5.95100 p99 9.02300 kb_per_op 0.7477
-events round 2 redis P1 ops 169506 misses 0.00 p50 1.25500 p99 2.27100 kb_per_op 0.7434
-events round 2 redis P16 ops 318748 misses 0.00 p50 12.03100 p99 15.99900 kb_per_op 0.7458
-events round 2 valkey P1 ops 166356 misses 0.00 p50 1.27100 p99 2.33500 kb_per_op 0.7434
-events round 2 valkey P16 ops 344682 misses 0.00 p50 11.13500 p99 14.52700 kb_per_op 0.7461
-events round 2 tantalum P1 ops 239399 misses 0.00 p50 0.91100 p99 1.45500 kb_per_op 0.7446
-events round 2 tantalum P16 ops 624611 misses 0.00 p50 6.07900 p99 7.71100 kb_per_op 0.7476
-events round 3 redis P1 ops 169235 misses 0.00 p50 1.25500 p99 2.28700 kb_per_op 0.7434
-events round 3 redis P16 ops 321498 misses 0.00 p50 11.96700 p99 15.29500 kb_per_op 0.7458
-events round 3 valkey P1 ops 167798 misses 0.00 p50 1.27100 p99 2.30300 kb_per_op 0.7434
-events round 3 valkey P16 ops 345303 misses 0.00 p50 11.07100 p99 15.48700 kb_per_op 0.7461
-events round 3 tantalum P1 ops 240318 misses 0.00 p50 0.91100 p99 1.45500 kb_per_op 0.7446
-events round 3 tantalum P16 ops 618701 misses 0.00 p50 6.11100 p99 7.35900 kb_per_op 0.7476
-events round 3 tantalum-uring P1 ops 254790 misses 0.00 p50 0.93500 p99 1.16700 kb_per_op 0.7448
-events round 3 tantalum-uring P16 ops 648682 misses 0.00 p50 5.88700 p99 9.53500 kb_per_op 0.7477
+events round 1 tantalum P1 ops 237004 misses 0.00 p50 0.91900 p99 1.50300 kb_per_op 0.7446
+events round 1 tantalum P16 ops 601694 misses 0.00 p50 6.27100 p99 8.44700 kb_per_op 0.7475
+events round 1 tantalum-uring P1 ops 252508 misses 0.00 p50 0.95100 p99 1.15900 kb_per_op 0.7448
+events round 1 tantalum-uring P16 ops 641588 misses 0.00 p50 6.01500 p99 10.04700 kb_per_op 0.7476
+events round 1 redis P1 ops 168016 misses 0.00 p50 1.26300 p99 2.30300 kb_per_op 0.7434
+events round 1 redis P16 ops 318525 misses 0.00 p50 12.09500 p99 15.48700 kb_per_op 0.7458
+events round 1 valkey P1 ops 166586 misses 0.00 p50 1.27900 p99 2.33500 kb_per_op 0.7434
+events round 1 valkey P16 ops 345975 misses 0.00 p50 11.07100 p99 14.71900 kb_per_op 0.7461
+events round 2 tantalum-uring P1 ops 252016 misses 0.00 p50 0.95100 p99 1.23100 kb_per_op 0.7448
+events round 2 tantalum-uring P16 ops 644585 misses 0.00 p50 5.88700 p99 9.15100 kb_per_op 0.7476
+events round 2 redis P1 ops 167147 misses 0.00 p50 1.27100 p99 2.33500 kb_per_op 0.7434
+events round 2 redis P16 ops 317352 misses 0.00 p50 12.09500 p99 15.87100 kb_per_op 0.7458
+events round 2 valkey P1 ops 166836 misses 0.00 p50 1.27900 p99 2.33500 kb_per_op 0.7434
+events round 2 valkey P16 ops 342245 misses 0.00 p50 11.19900 p99 15.99900 kb_per_op 0.7461
+events round 2 tantalum P1 ops 242756 misses 0.00 p50 0.90300 p99 1.43100 kb_per_op 0.7446
+events round 2 tantalum P16 ops 615589 misses 0.00 p50 6.17500 p99 7.00700 kb_per_op 0.7476
+events round 3 redis P1 ops 168182 misses 0.00 p50 1.27100 p99 2.30300 kb_per_op 0.7434
+events round 3 redis P16 ops 318505 misses 0.00 p50 12.09500 p99 15.42300 kb_per_op 0.7458
+events round 3 valkey P1 ops 165346 misses 0.00 p50 1.28700 p99 2.35100 kb_per_op 0.7434
+events round 3 valkey P16 ops 342178 misses 0.00 p50 11.19900 p99 14.91100 kb_per_op 0.7461
+events round 3 tantalum P1 ops 237256 misses 0.00 p50 0.91900 p99 1.51100 kb_per_op 0.7446
+events round 3 tantalum P16 ops 613160 misses 0.00 p50 6.11100 p99 10.11100 kb_per_op 0.7476
+events round 3 tantalum-uring P1 ops 252284 misses 0.00 p50 0.94300 p99 1.27900 kb_per_op 0.7448
+events round 3 tantalum-uring P16 ops 646604 misses 0.00 p50 5.91900 p99 9.53500 kb_per_op 0.7476
 == bullmq
 # 7.0.0-38-generic, 4 CPUs, Intel(R) Xeon(R) E-2388G CPU @ 3.20GHz
 # BullMQ 6.5.4, node v20.19.2; 100000 jobs, 3 workers x 100; server on CPU 0, clients on 1-3
-round 1 tantalum         add   59567 jobs/s    4.6 us/job | process   65776 jobs/s   12.7 us/job, server 0.84 cores
-round 1 tantalum-uring   add   57234 jobs/s    5.1 us/job | process   68301 jobs/s   12.8 us/job, server 0.87 cores
-round 1 redis            add   37357 jobs/s   15.2 us/job | process   28892 jobs/s   33.9 us/job, server 0.98 cores
-round 1 valkey           add   35636 jobs/s   16.5 us/job | process   26931 jobs/s   36.5 us/job, server 0.98 cores
-round 2 tantalum-uring   add   59233 jobs/s    4.4 us/job | process   68670 jobs/s   12.4 us/job, server 0.85 cores
-round 2 redis            add   38142 jobs/s   14.6 us/job | process   30487 jobs/s   31.9 us/job, server 0.97 cores
-round 2 valkey           add   35896 jobs/s   16.1 us/job | process   27327 jobs/s   36.3 us/job, server 0.99 cores
-round 2 tantalum         add   59780 jobs/s    4.6 us/job | process   66414 jobs/s   12.8 us/job, server 0.85 cores
-round 3 redis            add   37354 jobs/s   15.0 us/job | process   29574 jobs/s   32.9 us/job, server 0.97 cores
-round 3 valkey           add   35543 jobs/s   16.4 us/job | process   26395 jobs/s   37.5 us/job, server 0.99 cores
-round 3 tantalum         add   58888 jobs/s    4.8 us/job | process   67293 jobs/s   12.5 us/job, server 0.84 cores
-round 3 tantalum-uring   add   59391 jobs/s    4.7 us/job | process   64788 jobs/s   13.5 us/job, server 0.87 cores
+round 1 tantalum         add   59214 jobs/s    4.9 us/job | process   69097 jobs/s   12.1 us/job, server 0.84 cores
+round 1 tantalum-uring   add   59494 jobs/s    4.6 us/job | process   69115 jobs/s   12.3 us/job, server 0.85 cores
+round 1 redis            add   37283 jobs/s   14.9 us/job | process   29937 jobs/s   32.8 us/job, server 0.98 cores
+round 1 valkey           add   35330 jobs/s   16.2 us/job | process   26730 jobs/s   37.1 us/job, server 0.99 cores
+round 2 tantalum-uring   add   58459 jobs/s    4.6 us/job | process   68628 jobs/s   12.3 us/job, server 0.84 cores
+round 2 redis            add   37600 jobs/s   14.8 us/job | process   30614 jobs/s   32.2 us/job, server 0.99 cores
+round 2 valkey           add   35804 jobs/s   16.1 us/job | process   26836 jobs/s   36.7 us/job, server 0.98 cores
+round 2 tantalum         add   60589 jobs/s    4.8 us/job | process   69541 jobs/s   12.2 us/job, server 0.85 cores
+round 3 redis            add   37874 jobs/s   14.7 us/job | process   30515 jobs/s   32.2 us/job, server 0.98 cores
+round 3 valkey           add   36029 jobs/s   16.2 us/job | process   26623 jobs/s   37.0 us/job, server 0.99 cores
+round 3 tantalum         add   59523 jobs/s    4.8 us/job | process   71313 jobs/s   12.1 us/job, server 0.86 cores
+round 3 tantalum-uring   add   59200 jobs/s    4.6 us/job | process   69090 jobs/s   12.3 us/job, server 0.85 cores
 Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 b
 Valkey server v=9.1.3 sha=00000000:0 malloc=jemalloc-5.3.0 b
-
-== the rate limiter by shard count, 3 rotated rounds of 8 s, in a later and slower spell of the VM
-round 1 shards-256 P1 ops 97592.61
-round 1 shards-256 P16 ops 185139.04
-round 1 shards-16 P1 ops 161318.02
-round 1 shards-16 P16 ops 537237.99
-round 1 shards-1 P1 ops 162840.95
-round 1 shards-1 P16 ops 602010.86
-round 1 redis P1 ops 171046.72
-round 1 redis P16 ops 526760.30
-round 2 shards-16 P1 ops 191354.96
-round 2 shards-16 P16 ops 611278.68
-round 2 shards-1 P1 ops 199422.41
-round 2 shards-1 P16 ops 644132.50
-round 2 redis P1 ops 182556.91
-round 2 redis P16 ops 608922.34
-round 2 shards-256 P1 ops 143570.53
-round 2 shards-256 P16 ops 244670.58
-round 3 shards-1 P1 ops 258197.95
-round 3 shards-1 P16 ops 811589.91
-round 3 redis P1 ops 218458.52
-round 3 redis P16 ops 607962.73
-round 3 shards-256 P1 ops 149635.79
-round 3 shards-256 P16 ops 250090.93
-round 3 shards-16 P1 ops 249002.96
-round 3 shards-16 P16 ops 740629.58

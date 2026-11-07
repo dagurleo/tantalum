@@ -1,11 +1,11 @@
 //! A connection's transaction state: the commands `MULTI` queued for
 //! `EXEC`, and the keys `WATCH` watches.
 //!
-//! `EXEC` runs its commands with every shard of the store locked
-//! (`Store::exclusive`), so no other client's command runs meanwhile, as in
-//! Redis. A watched key's change sets the watcher's flag, under the key's
-//! shard lock: `EXEC` checks it holding every shard, so no change can slip
-//! in between the check and the commands.
+//! `EXEC` runs its commands as a transaction (`Store::exclusive`), so it's as if
+//! no other client's command runs meanwhile, as in Redis. A watched key's change
+//! sets the watcher's flag, under the key's shard lock: `EXEC` checks it holding
+//! the shards of every watched key, so no change can slip in between the check
+//! and the commands.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -76,13 +76,15 @@ impl Watching {
     }
 
     /// Whether a watched key changed, or expired since it was watched. For
-    /// `EXEC`, holding every shard.
+    /// `EXEC`, in its transaction: looking at each key holds its shard from then
+    /// on, so the flag is read last.
     pub(crate) fn changed(&self, now: Millis) -> bool {
-        self.flag.load(Relaxed)
-            || self.keys.iter().any(|(db, key, expired)| {
-                let store = self.store.db(*db);
-                !expired && store.has_expired(store.key(key), now)
-            })
+        let mut expired_since = false;
+        for (db, key, expired) in &self.keys {
+            let store = self.store.db(*db);
+            expired_since |= store.has_expired(store.key(key), now) && !expired;
+        }
+        expired_since || self.flag.load(Relaxed)
     }
 }
 
@@ -92,5 +94,45 @@ impl Drop for Watching {
             let store = self.store.db(*db);
             store.unwatch(store.key(key), &self.flag);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Condition, Expiry};
+
+    fn set(store: &Store, value: &[u8]) {
+        store
+            .set(
+                b"watched",
+                value,
+                Condition::Always,
+                Expiry::Never,
+                1,
+                false,
+            )
+            .unwrap();
+    }
+
+    /// `EXEC` hasn't reached the key yet when it checks, and a change right after
+    /// the check would be lost under what it then writes: it must wait.
+    #[test]
+    fn no_change_slips_in_after_the_check() {
+        let store = Arc::new(Store::new(4));
+        set(&store, b"first");
+        let mut watching = Watching::new(&store);
+        watching.add(0, b"watched", 1);
+        let writer = store.exclusive(|| {
+            assert!(!watching.changed(1));
+            let store = store.clone();
+            let writer = std::thread::spawn(move || set(&store, b"theirs"));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(!writer.is_finished(), "it changed after the check");
+            writer
+        });
+        writer.join().unwrap();
+        assert!(watching.flag.load(Relaxed));
+        assert!(store.exclusive(|| watching.changed(1)));
     }
 }

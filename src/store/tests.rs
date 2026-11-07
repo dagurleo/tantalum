@@ -2430,6 +2430,38 @@ fn an_edit_counts_as_a_write_only_if_it_says_so() {
 }
 
 #[test]
+fn a_transaction_holds_only_the_shards_it_touches() {
+    let store = Arc::new(Store::new(4));
+    let shard = |key: &[u8]| store.locate(store.key(key).hash).1;
+    let elsewhere = (0..)
+        .map(|i| format!("other:{i}"))
+        .find(|key| shard(key.as_bytes()) != shard(b"mine"))
+        .unwrap();
+    store.exclusive(|| {
+        store
+            .set(b"mine", b"1", Condition::Always, Expiry::Never, 1, false)
+            .unwrap();
+        // Another thread gets through while this one goes on.
+        let other = store.clone();
+        std::thread::spawn(move || {
+            other
+                .set(
+                    elsewhere.as_bytes(),
+                    b"1",
+                    Condition::Always,
+                    Expiry::Never,
+                    1,
+                    false,
+                )
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+    });
+    assert_eq!(store.len(), 2);
+}
+
+#[test]
 fn databases_share_their_shards_locks() {
     let store = Arc::new(Store::new(2));
     let other = store.db(3).clone();
@@ -2437,13 +2469,15 @@ fn databases_share_their_shards_locks() {
     let writer = {
         let other = other.clone();
         store.exclusive(|| {
-            // This thread uses them all as always, holding them.
+            // This thread uses them as always, holding what it touches.
             other
                 .set(b"mine", b"1", Condition::Always, Expiry::Never, 1, false)
                 .unwrap();
+            let store = store.clone();
             let writer = std::thread::spawn(move || {
-                other
-                    .set(b"theirs", b"1", Condition::Always, Expiry::Never, 1, false)
+                // The same shard, in another database.
+                store
+                    .set(b"mine", b"2", Condition::Always, Expiry::Never, 1, false)
                     .unwrap();
                 entered.send(()).unwrap();
             });
@@ -2455,8 +2489,8 @@ fn databases_share_their_shards_locks() {
     };
     writer.join().unwrap();
     assert!(enter.try_recv().is_ok());
-    assert_eq!(other.len(), 2);
-    assert_eq!(store.len(), 0);
+    assert_eq!(other.len(), 1);
+    assert_eq!(store.len(), 1);
 }
 
 #[test]

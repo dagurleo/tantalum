@@ -175,12 +175,8 @@ fn reading(
     f: impl FnOnce(Option<SetView<'_>>, &mut Vec<u8>),
 ) -> Reply {
     let store = ctx.db(session);
-    let mut reply = Vec::new();
-    match read(store, args.key(store), now, session, |set| {
-        f(set, &mut reply)
-    }) {
-        Ok(()) => out.extend_from_slice(&reply),
-        Err(()) => resp::write_error(out, WRONGTYPE),
+    if read(store, args.key(store), now, session, |set| f(set, out)).is_err() {
+        resp::write_error(out, WRONGTYPE);
     }
     Reply::Written
 }

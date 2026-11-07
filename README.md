@@ -81,7 +81,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `MSETNX key value [key value ...]` | Atomic: all or none, with nothing else running meanwhile |
 | `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN n] [WITHMATCHLEN]` | |
 | `COPY source destination [DB db] [REPLACE]`, `TOUCH key [key ...]`, `RANDOMKEY` | `COPY` is atomic, TTL included. `RANDOMKEY` is about uniform |
-| `SELECT index`, `MOVE key db`, `SWAPDB index1 index2` | Numbered databases, 16 unless `--databases` says otherwise. `MOVE` copies a big collection rather than handing it over, so it takes time in proportion to its size, holding every shard |
+| `SELECT index`, `MOVE key db`, `SWAPDB index1 index2` | Numbered databases, 16 unless `--databases` says otherwise. `MOVE` copies a big collection rather than handing it over, so it takes time in proportion to its size, holding that key's shard |
 | `OBJECT ENCODING\|FREQ\|IDLETIME\|REFCOUNT key`, `OBJECT HELP` | `ENCODING` is what Redis would use for what's held now, built from nothing (see "Not there yet"). `IDLETIME` is always 0: no last-access time is kept per key. `FREQ` is Redis' error without an LFU policy, as there's none |
 | `SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC\|DESC] [ALPHA] [STORE destination]`, `SORT_RO` | Atomic. Lists, sets and sorted sets, `*->field` for hashes |
 | `HSET key field value [field value ...]`, `HSETNX`, `HMSET` | Hashes keep their fields in the order they were added (as Redis does for small hashes) and keep the key's TTL |
@@ -458,16 +458,23 @@ differences.
   as Redis 7.2 prints them: shortest digits, laid out as JavaScript's
   `Number.prototype.toString` (plain from 1e-6 up to 1e21).
 - **Transactions** (`src/transaction.rs`, `src/shard_lock.rs`): `EXEC`
-  locks every shard, in shard order like everything that locks two, and
-  runs the queued commands as they always run; nothing else touches the
-  store meanwhile, as with Redis' single thread. That works because a
-  shard's lock lets the thread holding every shard for a transaction take
-  it again: outside transactions, taking a lock costs one read more, of a
-  counter only transactions write (the speed guard saw no difference). A
+  runs the queued commands as they always run, and each shard it touches
+  stays its own until it ends. What it read can't change and what it wrote
+  can't be seen until then, so it's as if nothing else ran meanwhile, as with
+  Redis' single thread, while commands on other shards carry on. That works
+  because a shard's lock lets the thread holding it for a transaction take it
+  again: outside transactions, taking a lock costs one read more, of a counter
+  only transactions write (the speed guard saw no difference). Transactions
+  run one at a time, and they alone may wait for a shard for as long as it
+  takes in any order: anything else holding a shard waits 1 ms at most for the
+  next one, then lets go and starts over, so nothing can deadlock. Debug builds
+  panic if a thread waits for a shard while holding another, which the whole
+  test suite runs under. A
   `WATCH` registers the client on the key in its shard; every write,
   removal, expiry and eviction there marks the key's watchers, which costs
   writes one check of a field in cache while nothing is watched. `EXEC`
-  checks the mark holding every shard, so no change slips in between. 101
+  takes the shards of what's watched before it checks the mark, so no change
+  slips in between. 101
   write commands, no-ops included (`SET NX` of an existing key, `LREM` of
   nothing, `LTRIM` keeping all), change a watched key exactly when they do
   in Redis 7.2.4.
@@ -479,8 +486,10 @@ differences.
   messages, and get the same `math.random` sequences. One interpreter
   serves every connection, made on the first script: a server that runs
   none only carries the code (the binary is ~200 KB bigger). A script runs
-  holding every shard, as `EXEC` does (and inside `EXEC`, takes them
-  again); its `redis.call`s run through the command table in a session of
+  as a transaction, as `EXEC` does, holding each shard it touches to the end,
+  whether it declared the key or not (it can't be known beforehand: BullMQ
+  builds key names from data), and a script inside `EXEC` is part of `EXEC`'s;
+  its `redis.call`s run through the command table in a session of
   their own (RESP2 unless the script asks for RESP3; blocking commands
   answer at once), and replies become Lua values, and its result a reply,
   by Redis' rules. 311 commands' replies match Redis 7.2.4 in both
@@ -510,8 +519,9 @@ differences.
   off, comparing every reply and every key, and adds 4,000 jobs with random
   options (colliding and repeated keys, nils, nesting, escapes, floats),
   checking each runs natively exactly when it should; on a queue run as apps
-  run it, every call stays native. Where a Lua script holds every shard, a
-  native one holds only those of the keys it uses, taken in ascending order
+  run it, every call stays native. Where a Lua script takes shards as it
+  reaches them, one at a time with the others, a native one runs alongside
+  others, holding those of the keys it uses, taken in ascending order
   as everything that holds two does: it asks for them before using them,
   those whose names depend on data too (the next job, from the waiting
   list's end or the first prioritized; a new job's id, from the counter),
@@ -713,9 +723,10 @@ differences.
     through mimalloc kept RSS ~9% above what was in use. Pool blocks become
     resident page by page as they're written. Freed blocks stay resident for
     reuse up to 4 MB in total; beyond that they drop their pages
-    (`madvise(MADV_DONTNEED)`). An A/B on Railway showed that dropping every
-    freed block's pages cost ~8% of pipelined throughput, because new segments
-    had to fault them back in (~10k faults/s). Big mappings keep the mapping count far
+    (`madvise(MADV_DONTNEED)`), those of sizes no longer being taken first. An A/B
+    on Railway showed that dropping every freed block's pages cost ~8% of pipelined
+    throughput, because new segments had to fault them back in (~10k faults/s).
+    Big mappings keep the mapping count far
     below Linux's ~65k limit.
   - **Hash tables** are mapped straight from the OS when rounding up to whole
     pages wastes at most 1/8 (on 4 KB-page Linux, anything over ~18 KB). A resize
@@ -786,7 +797,7 @@ caps the accounted memory. `--maxmemory-policy` decides what happens at the cap:
 
 ### Everyday apps (Agent37 VM, November 2026)
 
-What people use Redis for, rather than one command on its own. Tantalum 0.24.0,
+What people use Redis for, rather than one command on its own. Tantalum 0.25.0,
 Redis 8.10.3 and Valkey 9.1.3, each on one core of a 4-vCPU Xeon E-2388G, with
 memtier (3 × 80 clients) on the other three, persistence off, 1M items. Thousands
 of ops/s, medians of 3 rotated rounds of 12 s, the best in each row in bold
@@ -795,47 +806,54 @@ output: `bench/showcase/results-agent37.txt`). "vs Redis" is Tantalum on epoll.
 
 | Example | Pipeline | Tantalum | Tantalum, io_uring | Redis | Valkey | vs Redis |
 |---|---|---|---|---|---|---|
-| Login sessions: a 5-field hash each, mostly `HGETALL` | 1 | 303 | **314** | 253 | 218 | +19.8% |
-| | 16 | **2,021** | 1,995 | 1,003 | 784 | +101.6% |
-| Event stream: `XADD` capped at 1M, `XREVRANGE` of the latest | 1 | 239 | **254** | 169 | 167 | +41.5% |
-| | 16 | 619 | **652** | 319 | 345 | +94.1% |
-| Page cache: 1 KB values with TTLs, 9 reads to a write | 1 | 281 | **290** | 257 | 259 | +9.1% |
-| | 16 | 1,115 | **1,290** | 1,094 | 1,068 | +1.9% |
-| Leaderboard: one sorted set of 1M players | 1 | 245 | **252** | 238 | 239 | +2.9% |
-| | 16 | 714 | 707 | 699 | **726** | +2.1% |
-| Activity feeds: lists of the latest 50, `LRANGE` of 20 | 1 | 255 | **264** | 248 | 251 | +2.8% |
-| | 16 | 735 | 841 | **876** | 847 | -16.2% |
-| Rate limiter: a Lua script doing `INCR` and `EXPIRE` | 1 | 149 | 156 | **220** | 209 | -32.3% |
-| | 16 | 252 | 256 | **624** | 556 | -59.7% |
+| Login sessions: a 5-field hash each, mostly `HGETALL` | 1 | 308 | **317** | 254 | 221 | +21.5% |
+|  | 16 | **2,005** | 1,996 | 1,004 | 779 | +99.7% |
+| Event stream: `XADD` capped at 1M, `XREVRANGE` of the latest | 1 | 237 | **252** | 168 | 167 | +41.2% |
+|  | 16 | 613 | **645** | 319 | 342 | +92.5% |
+| Rate limiter: a Lua script doing `INCR` and `EXPIRE` | 1 | 257 | **267** | 221 | 210 | +16.6% |
+|  | 16 | 830 | **841** | 627 | 561 | +32.3% |
+| Page cache: 1 KB values with TTLs, 9 reads to a write | 1 | 295 | **298** | 257 | 258 | +14.7% |
+|  | 16 | 1,280 | **1,418** | 1,086 | 1,065 | +17.9% |
+| Activity feeds: lists of the latest 50, `LRANGE` of 20 | 1 | 272 | **285** | 250 | 246 | +9.0% |
+|  | 16 | 961 | **1,116** | 853 | 840 | +12.7% |
+| Leaderboard: one sorted set of 1M players | 1 | 243 | **253** | 233 | 237 | +4.4% |
+|  | 16 | 693 | 700 | 679 | **705** | +2.1% |
 
 The job queue is the real BullMQ 6.5.4 (`bench/bullmq/run.sh`, 100,000 jobs, three
 Node workers, medians of 3 rounds), in thousands of jobs/s. Tantalum's server used
-0.85 of its core processing, as the workers limit the rate, and Redis' 0.97. A job,
-added and processed, cost the server 17.3 µs of CPU, Redis 47.9 and Valkey 52.9.
+0.85 of its core processing, as the workers limit the rate, and Redis' 0.98. A job,
+added and processed, cost the server 16.9 µs of CPU, Redis 47.0 and Valkey 53.2.
 
 | BullMQ | Tantalum | Tantalum, io_uring | Redis | Valkey | vs Redis |
 |---|---|---|---|---|---|
-| Adding jobs | **59.6** | 59.2 | 37.4 | 35.6 | +59.5% |
-| Processing jobs | 66.4 | **68.3** | 29.6 | 26.9 | +124.6% |
+| Adding jobs | **59.5** | 59.2 | 37.6 | 35.8 | +58.3% |
+| Processing jobs | **69.5** | 69.1 | 30.5 | 26.7 | +127.9% |
 
 Memory for the same data, RSS after the fill, in MB:
 
 | Example | Tantalum | Redis | Valkey | vs Redis |
 |---|---|---|---|---|
-| Page cache | **1,025** | 1,322 | 1,329 | -22.5% |
-| Login sessions | **155** | 195 | 196 | -20.6% |
-| Leaderboard | **53** | 83 | 83 | -35.6% |
-| Activity feeds | **185** | 190 | 189 | -2.5% |
-| Event stream | **48** | 54 | 54 | -10.8% |
+| Page cache | **1,025** | 1,321 | 1,330 | -22.4% |
+| Login sessions | **154** | 195 | 196 | -20.8% |
+| Leaderboard | **53** | 83 | 83 | -36.0% |
+| Activity feeds | **185** | 190 | 189 | -3.0% |
+| Event stream | **48** | 54 | 54 | -10.7% |
 
-Two examples lose. **The rate limiter** because a Lua script takes every shard's
-lock first, as it may touch keys it didn't declare: with the default 256 shards
-that's about 2.5 µs a call. In a later run on a slower spell of the VM, Redis did
-183k and 608k, Tantalum with its 256 shards 144k and 245k, with `--shards 16` 191k
-and 611k, and with `--shards 1` 199k and 644k. What fewer shards cost elsewhere is
-unmeasured, so the default stays for now. BullMQ's scripts avoid this by running
-natively. **Activity feeds at pipeline 16** lose on epoll and by 4% on io_uring,
-cause not looked into yet.
+Tantalum leads Redis everywhere. The closest is the leaderboard at pipeline 16, by
+2.1%, and on this VM anything within 3% counts as level; Valkey is 1.8% ahead of
+Tantalum there, level too.
+
+Two of these lost until 0.25.0. **The rate limiter** did 32% and 60% less than Redis,
+because a Lua script took all 256 shard locks first, as it may touch keys it didn't
+declare: about 2.5 µs a call. A script now takes each shard when it first touches it
+and keeps it to the end, so nothing sees it half done. **Activity feeds at pipeline
+16** did 16% less: a small list lives in the segment log, so each `LPUSH` and `LTRIM`
+writes it again, and freed segments were losing their pages and faulting them back
+in, 0.17 faults a command against Redis' 0.002. The pool keeps 4 MB of freed blocks
+resident, and that had filled up with blocks of sizes shards had outgrown. Sizes in
+use now push those out: faults fell to 0.0002 a command, for 2% more RSS after the
+traffic (251 to 256 MB). The page cache at pipeline 16 rose from +1.9% to +17.9% in
+the same release, probably for the same reason, though that wasn't measured alone.
 
 An error reply is the fastest reply there is, so `run.sh` asks every server the same
 questions after filling it, and `summary.py` compares the bytes each server sent per
@@ -1225,9 +1243,6 @@ hit rates share the seeding flaw described above.
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
   the 209 commands that are here (1, which expects over 300).
-- **Lua scripts are behind Redis**: each takes all 256 shard locks, about 2.5 µs a
-  call, so a rate limiter does 32-60% less than on Redis (see "Everyday apps").
-  Scripts BullMQ uses most run natively and don't pay it.
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out

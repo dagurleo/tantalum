@@ -5,9 +5,10 @@
 //! `redis` API, and fail with the same errors.
 //!
 //! One interpreter serves every connection, made on the first script, so a
-//! server that runs none doesn't pay for it. A script runs holding every
-//! shard of the store, as `EXEC` does, so nothing else runs meanwhile, as in
-//! Redis. Its `redis.call`s run through the command table in a session of
+//! server that runs none doesn't pay for it. A script runs as a transaction,
+//! as `EXEC` does, holding each shard it touches to the end, so it's as if
+//! nothing else ran meanwhile, as in Redis, whatever keys it uses, declared or
+//! not. Its `redis.call`s run through the command table in a session of
 //! their own, and replies become Lua values (and the script's result a
 //! reply) by Redis' rules.
 //!
@@ -167,8 +168,8 @@ impl Scripting {
     /// Runs a script for `EVAL` (`sha` false: `args[1]` is its body) or
     /// `EVALSHA` (its SHA-1), with `numkeys` keys after `args[2]` and then
     /// its arguments, writing its reply in the caller's protocol. For
-    /// `EVAL_RO` and `EVALSHA_RO`, `read_only`. Must run holding every
-    /// shard (`Store::exclusive`).
+    /// `EVAL_RO` and `EVALSHA_RO`, `read_only`. Must run as a transaction
+    /// (`Store::exclusive`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn eval(
         &self,
@@ -224,7 +225,7 @@ impl Scripting {
         }
         let read_only = read_only || (!flags.compat && flags.no_writes);
         // BullMQ's hottest scripts natively, unless one sends this call
-        // back to Lua (having written nothing). Holding every shard here.
+        // back to Lua (having written nothing). In a transaction here.
         if try_native
             && ctx.settings.native_scripts
             && !read_only
@@ -240,7 +241,7 @@ impl Scripting {
                 self.natives.fetch_add(1, Relaxed);
                 return;
             }
-            // (Not `Retry`, holding every shard.)
+            // (Not `Retry`, in a transaction.)
             drop(call);
             self.fallbacks.fetch_add(1, Relaxed);
             out.truncate(start);
