@@ -575,7 +575,10 @@ fn algebra_store(
         (update, len)
     });
     match stored {
-        Ok(len) => resp::write_integer(out, len as i64),
+        Ok(len) => {
+            store.forget_expiry(args.key(store), now);
+            resp::write_integer(out, len as i64);
+        }
         Err(OutOfMemory) => resp::write_error(out, OOM),
     }
     Reply::Written

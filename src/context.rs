@@ -131,6 +131,8 @@ pub struct Context {
     pub(crate) latency: Latency,
     /// `stream-node-max-entries` and `-bytes`, as streams read them.
     stream_node_entries: AtomicUsize,
+    /// `hll-sparse-max-bytes`.
+    hll_sparse_max_bytes: AtomicUsize,
     stream_node_bytes: AtomicUsize,
     /// A clock a thread ticks, for commands that aren't `fast` to read (`slowlog.rs`).
     ticks: AtomicU64,
@@ -181,6 +183,7 @@ impl Context {
             slowlog: SlowLog::default(),
             latency: Latency::default(),
             stream_node_entries: AtomicUsize::new(NodeLimits::default().entries),
+            hll_sparse_max_bytes: AtomicUsize::new(3000),
             stream_node_bytes: AtomicUsize::new(NodeLimits::default().bytes),
             ticks: AtomicU64::new(0),
             special: AtomicU8::new(0),
@@ -269,6 +272,14 @@ impl Context {
             entries: self.stream_node_entries.load(Relaxed),
             bytes: self.stream_node_bytes.load(Relaxed),
         }
+    }
+
+    pub(crate) fn hll_sparse_max_bytes(&self) -> usize {
+        self.hll_sparse_max_bytes.load(Relaxed)
+    }
+
+    pub(crate) fn set_hll_sparse_max_bytes(&self, bytes: usize) {
+        self.hll_sparse_max_bytes.store(bytes, Relaxed);
     }
 
     pub(crate) fn set_stream_node_entries(&self, entries: usize) {

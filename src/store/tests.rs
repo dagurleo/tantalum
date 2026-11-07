@@ -577,6 +577,9 @@ fn matches_a_model() {
                     (Update::Replace(kind, value), _) => {
                         model.insert(key, (kind, value, deadline));
                     }
+                    (Update::ReplaceWithRoom(value), _) => {
+                        model.insert(key, (Kind::String, value, deadline));
+                    }
                     (_, None) | (Update::Touch, _) => {}
                     (Update::Delete, _) => {
                         model.remove(&key);
@@ -2370,14 +2373,21 @@ fn big_strings_change_in_place_unless_shared() {
             .is_none()
     );
 
-    // Not for small strings, other kinds or no key.
+    // A small string only if it keeps its length. Not other kinds or no key.
     store
         .set(b"small", b"v", Condition::Always, Expiry::Never, now, false)
         .unwrap();
     let small = store.key(b"small");
+    let edited = store.edit_string(small, now, same, |bytes, _| {
+        bytes[0] = b'w';
+        ((), true)
+    });
+    assert!(edited.is_some());
+    let value = store.get_with(b"small", now, |v| v.unwrap().as_bytes().to_vec());
+    assert_eq!(value, b"w");
     assert!(
         store
-            .edit_string(small, now, same, |_, _| ((), true))
+            .edit_string(small, now, |len| Some(len + 1), |_, _| ((), true))
             .is_none()
     );
     let missing = store.key(b"missing");
@@ -2427,6 +2437,74 @@ fn an_edit_counts_as_a_write_only_if_it_says_so() {
             .edit_string(key, 2000, same, |_, _| ((), true))
             .is_none()
     );
+}
+
+#[test]
+fn strings_kept_apart_change_where_they_lie() {
+    let store = Store::new(4);
+    let key = store.key(b"k");
+    let get = |store: &Store| {
+        store.get_key(key, 1, |value| {
+            value.map(|v| (v.kind(), v.as_bytes().to_vec()))
+        })
+    };
+    // Not there, or not kept apart: no room to be had.
+    let no_room = |bytes: &mut [u8], len: usize| {
+        assert_eq!(bytes.len(), len, "no room here");
+        ((), len, false)
+    };
+    assert_eq!(store.edit_string_room(key, 1, 3, no_room), None);
+    store
+        .set(b"k", b"abc", Condition::Always, Expiry::At(1000), 1, false)
+        .unwrap();
+    assert_eq!(store.edit_string_room(key, 1, 3, no_room), Some(()));
+
+    store
+        .update_key(key, 1, |_| (Update::ReplaceWithRoom(b"abcd".to_vec()), ()))
+        .unwrap();
+    assert_eq!(get(&store), Some((Kind::String, b"abcd".to_vec())));
+    assert!(store.has_ttl_for_test(key, 1), "keeps its expiry");
+
+    // Grows, in zeroes it may use or not.
+    let grown = store.edit_string_room(key, 1, 3, |bytes, len| {
+        assert_eq!((bytes.len(), len), (7, 4));
+        assert_eq!(bytes, b"abcd\0\0\0");
+        bytes[4] = b'e';
+        ("grown", 5, true)
+    });
+    assert_eq!(grown, Some("grown"));
+    assert_eq!(get(&store), Some((Kind::String, b"abcde".to_vec())));
+
+    // Shrinks, and the bytes it let go of don't come back.
+    store.edit_string_room(key, 1, 3, |bytes, _| {
+        bytes[0] = b'A';
+        ((), 2, true)
+    });
+    assert_eq!(get(&store), Some((Kind::String, b"Ab".to_vec())));
+    store.edit_string_room(key, 1, 1, |bytes, len| {
+        assert_eq!((&bytes[..], len), (&b"Ab\0"[..], 2));
+        ((), len, false)
+    });
+
+    // Past its room, it just has none.
+    store.edit_string_room(key, 1, 1000, |bytes, len| {
+        assert_eq!(bytes.len(), len);
+        ((), len, false)
+    });
+
+    // A reader holding it on to send it keeps what it has.
+    let reader = store.get_key(key, 1, |value| value.unwrap().share());
+    assert_eq!(store.edit_string_room(key, 1, 3, no_room), None);
+    assert_eq!(reader.as_bytes(), b"Ab");
+    drop(reader);
+
+    // What any other write makes of it.
+    store
+        .set(b"k", b"plain", Condition::Always, Expiry::Keep, 1, false)
+        .unwrap();
+    assert_eq!(get(&store), Some((Kind::String, b"plain".to_vec())));
+    store.exclusive(|| store.forget_expiry(key, 1));
+    assert!(!store.has_ttl_for_test(key, 1));
 }
 
 #[test]

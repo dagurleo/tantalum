@@ -75,7 +75,7 @@ fn finish(set: Option<ZMut<'_>>, existed: bool) -> Update {
 }
 
 /// How a whole result set is stored: packed, big, or deleted when empty.
-fn store_update(set: BigZSet) -> Update {
+pub(super) fn store_update(set: BigZSet) -> Update {
     if set.is_empty() {
         Update::Delete
     } else if set.fits_packed() {
@@ -85,7 +85,7 @@ fn store_update(set: BigZSet) -> Update {
     }
 }
 
-fn read<R>(
+pub(super) fn read<R>(
     store: &Store,
     key: Key<'_>,
     now: Millis,
@@ -489,8 +489,8 @@ fn score_ranks(set: &ZView<'_>, range: &ScoreRange) -> std::ops::Range<usize> {
     if range.is_empty() {
         return 0..0;
     }
-    let start = set.partition_point(|s, _| range.below(s));
-    let end = set.partition_point(|s, _| range.not_above(s));
+    let start = set.partition_by_score(|s| range.below(s));
+    let end = set.partition_by_score(|s| range.not_above(s));
     start..end.max(start)
 }
 
@@ -715,7 +715,10 @@ fn range_command(
         (store_update(set), ())
     });
     match stored {
-        Ok(()) => resp::write_integer(out, n as i64),
+        Ok(()) => {
+            store.forget_expiry(args.key(store), now);
+            resp::write_integer(out, n as i64);
+        }
         Err(OutOfMemory) => resp::write_error(out, OOM),
     }
     Reply::Written
@@ -1482,7 +1485,10 @@ fn algebra(
         (store_update(result.take().unwrap_or_default()), ())
     });
     match stored {
-        Ok(()) => resp::write_integer(out, n as i64),
+        Ok(()) => {
+            store.forget_expiry(args.key(store), now);
+            resp::write_integer(out, n as i64);
+        }
         Err(OutOfMemory) => resp::write_error(out, OOM),
     }
     Reply::Written

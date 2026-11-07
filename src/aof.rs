@@ -723,7 +723,7 @@ pub(crate) fn record(name: &str, args: &Args<'_>, reply: &[u8]) {
         return;
     }
     // Without `STORE` it changed nothing.
-    if name == "sort" && reply.first() != Some(&b':') {
+    if matches!(name, "sort" | "georadius" | "georadiusbymember") && reply.first() != Some(&b':') {
         return;
     }
     // Nor does a `BITFIELD` of only `GET`s.
