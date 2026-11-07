@@ -1202,3 +1202,79 @@ fn evictions_are_logged_in_their_databases() {
     assert_eq!(before, keys(again));
     close(&log2);
 }
+
+#[test]
+fn hyperloglogs_and_geo_come_back() {
+    let dir = temp_dir("geo-hll");
+    let (server1, mut c) = server(&dir);
+    call(&mut c, &["PFADD", "h", "a", "b", "c"], ":1\r\n");
+    call(&mut c, &["PFCOUNT", "h"], ":3\r\n");
+    call(&mut c, &["PFADD", "h2", "d"], ":1\r\n");
+    call(&mut c, &["PFMERGE", "m", "h", "h2"], "+OK\r\n");
+    call(
+        &mut c,
+        &[
+            "GEOADD",
+            "g",
+            "13.361389",
+            "38.115556",
+            "Palermo",
+            "15.087269",
+            "37.502669",
+            "Catania",
+        ],
+        ":2\r\n",
+    );
+    // A search changes nothing, so it isn't logged.
+    call(
+        &mut c,
+        &["GEORADIUS", "g", "15", "37", "200", "km", "COUNT", "1"],
+        "*1\r\n$7\r\nCatania\r\n",
+    );
+    call(
+        &mut c,
+        &["GEORADIUS", "g", "15", "37", "100", "km", "STORE", "stored"],
+        ":1\r\n",
+    );
+    call(
+        &mut c,
+        &[
+            "GEOSEARCHSTORE",
+            "near",
+            "g",
+            "FROMLONLAT",
+            "15",
+            "37",
+            "BYRADIUS",
+            "100",
+            "km",
+        ],
+        ":1\r\n",
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    drop(server1); // SIGKILL
+    let log = std::fs::read(log_file(&dir)).unwrap();
+    let times = |word: &[u8]| log.windows(word.len()).filter(|w| *w == word).count();
+    assert_eq!(times(b"COUNT"), 0, "a search without STORE was logged");
+    assert_eq!(times(b"GEOSEARCHSTORE"), 1);
+    assert_eq!(times(b"STORE"), 2, "with GEOSEARCHSTORE's");
+
+    let (_server2, mut c) = server(&dir);
+    call(&mut c, &["PFCOUNT", "h"], ":3\r\n");
+    call(&mut c, &["PFCOUNT", "m"], ":4\r\n");
+    call(
+        &mut c,
+        &["GEODIST", "g", "Palermo", "Catania", "km"],
+        "$8\r\n166.2742\r\n",
+    );
+    call(
+        &mut c,
+        &["ZRANGE", "stored", "0", "-1"],
+        "*1\r\n$7\r\nCatania\r\n",
+    );
+    call(
+        &mut c,
+        &["ZRANGE", "near", "0", "-1"],
+        "*1\r\n$7\r\nCatania\r\n",
+    );
+}

@@ -390,6 +390,7 @@ fn apply(ctx: &Context, name: &str, value: &str) {
         }
         "stream-node-max-entries" => ctx.set_stream_node_entries(number().max(0) as usize),
         "stream-node-max-bytes" => ctx.set_stream_node_bytes(number().max(0) as usize),
+        "hll-sparse-max-bytes" => ctx.set_hll_sparse_max_bytes(number().max(0) as usize),
         _ => {}
     }
 }

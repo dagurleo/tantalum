@@ -107,6 +107,9 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `BZPOPMIN`, `BZPOPMAX key [key ...] timeout`, `BZMPOP timeout numkeys key ... MIN\|MAX [COUNT n]` | As the blocking list commands |
 | `ZUNION`, `ZINTER`, `ZDIFF numkeys key ... [WEIGHTS ...] [AGGREGATE SUM\|MIN\|MAX] [WITHSCORES]`, their `STORE` forms, `ZINTERCARD` | Sets count as sorted sets with scores of 1, as in Redis. Each key is read on its own |
 | `ZSCAN key cursor [MATCH pattern] [COUNT n]` | As `SSCAN` |
+| `PFADD key [element ...]`, `PFCOUNT key [key ...]`, `PFMERGE destkey [sourcekey ...]`, `PFDEBUG GETREG\|DECODE\|ENCODING\|TODENSE key`, `PFSELFTEST` | HyperLogLog, in strings with the same bytes as Redis', sparse then dense (`hll-sparse-max-bytes`) |
+| `GEOADD key [NX\|XX] [CH] longitude latitude member ...`, `GEOPOS`, `GEOHASH`, `GEODIST key member member [M\|KM\|FT\|MI]` | Positions as sorted set scores, as in Redis |
+| `GEOSEARCH key FROMMEMBER member\|FROMLONLAT longitude latitude BYRADIUS radius unit\|BYBOX width height unit [ASC\|DESC] [COUNT count [ANY]] [WITHCOORD] [WITHDIST] [WITHHASH]`, `GEOSEARCHSTORE`, `GEORADIUS`, `GEORADIUS_RO`, `GEORADIUSBYMEMBER`, `GEORADIUSBYMEMBER_RO` | Results in the order Redis gives them; `STORE` and `STOREDIST` make a sorted set |
 | `SSCAN key cursor [MATCH pattern] [COUNT n]` | Small sets come whole with cursor 0, as in Redis; big ones `COUNT` at a time, each member there throughout returned at least once |
 | `XADD key [NOMKSTREAM] [MAXLEN\|MINID [=\|~] threshold [LIMIT n]] *\|id field value ...` | IDs as Redis makes and reads them (`ms-*` included). Trimming with `~` removes whole nodes where Redis' end, so it removes what Redis does, with `stream-node-max-entries` and `-bytes` as set |
 | `XLEN`, `XRANGE key start end [COUNT n]`, `XREVRANGE`, `XDEL key id ...`, `XTRIM key MAXLEN\|MINID [=\|~] threshold [LIMIT n]` | `(` for exclusive ends. An emptied stream stays, keeping its last ID, as in Redis |
@@ -187,17 +190,17 @@ pass on Redis 7.2.4 and fail on Tantalum, by library (`bench/frameworks/results-
 
 | Suite | Pass on Redis | Lost on Tantalum |
 |---|---|---|
-| redis-py 7.4.0 | 2,357 | 152 |
-| Predis 3.6.1 | 4,525 | 83 |
+| redis-py 7.4.0 | 2,357 | 84 |
+| Predis 3.6.1 | 4,525 | 35 |
 | node-redis 6.3.1 | 1,486 | 49 |
-| redis-rb 6.0.0 | 893 | 69 |
+| redis-rb 6.0.0 | 893 | 7 |
 | ioredis 5.11.0 | 566 | 1 |
-| phpredis 6.3.0 | 203 | 10 |
+| phpredis 6.3.0 | 203 | 4 |
 
-That's 364 of 10,530, and 346 of them need something that isn't here: geo commands, `ACL`,
-`FUNCTION`, HyperLogLog, `CLIENT TRACKING`, or `DUMP` and `RESTORE`. The other 18 are listed under
+That's 180 of 10,530, and 162 of them need something that isn't here: `ACL`, `FUNCTION`, `CLIENT
+TRACKING`, or `DUMP` and `RESTORE`. The other 18 are listed under
 "Not there yet". `tools/admin-diff.py` compares the admin commands with Redis 7.2.4 directly:
-3,278 commands and checks, every command's `COMMAND` entries and every setting among them, no
+3,353 commands and checks, every command's `COMMAND` entries and every setting among them, no
 differences.
 
 ## Design
@@ -455,8 +458,23 @@ differences.
   its skiplist and dict). In-process on 500k members: `ZADD` of a new
   member ~790 ns, `ZINCRBY` ~1.3 µs, `ZSCORE` ~400 ns, `ZREVRANK` ~1 µs,
   `ZREVRANGE 0 9 WITHSCORES` ~1 µs, `ZREM` ~1.6 µs. Scores reply exactly
-  as Redis 7.2 prints them: shortest digits, laid out as JavaScript's
-  `Number.prototype.toString` (plain from 1e-6 up to 1e21).
+  as Redis 7.2 prints them, by the same `fpconv_dtoa` (`vendor/fpconv`).
+- **HyperLogLog** (`src/hll.rs`, `src/cmd/hll.rs`) follows Redis 7.2.4's
+  `hyperloglog.c`, to the same strings byte for byte, sparse and dense, so `GET`
+  and `SET` move them between the two. Two things differ in how. A sparse one a
+  key goes on adding to gets a place of its own with some room, as Redis' string
+  has, rather than being written to the log anew each time, and scanning its
+  opcodes looks each one's span up in a table: which kind comes next can't be
+  predicted, and Redis' branches on it were most of `PFADD`'s time. `PFCOUNT`'s
+  cache in the string isn't logged, as it's only ever rebuilt.
+- **Geo** (`src/geo.rs`, `src/cmd/geo.rs`) keeps positions as sorted set scores
+  and searches as Redis 7.2.4's `geo.c` does, in the same boxes in the same
+  order, down to its partial sort, on which it depends which of several points at
+  one distance make a `COUNT`. A search reads only scores until a point is in
+  range, with the next ones prefetched, as a member's bytes are two more cache
+  misses (`ZRANGEBYSCORE` and `ZCOUNT` find where to start the same way).
+  `tools/geo-hll-diff.py` compares both families with Redis at random, replies
+  and stored bytes, and they pass Redis' own `unit/geo` and `unit/hyperloglog`.
 - **Transactions** (`src/transaction.rs`, `src/shard_lock.rs`): `EXEC`
   runs the queued commands as they always run, and each shard it touches
   stays its own until it ends. What it read can't change and what it wrote
@@ -797,51 +815,60 @@ caps the accounted memory. `--maxmemory-policy` decides what happens at the cap:
 
 ### Everyday apps (Agent37 VM, November 2026)
 
-What people use Redis for, rather than one command on its own. Tantalum 0.25.0,
+What people use Redis for, rather than one command on its own. Tantalum 0.26.0,
 Redis 8.10.3 and Valkey 9.1.3, each on one core of a 4-vCPU Xeon E-2388G, with
 memtier (3 × 80 clients) on the other three, persistence off, 1M items. Thousands
 of ops/s, medians of 3 rotated rounds of 12 s, the best in each row in bold
-(`bench/showcase/run.sh`, about 35 minutes, `summary.py` for the tables; raw
-output: `bench/showcase/results-agent37.txt`). "vs Redis" is Tantalum on epoll.
+(`bench/showcase/run.sh`, about 50 minutes, `summary.py` for the tables; raw
+output: `bench/showcase/results-agent37.txt`). "vs Redis" is Tantalum on epoll. The
+page cache (5 rounds) and login sessions are from re-runs: this VM runs at half speed
+for some minutes after it starts, which hit their first go, and made the page cache's
+lead look bigger than it is.
 
 | Example | Pipeline | Tantalum | Tantalum, io_uring | Redis | Valkey | vs Redis |
 |---|---|---|---|---|---|---|
-| Login sessions: a 5-field hash each, mostly `HGETALL` | 1 | 308 | **317** | 254 | 221 | +21.5% |
-|  | 16 | **2,005** | 1,996 | 1,004 | 779 | +99.7% |
-| Event stream: `XADD` capped at 1M, `XREVRANGE` of the latest | 1 | 237 | **252** | 168 | 167 | +41.2% |
-|  | 16 | 613 | **645** | 319 | 342 | +92.5% |
-| Rate limiter: a Lua script doing `INCR` and `EXPIRE` | 1 | 257 | **267** | 221 | 210 | +16.6% |
-|  | 16 | 830 | **841** | 627 | 561 | +32.3% |
-| Page cache: 1 KB values with TTLs, 9 reads to a write | 1 | 295 | **298** | 257 | 258 | +14.7% |
-|  | 16 | 1,280 | **1,418** | 1,086 | 1,065 | +17.9% |
-| Activity feeds: lists of the latest 50, `LRANGE` of 20 | 1 | 272 | **285** | 250 | 246 | +9.0% |
-|  | 16 | 961 | **1,116** | 853 | 840 | +12.7% |
-| Leaderboard: one sorted set of 1M players | 1 | 243 | **253** | 233 | 237 | +4.4% |
-|  | 16 | 693 | 700 | 679 | **705** | +2.1% |
+| Login sessions: a 5-field hash each, mostly `HGETALL` | 1 | 307 | **317** | 256 | 218 | +19.8% |
+|  | 16 | **1,974** | 1,956 | 1,035 | 770 | +90.7% |
+| Event stream: `XADD` capped at 1M, `XREVRANGE` of the latest | 1 | 239 | **253** | 168 | 166 | +41.9% |
+|  | 16 | 621 | **641** | 318 | 341 | +95.3% |
+| Nearby search: `GEOSEARCH` among 1M places | 1 | **50** | 50 | 35 | 34 | +45.9% |
+|  | 16 | **63** | 62 | 40 | 40 | +56.6% |
+| Rate limiter: a Lua script doing `INCR` and `EXPIRE` | 1 | 252 | **266** | 219 | 205 | +15.3% |
+|  | 16 | **819** | 812 | 622 | 554 | +31.6% |
+| Page cache: 1 KB values with TTLs, 9 reads to a write | 1 | 295 | **310** | 259 | 260 | +14.1% |
+|  | 16 | 1,336 | **1,486** | 1,087 | 1,066 | +22.9% |
+| Activity feeds: lists of the latest 50, `LRANGE` of 20 | 1 | 272 | **280** | 247 | 247 | +10.2% |
+|  | 16 | 1,003 | **1,088** | 848 | 828 | +18.3% |
+| Unique visitors: a HyperLogLog per page, `PFADD`, `PFCOUNT` | 1 | 285 | **301** | 254 | 239 | +12.3% |
+|  | 16 | 957 | **973** | 867 | 708 | +10.4% |
+| Leaderboard: one sorted set of 1M players | 1 | 237 | **253** | 232 | 236 | +2.5% |
+|  | 16 | 686 | 695 | 677 | **707** | +1.3% |
 
 The job queue is the real BullMQ 6.5.4 (`bench/bullmq/run.sh`, 100,000 jobs, three
 Node workers, medians of 3 rounds), in thousands of jobs/s. Tantalum's server used
-0.85 of its core processing, as the workers limit the rate, and Redis' 0.98. A job,
-added and processed, cost the server 16.9 µs of CPU, Redis 47.0 and Valkey 53.2.
+0.83 of its core processing, as the workers limit the rate, and Redis' 0.98. A job,
+added and processed, cost the server 17.7 µs of CPU, Redis 48.9 and Valkey 55.2.
 
 | BullMQ | Tantalum | Tantalum, io_uring | Redis | Valkey | vs Redis |
 |---|---|---|---|---|---|
-| Adding jobs | **59.5** | 59.2 | 37.6 | 35.8 | +58.3% |
-| Processing jobs | **69.5** | 69.1 | 30.5 | 26.7 | +127.9% |
+| Adding jobs | 55.8 | **59.4** | 34.1 | 34.5 | +63.5% |
+| Processing jobs | 66.6 | **70.4** | 29.9 | 25.9 | +122.6% |
 
 Memory for the same data, RSS after the fill, in MB:
 
 | Example | Tantalum | Redis | Valkey | vs Redis |
 |---|---|---|---|---|
-| Page cache | **1,025** | 1,321 | 1,330 | -22.4% |
-| Login sessions | **154** | 195 | 196 | -20.8% |
+| Page cache | **1,025** | 1,317 | 1,330 | -22.2% |
+| Login sessions | **154** | 195 | 196 | -21.0% |
 | Leaderboard | **53** | 83 | 83 | -36.0% |
-| Activity feeds | **185** | 190 | 189 | -3.0% |
+| Activity feeds | **185** | 190 | 189 | -2.6% |
 | Event stream | **48** | 54 | 54 | -10.7% |
+| Unique visitors | **15** | 21 | 20 | -27.6% |
+| Nearby search | **52** | 83 | 83 | -38.0% |
 
-Tantalum leads Redis everywhere. The closest is the leaderboard at pipeline 16, by
-2.1%, and on this VM anything within 3% counts as level; Valkey is 1.8% ahead of
-Tantalum there, level too.
+Tantalum leads Redis everywhere. The closest is the leaderboard, by 2.5% and 1.3%, and
+on this VM anything within 3% counts as level; Valkey is 3.0% ahead of Tantalum there at
+pipeline 16, level too.
 
 Two of these lost until 0.25.0. **The rate limiter** did 32% and 60% less than Redis,
 because a Lua script took all 256 shard locks first, as it may touch keys it didn't
@@ -854,6 +881,8 @@ resident, and that had filled up with blocks of sizes shards had outgrown. Sizes
 use now push those out: faults fell to 0.0002 a command, for 2% more RSS after the
 traffic (251 to 256 MB). The page cache at pipeline 16 rose from +1.9% to +17.9% in
 the same release, probably for the same reason, though that wasn't measured alone.
+Unique visitors and nearby search came in with 0.26.0, losing at first by up to 31%, for
+reasons in their design notes above.
 
 An error reply is the fastest reply there is, so `run.sh` asks every server the same
 questions after filling it, and `summary.py` compares the bytes each server sent per
@@ -1236,13 +1265,13 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
-- **Missing, by how many client library tests need it** (see above; 364 of 10,530): geo commands
-  (156), `ACL` (81), `FUNCTION` and `FCALL` (39), HyperLogLog (29), client-side caching with `CLIENT
-  TRACKING` (22), `DUMP`, `RESTORE` and `MIGRATE` (19), turning the log on with `CONFIG SET appendonly`
+- **Missing, by how many client library tests need it** (see above; 180 of 10,530): `ACL` (81),
+  `FUNCTION` and `FCALL` (39), client-side caching with `CLIENT
+  TRACKING` (22), `DUMP`, `RESTORE` and `MIGRATE` (20), turning the log on with `CONFIG SET appendonly`
   (5), `LATENCY HISTOGRAM` (5), `INFO commandstats` (3), `OBJECT IDLETIME` (1), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
-  the 209 commands that are here (1, which expects over 300).
+  the 224 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1306,7 +1335,7 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- Replication, ACL users, `DUMP`/`RESTORE`, HyperLogLog and geo commands.
+- Replication, ACL users, `DUMP`/`RESTORE`.
 - **Settings with a syntax of their own aren't checked**: `client-output-buffer-limit`,
   `latency-tracking-info-percentiles`, `oom-score-adj-values`, `locale-collate` and
   `proc-title-template` take anything, as none of them does anything here.

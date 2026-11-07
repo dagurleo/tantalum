@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # What people use Redis for, on Tantalum, Redis and Valkey: a page cache, login
-# sessions, a rate limiter, a leaderboard, activity feeds and an event stream.
+# sessions, a rate limiter, a leaderboard, activity feeds, an event stream, counting
+# unique visitors and finding what's nearby.
 # Each server gets one core (SERVER_CPUS), memtier the rest of the machine, so
 # the server is what limits the rate. Persistence is off everywhere. The job
 # queue example is the real BullMQ: bench/bullmq/run.sh.
@@ -11,7 +12,7 @@
 #   python3 bench/showcase/summary.py results.txt
 #
 # --privileged allows io_uring. TANTALUM picks a build, ONLY some of the
-# examples, ITEMS how much data, ROUNDS and TIME how long (about 35 minutes as
+# examples, ITEMS how much data, ROUNDS and TIME how long (about 50 minutes as
 # it stands). All the servers stay up while each is tested in turn, and each
 # round starts with a different one, so a machine's slow moments are shared.
 #
@@ -27,7 +28,7 @@ TIME=${TIME:-12}
 ITEMS=${ITEMS:-1000000}
 SERVER_CPUS=${SERVER_CPUS:-0}
 CLIENT_CPUS=${CLIENT_CPUS:-1-3}
-read -ra ONLY <<<"${ONLY:-cache sessions limiter leaderboard feed events}"
+read -ra ONLY <<<"${ONLY:-cache sessions limiter leaderboard feed events uniques nearby}"
 USERS=$((ITEMS / 10))
 
 NAMES=(tantalum tantalum-uring redis valkey)
@@ -232,6 +233,48 @@ events() {
   traffic events --key-prefix= --key-minimum 1 --key-maximum "$ITEMS" --data-size 32 \
     --command "XADD events MAXLEN ~ $ITEMS * user __key__ kind page-view page __data__" --command-ratio 1 --command-key-pattern G \
     --command 'XREVRANGE events + - COUNT 10' --command-ratio 1 --command-key-pattern G
+}
+
+# Unique visitors, as analytics count them: a HyperLogLog per page, sparse at first,
+# popular ones turning dense. Each visit is added, and the count read now and then.
+uniques() {
+  local pages=$((ITEMS / 100))
+  awk -v n="$pages" 'BEGIN {
+    srand(3)
+    for (i = 1; i <= n; i++) {
+      printf "PFADD page:%d", i
+      for (j = 0; j < 200; j++) printf " visitor-%d", rand() * 1e9
+      print ""
+    }
+  }' | to_resp >/tmp/showcase-fill
+  fill_from /tmp/showcase-fill
+  note_memory uniques "$pages"
+  agree DBSIZE
+  agree PFCOUNT page:1234
+  agree PFCOUNT page:1 page:2 page:3
+  agree PFDEBUG ENCODING page:1234
+  traffic uniques --key-prefix= --key-minimum 1 --key-maximum "$pages" --data-size 16 \
+    --command 'PFADD page:__key__ __data__' --command-ratio 9 --command-key-pattern G \
+    --command 'PFCOUNT page:__key__' --command-ratio 1 --command-key-pattern G
+}
+
+# A delivery app: what's near this place, where is it, and couriers reporting where
+# they are, kept apart so that what's searched stays the same for every server.
+nearby() {
+  awk -v n="$ITEMS" 'BEGIN {
+    srand(4)
+    for (i = 1; i <= n; i++) printf "GEOADD places %.6f %.6f place:%d\n", -10 + rand() * 40, 35 + rand() * 25, i
+  }' | to_resp >/tmp/showcase-fill
+  fill_from /tmp/showcase-fill
+  note_memory nearby "$ITEMS"
+  agree ZCARD places
+  agree GEOHASH places place:12345
+  agree GEODIST places place:1 place:2 km
+  agree GEOSEARCH places FROMMEMBER place:12345 BYRADIUS 20 km ASC COUNT 10 WITHDIST
+  traffic nearby --key-prefix= --key-minimum 1 --key-maximum "$ITEMS" \
+    --command 'GEOSEARCH places FROMMEMBER place:__key__ BYRADIUS 10 km ASC COUNT 10' --command-ratio 8 --command-key-pattern G \
+    --command 'GEOPOS places place:__key__' --command-ratio 1 --command-key-pattern G \
+    --command 'GEOADD couriers 13.__key__ 52.__key__ courier:__key__' --command-ratio 1 --command-key-pattern G
 }
 
 echo "# $(uname -r), $(nproc) CPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"

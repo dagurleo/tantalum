@@ -108,6 +108,18 @@ impl KeyValue {
         unsafe { slice::from_raw_parts(self.data().add(h.key_len as usize), h.value_len as usize) }
     }
 
+    /// Bytes its value has room for.
+    pub fn value_capacity(&self) -> usize {
+        self.header().capacity as usize
+    }
+
+    /// Shortens the value [`edit`](Self::edit) lent, the only reference.
+    pub fn shorten(&mut self, len: usize) {
+        debug_assert!(len <= self.value().len());
+        // SAFETY: `&mut self`, and only the length changes, to one that's in use.
+        unsafe { self.0.as_mut().value_len = len as u32 };
+    }
+
     /// The value to change where it lies, grown to `len` bytes (in zeroes), if
     /// this is the only reference and it has the room. Otherwise, for instance
     /// while a reader holds a reference to send the value, `None`.

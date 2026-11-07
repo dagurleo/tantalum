@@ -21,6 +21,7 @@
 //! JavaScript's `Number.prototype.toString`), and parse as its `strtod`.
 
 use std::cmp::Ordering;
+use std::ffi::{c_char, c_int};
 
 use crate::big::Paged;
 use crate::set::BigSet;
@@ -83,10 +84,18 @@ pub fn cmp(a: (f64, &[u8]), b: (f64, &[u8])) -> Ordering {
         .then_with(|| a.1.cmp(b.1))
 }
 
-/// Writes `x` as Redis 7.2 replies a double: shortest round-trip digits,
-/// laid out as JavaScript's `Number.prototype.toString` does (plain from
-/// 1e-6 up to 1e21, exponent form outside), `inf`, `-inf`, `nan`; -0 is 0.
+unsafe extern "C" {
+    /// Redis' shortest round-trip digits of `fp`, without a terminating zero.
+    fn fpconv_dtoa(fp: f64, dest: *mut c_char) -> c_int;
+}
+
+/// Writes `x` as Redis 7.2 replies a double (`d2string`): `nan`, `inf`, `-inf`,
+/// `-0`, a whole number that fits a safe `long long` in full, and anything else
+/// by Redis' own `fpconv_dtoa`, whose layout and digits it follows exactly. (A
+/// small sorted set never has -0: see [`PackedIter`].)
 pub fn format_score(x: f64, out: &mut Vec<u8>) {
+    /// `LLONG_MAX / 2`, as a double.
+    const SAFE_WHOLE: f64 = 4_611_686_018_427_387_904.0;
     if x.is_nan() {
         return out.extend_from_slice(b"nan");
     }
@@ -94,79 +103,16 @@ pub fn format_score(x: f64, out: &mut Vec<u8>) {
         return out.extend_from_slice(if x < 0.0 { b"-inf" } else { b"inf" });
     }
     if x == 0.0 {
-        return out.push(b'0');
+        return out.extend_from_slice(if x.is_sign_negative() { b"-0" } else { b"0" });
     }
-    // Whole numbers below 2^53 (counts, ranks, timestamps) print as
-    // integers, without the general path.
-    if x.fract() == 0.0 && x.abs() < 9007199254740992.0 {
+    if x.abs() <= SAFE_WHOLE && x.fract() == 0.0 {
         return out.extend_from_slice(itoa::Buffer::new().format(x as i64).as_bytes());
     }
-    if x < 0.0 {
-        out.push(b'-');
-    }
-    // Shortest digits and exponent, from Rust's own shortest formatting,
-    // written to the stack.
-    let mut sci = Stack::default();
-    std::fmt::Write::write_fmt(&mut sci, format_args!("{:e}", x.abs())).expect("fits");
-    let sci = &sci.0[..sci.1];
-    let e = sci.iter().position(|&b| b == b'e').expect("an exponent");
-    let (mantissa, exp) = (&sci[..e], &sci[e + 1..]);
-    let mut digits = [0u8; 24];
-    let mut k = 0;
-    for &b in mantissa.iter().filter(|&&b| b != b'.') {
-        digits[k] = b;
-        k += 1;
-    }
-    let digits = &digits[..k];
-    let k = k as i32;
-    // The decimal point goes after `n` digits.
-    let exp: i32 = std::str::from_utf8(exp)
-        .expect("ASCII")
-        .parse()
-        .expect("an exponent");
-    let n = exp + 1;
-    if k <= n && n <= 21 {
-        out.extend_from_slice(digits);
-        out.extend(std::iter::repeat_n(b'0', (n - k) as usize));
-    } else if 0 < n && n <= 21 {
-        out.extend_from_slice(&digits[..n as usize]);
-        out.push(b'.');
-        out.extend_from_slice(&digits[n as usize..]);
-    } else if -6 < n && n <= 0 {
-        out.extend_from_slice(b"0.");
-        out.extend(std::iter::repeat_n(b'0', (-n) as usize));
-        out.extend_from_slice(digits);
-    } else {
-        out.push(digits[0]);
-        if k > 1 {
-            out.push(b'.');
-            out.extend_from_slice(&digits[1..]);
-        }
-        out.push(b'e');
-        out.push(if n - 1 < 0 { b'-' } else { b'+' });
-        out.extend_from_slice((n - 1).abs().to_string().as_bytes());
-    }
-}
-
-/// A small buffer on the stack to format into.
-struct Stack([u8; 40], usize);
-
-impl Default for Stack {
-    fn default() -> Self {
-        Stack([0; 40], 0)
-    }
-}
-
-impl std::fmt::Write for Stack {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        let end = self.1 + s.len();
-        self.0
-            .get_mut(self.1..end)
-            .ok_or(std::fmt::Error)?
-            .copy_from_slice(s.as_bytes());
-        self.1 = end;
-        Ok(())
-    }
+    let mut digits = [0 as c_char; 32];
+    // SAFETY: it writes at most 24 bytes, and a finite number has its digits.
+    let len = unsafe { fpconv_dtoa(x, digits.as_mut_ptr()) } as usize;
+    // SAFETY: those bytes are initialized, and bytes and chars have the same layout.
+    out.extend_from_slice(unsafe { std::slice::from_raw_parts(digits.as_ptr().cast(), len) });
 }
 
 pub fn score_string(x: f64) -> Vec<u8> {
@@ -501,7 +447,8 @@ impl<'a> Iterator for PackedIter<'a> {
         let len = take_varint(&mut rest).expect("a member") as usize;
         let (member, rest) = rest.split_at(len);
         self.body = rest;
-        Some((score, member))
+        // As in Redis, whose listpack keeps `-0` as the integer 0.
+        Some((score + 0.0, member))
     }
 }
 
@@ -766,6 +713,45 @@ impl BigZSet {
         self.sizes.before(c) + i
     }
 
+    /// [`partition_point`](Self::partition_point) by score alone, which doesn't
+    /// read a single member: two cache misses at each step of the search.
+    pub fn partition_by_score(&self, before: impl Fn(f64) -> bool) -> usize {
+        let score = |pos: u32| self.scores.get(pos as usize);
+        let c = self
+            .order
+            .partition_point(|chunk| before(score(*chunk.last().expect("non-empty"))));
+        if c == self.order.len() {
+            return self.len();
+        }
+        let i = self.order[c].partition_point(|&p| before(score(p)));
+        self.sizes.before(c) + i
+    }
+
+    /// Entries from rank `start`, lowest first, until `f` returns false. Members
+    /// are read only if `f` asks ([`LazyMember`]): the scores come in cache ahead.
+    pub fn scan_from(&self, start: usize, mut f: impl FnMut(f64, LazyMember<'_>) -> bool) {
+        const AHEAD: usize = 8;
+        if start >= self.len() {
+            return;
+        }
+        let (mut c, mut i) = self.sizes.find(start);
+        while c < self.order.len() {
+            let chunk = &self.order[c];
+            while i < chunk.len() {
+                if let Some(&ahead) = chunk.get(i + AHEAD) {
+                    self.scores.prefetch(ahead as usize);
+                }
+                let pos = chunk[i] as usize;
+                if !f(self.scores.get(pos), LazyMember::At(self, pos)) {
+                    return;
+                }
+                i += 1;
+            }
+            c += 1;
+            i = 0;
+        }
+    }
+
     /// Entries `start..end` by rank, lowest first (or highest first if `rev`, counting ranks from the highest).
     pub fn for_range(&self, start: usize, end: usize, rev: bool, mut f: impl FnMut(f64, &[u8])) {
         if start >= end {
@@ -856,6 +842,21 @@ impl BigZSet {
     }
 }
 
+/// An entry's member, read when it's asked for.
+pub enum LazyMember<'a> {
+    Here(&'a [u8]),
+    At(&'a BigZSet, usize),
+}
+
+impl<'a> LazyMember<'a> {
+    pub fn get(&self) -> &'a [u8] {
+        match *self {
+            LazyMember::Here(member) => member,
+            LazyMember::At(set, pos) => set.members.get_index(pos),
+        }
+    }
+}
+
 /// A sorted set being read: packed or big.
 #[derive(Clone, Copy)]
 pub enum ZView<'a> {
@@ -889,6 +890,28 @@ impl<'a> ZView<'a> {
         match self {
             ZView::Packed(z) => z.iter().take_while(|&(s, m)| before(s, m)).count(),
             ZView::Big(z) => z.partition_point(before),
+        }
+    }
+
+    /// See [`BigZSet::partition_by_score`].
+    pub fn partition_by_score(&self, before: impl Fn(f64) -> bool) -> usize {
+        match self {
+            ZView::Packed(z) => z.iter().take_while(|&(s, _)| before(s)).count(),
+            ZView::Big(z) => z.partition_by_score(before),
+        }
+    }
+
+    /// See [`BigZSet::scan_from`].
+    pub fn scan_from(&self, start: usize, mut f: impl FnMut(f64, LazyMember<'_>) -> bool) {
+        match self {
+            ZView::Packed(z) => {
+                for (score, member) in z.iter().skip(start) {
+                    if !f(score, LazyMember::Here(member)) {
+                        return;
+                    }
+                }
+            }
+            ZView::Big(z) => z.scan_from(start, f),
         }
     }
 
@@ -1034,7 +1057,7 @@ mod tests {
             (1.1, "1.1"),
             (0.1, "0.1"),
             (3.0, "3"),
-            (-0.0, "0"),
+            (-0.0, "-0"),
             (1e15, "1000000000000000"),
             (1e17, "100000000000000000"),
             (123456789012345678.0, "123456789012345680"),
@@ -1052,7 +1075,11 @@ mod tests {
             (-1.5, "-1.5"),
             (12345678.9, "12345678.9"),
             (9007199254740992.0, "9007199254740992"),
-            (1e20, "100000000000000000000"),
+            (1e20, "1e+20"),
+            (15194.382059851243, "1.5194382059851243e+4"),
+            (0.0009088329744167203, "9.088329744167203e-4"),
+            (1152921504606846976.0, "1152921504606846976"),
+            (4611686018427388928.0, "4611686018427389000"),
             (1e-6, "0.000001"),
             (-123.456e-9, "-1.23456e-7"),
         ] {

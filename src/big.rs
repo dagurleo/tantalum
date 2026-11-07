@@ -116,7 +116,7 @@ impl<T: Copy> Paged<T> {
 
     /// Starts loading item `i`, which is there.
     #[inline]
-    fn prefetch(&self, i: usize) {
+    pub fn prefetch(&self, i: usize) {
         let page = self.pages[i >> PAGE_BITS].as_ptr() as usize;
         prefetch_line(page + (i & (PAGE - 1)) * size_of::<T>());
     }

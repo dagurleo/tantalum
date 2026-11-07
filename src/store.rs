@@ -489,6 +489,10 @@ pub enum Update {
     /// Sets its value to this, of this kind, keeping its TTL, or creates it
     /// without one.
     Replace(Kind, Vec<u8>),
+    /// Sets its value to this string, kept apart with some room, keeping its TTL
+    /// or creating it without one: for one [`Store::edit_string_room`] will go on
+    /// changing where it lies, as its length changes a little at a time.
+    ReplaceWithRoom(Vec<u8>),
     /// Sets its value to this big collection, keeping its TTL, or creates it
     /// without one.
     Object(Collection),
@@ -2352,13 +2356,13 @@ impl Store {
         }
     }
 
-    /// Changes a big string where it lies, if it can: the key holds one, nothing
-    /// else holds a reference to it now, and it has room for the length
-    /// `new_len` gives (from its length, or `None` not to try). `edit` gets its
-    /// bytes, new ones zero, and its old length, and returns its result and
-    /// whether the string changed. Otherwise this does nothing and returns
-    /// `None`, for the caller's [`Store::update_key`]: small strings are cheap
-    /// to write again, and a reader holding a reference keeps what it has.
+    /// Changes a string where it lies, if it can: the key holds one, nothing else
+    /// holds a reference to it now, and it has room for the length `new_len`
+    /// gives (from its length, or `None` not to try): a small one only keeps its
+    /// length. `edit` gets its bytes, new ones zero, and its old length, and
+    /// returns its result and whether the string changed. Otherwise this does
+    /// nothing and returns `None`, for the caller's [`Store::update_key`]: a
+    /// reader holding a reference keeps what it has.
     pub(crate) fn edit_string<R>(
         &self,
         key: Key<'_>,
@@ -2374,15 +2378,26 @@ impl Store {
         let inner = &mut *guard;
         let (existing, expired) = inner.lookup_live(hash, key, now, &mut garbage);
         let result = existing.and_then(|(loc, header)| {
-            let Body::External(i) = header.body else {
-                return None;
-            };
             if header.kind() != Kind::String {
                 return None;
             }
-            let value = inner.externals[i as usize].as_mut().expect("live external");
-            let old = value.value().len();
-            let bytes = value.edit(new_len(old)?)?;
+            let (bytes, old) = match &header.body {
+                Body::External(i) => {
+                    let value = inner.externals[*i as usize]
+                        .as_mut()
+                        .expect("live external");
+                    let old = value.value().len();
+                    (value.edit(new_len(old)?)?, old)
+                }
+                Body::Inline { value: range, .. } => {
+                    let old = range.len();
+                    if new_len(old)? != old {
+                        return None;
+                    }
+                    let segment = inner.segment_mut(split(loc).0);
+                    (&mut segment.buf[range.clone()], old)
+                }
+            };
             let (result, changed) = edit(bytes, old);
             inner.touch(loc, &header);
             if changed {
@@ -2397,6 +2412,85 @@ impl Store {
         drop(guard);
         drop(garbage); // frees values outside the lock
         result
+    }
+
+    /// [`edit_string`](Self::edit_string) for a change of length too: `edit` gets
+    /// its bytes, then `extra` zeroes if it's kept apart (`Update::ReplaceWithRoom`)
+    /// and has the room for them, and its length, and returns its result, its new
+    /// length, which only a string with the zeroes may change, and whether it
+    /// changed. `None` if there's no such string, for the caller's
+    /// [`Store::update_key`].
+    pub(crate) fn edit_string_room<R>(
+        &self,
+        key: Key<'_>,
+        now: Millis,
+        extra: usize,
+        edit: impl FnOnce(&mut [u8], usize) -> (R, usize, bool),
+    ) -> Option<R> {
+        let (hash, index) = self.locate(key.hash);
+        let key = key.bytes;
+        let shard = &self.shards[index];
+        let mut garbage = Vec::new();
+        let mut guard = self.lock(shard);
+        let inner = &mut *guard;
+        let (existing, expired) = inner.lookup_live(hash, key, now, &mut garbage);
+        let result = existing.and_then(|(loc, header)| {
+            if header.kind() != Kind::String {
+                return None;
+            }
+            let (result, changed) = match &header.body {
+                Body::External(i) => {
+                    let value = inner.externals[*i as usize]
+                        .as_mut()
+                        .expect("live external");
+                    let old = value.value().len();
+                    let room = if old + extra <= value.value_capacity() {
+                        extra
+                    } else {
+                        0
+                    };
+                    let (result, len, changed) = edit(value.edit(old + room)?, old);
+                    value.shorten(len);
+                    (result, changed)
+                }
+                Body::Inline { value: range, .. } => {
+                    let old = range.len();
+                    let segment = inner.segment_mut(split(loc).0);
+                    let (result, len, changed) = edit(&mut segment.buf[range.clone()], old);
+                    debug_assert_eq!(len, old);
+                    (result, changed)
+                }
+            };
+            inner.touch(loc, &header);
+            if changed {
+                inner.mem.writes += 1;
+                inner.changed(key, false);
+            }
+            Some(result)
+        });
+        if expired {
+            self.sync_usage(shard, inner, false);
+        }
+        drop(guard);
+        drop(garbage); // frees values outside the lock
+        result
+    }
+
+    #[cfg(test)]
+    fn has_ttl_for_test(&self, key: Key<'_>, now: Millis) -> bool {
+        self.update_key(key, now, |current| {
+            (
+                Update::Peek,
+                current.is_some_and(|c| matches!(c.expiry, Expiry::At(_))),
+            )
+        })
+        .unwrap()
+    }
+
+    /// Takes away a key's expiry: what a command's new value does to what the key
+    /// held, as Redis' `setKey`, where the value is written without touching it.
+    pub(crate) fn forget_expiry(&self, key: Key<'_>, now: Millis) {
+        let _ = self.update_key(key, now, |_| (Update::Expire(Expiry::Never), ()));
     }
 
     /// Applies `update` to the key's live entry (`existing`) under its
@@ -2426,6 +2520,20 @@ impl Store {
                     &existing,
                     Kind::String,
                     value,
+                    false,
+                    may_evict,
+                    garbage,
+                );
+            }
+            (Update::ReplaceWithRoom(value), _) => {
+                return self.write_bytes(
+                    inner,
+                    hash,
+                    key,
+                    &existing,
+                    Kind::String,
+                    &value,
+                    true,
                     may_evict,
                     garbage,
                 );
@@ -2434,7 +2542,7 @@ impl Store {
                 if !kind.is_collection() || key.len() + value.len() + 20 <= INLINE_MAX =>
             {
                 return self.write_bytes(
-                    inner, hash, key, &existing, kind, &value, may_evict, garbage,
+                    inner, hash, key, &existing, kind, &value, false, may_evict, garbage,
                 );
             }
             // A packed collection with a key too big to pack it with.
@@ -2513,10 +2621,12 @@ impl Store {
         existing: &Option<(u32, Header)>,
         kind: Kind,
         value: &[u8],
+        apart: bool,
         may_evict: bool,
         garbage: &mut Vec<Freed>,
     ) -> Result<bool, Retry> {
-        if let Some((loc, header)) = existing
+        if !apart
+            && let Some((loc, header)) = existing
             && let Body::Inline { value: range, .. } = &header.body
             && range.len() == value.len()
             && header.kind() == kind
@@ -2535,8 +2645,8 @@ impl Store {
             ),
             None => (None, NO_EXPIRY, 0),
         };
-        // Only a huge key makes this external.
-        let external = (key.len() + value.len() + 20 > INLINE_MAX).then(|| {
+        // Asked for, or only a huge key makes this external.
+        let external = (apart || key.len() + value.len() + 20 > INLINE_MAX).then(|| {
             // A big string growing, as `APPEND` and `SETBIT` do, is likely to go
             // on: with room for it, `edit_string` can do that without copying it.
             let grown = existing.as_ref().is_some_and(|(loc, header)| {
@@ -2545,7 +2655,9 @@ impl Store {
                     && matches!(header.body, Body::External(_))
                     && inner.value_ref(*loc, header).as_bytes().len() < value.len()
             });
-            let room = if grown {
+            let room = if apart {
+                (value.len() / 8).clamp(32, 300)
+            } else if grown {
                 value.len().min(GROWING_STRING_ROOM)
             } else {
                 0

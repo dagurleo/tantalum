@@ -3,8 +3,10 @@
 mod admin;
 mod bit;
 mod eval;
+mod geo;
 mod group;
 mod hash;
+mod hll;
 mod keys;
 mod list;
 mod multi;
@@ -349,6 +351,21 @@ static COMMANDS: &[Command] = &[
     Command { name: "zinterstore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: zset::zinterstore },
     Command { name: "zdiffstore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: zset::zdiffstore },
     Command { name: "zintercard", arity: -3, flags: &["readonly"], fast: false, keys: NO_KEYS, run: zset::zintercard },
+    Command { name: "pfadd", arity: -2, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hll::pfadd },
+    Command { name: "pfcount", arity: -2, flags: &["readonly"], fast: false, keys: ALL_KEYS, run: hll::pfcount },
+    Command { name: "pfmerge", arity: -2, flags: &["write", "denyoom"], fast: false, keys: ALL_KEYS, run: hll::pfmerge },
+    Command { name: "pfdebug", arity: 3, flags: &["write", "denyoom", "admin"], fast: false, keys: (2, 2, 1), run: hll::pfdebug },
+    Command { name: "pfselftest", arity: 1, flags: &["admin"], fast: false, keys: NO_KEYS, run: hll::pfselftest },
+    Command { name: "geoadd", arity: -5, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: geo::geoadd },
+    Command { name: "geohash", arity: -2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: geo::geohash },
+    Command { name: "geopos", arity: -2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: geo::geopos },
+    Command { name: "geodist", arity: -4, flags: &["readonly"], fast: false, keys: ONE_KEY, run: geo::geodist },
+    Command { name: "georadius", arity: -6, flags: &["write", "denyoom", "movablekeys"], fast: false, keys: ONE_KEY, run: geo::georadius },
+    Command { name: "georadius_ro", arity: -6, flags: &["readonly"], fast: false, keys: ONE_KEY, run: geo::georadius_ro },
+    Command { name: "georadiusbymember", arity: -5, flags: &["write", "denyoom", "movablekeys"], fast: false, keys: ONE_KEY, run: geo::georadiusbymember },
+    Command { name: "georadiusbymember_ro", arity: -5, flags: &["readonly"], fast: false, keys: ONE_KEY, run: geo::georadiusbymember_ro },
+    Command { name: "geosearch", arity: -7, flags: &["readonly"], fast: false, keys: ONE_KEY, run: geo::geosearch },
+    Command { name: "geosearchstore", arity: -8, flags: &["write", "denyoom"], fast: false, keys: (1, 2, 1), run: geo::geosearchstore },
 ];
 
 /// Runs one command and writes its reply to `out`. `args` must be non-empty.
@@ -547,16 +564,15 @@ fn held_back(ctx: &Context, session: &Session, command: &Command) -> bool {
         Some(false) => {
             command.writes()
                 || match command.name {
-                    "publish" | "spublish" | "eval" | "evalsha" | "script" | "wait" | "waitaof" => {
-                        true
-                    }
+                    "publish" | "spublish" | "pfcount" | "eval" | "evalsha" | "script" | "wait"
+                    | "waitaof" => true,
                     "exec" => session.multi.as_ref().is_some_and(|queue| {
                         (0..queue.len()).any(|i| {
                             let name = queue.command(i);
                             find_write_command(name.get(0)).is_some()
                                 || matches!(
                                     find_command(name.get(0)).map(|c| c.name),
-                                    Some("publish" | "spublish" | "eval" | "evalsha")
+                                    Some("publish" | "spublish" | "pfcount" | "eval" | "evalsha")
                                 )
                         })
                     }),
