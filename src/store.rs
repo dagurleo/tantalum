@@ -1423,12 +1423,14 @@ pub struct Store {
     client_memory: AtomicI64,
     flush_bytes: AtomicUsize,
     ready: Ready,
+    /// What transactions take turns by (see [`Store::exclusive`]), in database 0.
+    transactions: Mutex<()>,
     /// Which numbered database this is (`SELECT`).
     index: u32,
     /// Database 0, to any other. Each database is a store of its own but for
     /// the shard locks, which all use database 0's so that what holds a shard
     /// holds that shard of every one: `EXEC`, scripts and `MOVE` hold what
-    /// they always held, and what's in other databases costs database 0
+    /// they touch wherever it is, and what's in other databases costs database 0
     /// nothing. Database 0 also counts for all of them: memory, keys ready for
     /// blocked clients, and whether it's loading. (This and `others` keep
     /// each other alive, which is for as long as the server runs.)
@@ -1453,9 +1455,9 @@ fn new_shards(n: usize) -> Box<[Shard]> {
 pub(crate) struct ScriptShards<'a>(Shards<'a>);
 
 enum Shards<'a> {
-    /// This thread holds every shard already.
-    All,
-    Some {
+    /// This thread runs a transaction, which holds what it uses as it uses it.
+    Transaction,
+    Planned {
         store: &'a Store,
         held: shard_lock::Partial<'a, ShardInner>,
         /// Every shard asked for, held or not.
@@ -1465,10 +1467,10 @@ enum Shards<'a> {
 
 impl ScriptShards<'_> {
     /// Holds the shards of `keys` too. False if one couldn't be taken
-    /// without waiting for it while holding others: the script must start
+    /// without waiting long for it while holding others: the script must start
     /// over (it can't have written yet) holding [`wanted`](Self::wanted).
     pub(crate) fn hold(&mut self, keys: &[&[u8]]) -> bool {
-        let Shards::Some {
+        let Shards::Planned {
             store,
             held,
             wanted,
@@ -1492,8 +1494,8 @@ impl ScriptShards<'_> {
     /// Every shard asked for.
     pub(crate) fn wanted(&self) -> &[usize] {
         match &self.0 {
-            Shards::All => &[],
-            Shards::Some { wanted, .. } => wanted,
+            Shards::Transaction => &[],
+            Shards::Planned { wanted, .. } => wanted,
         }
     }
 }
@@ -1575,6 +1577,7 @@ impl Store {
             client_memory: AtomicI64::new(0),
             flush_bytes: AtomicUsize::new(flush_bytes),
             ready: Ready::default(),
+            transactions: Mutex::new(()),
             index: 0,
             base: None,
             others: (1..databases).map(|_| OnceLock::new()).collect(),
@@ -1666,6 +1669,7 @@ impl Store {
                 client_memory: AtomicI64::new(0),
                 flush_bytes: AtomicUsize::new(self.flush_bytes.load(Relaxed)),
                 ready: Ready::default(),
+                transactions: Mutex::new(()),
                 index: index as u32,
                 base: Some(self.clone()),
                 others: Box::default(),
@@ -1685,6 +1689,35 @@ impl Store {
         match &self.base {
             None => shard.inner.lock(),
             Some(base) => base.same_shard(self, shard).inner.lock_for(&shard.inner),
+        }
+    }
+
+    /// Locks shards `a` and `b` of this database, lower first: the lower, and
+    /// the higher if they're not the same one.
+    fn lock_two(
+        &self,
+        a: usize,
+        b: usize,
+    ) -> (
+        ShardGuard<'_, ShardInner>,
+        Option<ShardGuard<'_, ShardInner>>,
+    ) {
+        if a == b {
+            return (self.lock(&self.shards[a]), None);
+        }
+        let (low, high) = (&self.shards[a.min(b)], &self.shards[a.max(b)]);
+        loop {
+            let first = self.lock(low);
+            let second = match &self.base {
+                None => high.inner.lock_next_for(&high.inner),
+                Some(base) => base.same_shard(self, high).inner.lock_next_for(&high.inner),
+            };
+            if second.is_some() {
+                return (first, second);
+            }
+            // A transaction holding the higher may be waiting for the lower.
+            drop(first);
+            std::thread::yield_now();
         }
     }
 
@@ -2202,8 +2235,7 @@ impl Store {
         if grows && !self.room_for(ia, hash_a, a.bytes.len() + b.bytes.len(), now) {
             return Err(OutOfMemory);
         }
-        let mut low = self.lock(&self.shards[ia.min(ib)]);
-        let mut high = (ia != ib).then(|| self.lock(&self.shards[ia.max(ib)]));
+        let (mut low, mut high) = self.lock_two(ia, ib);
         let mut pair = Pair {
             store: self,
             low: &mut low,
@@ -2771,39 +2803,41 @@ impl Store {
             .count()
     }
 
-    /// The shards a native script runs holding: every one if this thread
-    /// holds them already (`EXEC`), else none yet but those in `start`,
-    /// taken in order. The script asks for the rest ([`ScriptShards::hold`])
-    /// before it uses their keys.
+    /// The shards a native script runs holding: those it uses as it uses them
+    /// inside a transaction (`EXEC`), else none yet but those in `start`, taken
+    /// in order. The script asks for the rest ([`ScriptShards::hold`]) before it
+    /// uses their keys.
     pub(crate) fn script_shards(&self, start: &[usize]) -> ScriptShards<'_> {
         let store = self.base();
-        if shard_lock::holding_all() {
-            return ScriptShards(Shards::All);
+        if shard_lock::in_transaction() {
+            return ScriptShards(Shards::Transaction);
         }
         let mut held = shard_lock::Partial::new();
         let mut wanted = start.to_vec();
         wanted.sort_unstable();
         wanted.dedup();
-        for &i in &wanted {
-            // Ascending, so each is waited for.
-            held.take(i, &store.shards[i].inner);
+        // Ascending, so each is waited for, but not for long.
+        while !wanted.iter().all(|&i| held.take(i, &store.shards[i].inner)) {
+            held.let_go();
+            std::thread::yield_now();
         }
-        ScriptShards(Shards::Some {
+        ScriptShards(Shards::Planned {
             store,
             held,
             wanted,
         })
     }
 
-    /// Runs `f` with every shard locked by this thread, so that nothing
-    /// else touches the store meanwhile while `f` uses it as always: `EXEC`
-    /// and scripts.
+    /// Runs `f` as a transaction, using the store as always: `EXEC`, scripts,
+    /// and commands on several keys. It's as if nothing else ran meanwhile: each
+    /// shard it touches is this thread's until it ends (`src/shard_lock.rs`),
+    /// and they run one at a time. Commands on other shards carry on.
     pub(crate) fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
-        // Holding them already (a script run by `EXEC`).
-        if shard_lock::holding_all() {
+        // In one already (a script run by `EXEC`).
+        if shard_lock::in_transaction() {
             return f();
         }
-        let _holding = shard_lock::hold_all(self.base().shards.iter().map(|s| &s.inner));
+        let _transaction = shard_lock::transaction(&self.base().transactions);
         f()
     }
 
@@ -2875,8 +2909,7 @@ impl Store {
         let mut attempts = 0;
         loop {
             let mut garbage = Vec::new();
-            let mut low = self.lock(&self.shards[a.min(b)]);
-            let mut high = (a != b).then(|| self.lock(&self.shards[a.max(b)]));
+            let (mut low, mut high) = self.lock_two(a, b);
             let (src, mut dst): (&mut ShardInner, Option<&mut ShardInner>) =
                 match high.as_deref_mut() {
                     None => (&mut *low, None),
@@ -3153,7 +3186,8 @@ impl Store {
             let mut garbage = Vec::new();
             // A native script's thread holds only its own shards: it takes
             // others only if they're free, so as never to wait while holding.
-            let guard = if shard_lock::holding_some() {
+            // Nor does a transaction keep a shard just for evicting from it.
+            let guard = if shard_lock::holding_some() || shard_lock::in_transaction() {
                 db.try_lock_here(shard)
             } else {
                 Some(db.lock(shard))

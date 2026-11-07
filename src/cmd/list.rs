@@ -77,12 +77,8 @@ fn reading(
     f: impl FnOnce(Option<ListView<'_>>, &mut Vec<u8>),
 ) -> Reply {
     let store = ctx.db(session);
-    let mut reply = Vec::new();
-    match read(store, args.key(store), now, session, |list| {
-        f(list, &mut reply)
-    }) {
-        Ok(()) => out.extend_from_slice(&reply),
-        Err(()) => resp::write_error(out, WRONGTYPE),
+    if read(store, args.key(store), now, session, |list| f(list, out)).is_err() {
+        resp::write_error(out, WRONGTYPE);
     }
     Reply::Written
 }

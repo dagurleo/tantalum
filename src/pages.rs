@@ -19,7 +19,10 @@
 //! `HOT_LIMIT` in total; beyond that, a freed block drops its pages
 //! (`madvise(MADV_DONTNEED)`), so it costs address space but no RAM. Dropping
 //! every freed block's pages made the next segment fault them back in (~10k
-//! faults/s under steady churn), which cost ~8% of pipelined throughput.
+//! faults/s under steady churn), which cost ~8% of pipelined throughput. So
+//! blocks of sizes still being taken push out those of sizes that aren't: a
+//! shard's segments get bigger as it fills, and the small ones it frees later
+//! would otherwise fill the limit for good.
 
 use std::alloc::Layout;
 use std::ops::{Deref, DerefMut};
@@ -141,6 +144,9 @@ struct Pool {
     /// Recently freed, pages still resident: handed out first.
     hot: [Vec<usize>; CLASSES],
     hot_bytes: usize,
+    /// Which take last wanted each size class, and takes so far.
+    last_take: [u64; CLASSES],
+    takes: u64,
     /// No resident pages: dropped, or never touched.
     cold: [Vec<usize>; CLASSES],
 }
@@ -148,8 +154,39 @@ struct Pool {
 static POOL: Mutex<Pool> = Mutex::new(Pool {
     hot: [const { Vec::new() }; CLASSES],
     hot_bytes: 0,
+    last_take: [0; CLASSES],
+    takes: 0,
     cold: [const { Vec::new() }; CLASSES],
 });
+
+impl Pool {
+    /// Notes that a block of this class is wanted.
+    fn wanted(&mut self, class: usize) {
+        self.takes += 1;
+        self.last_take[class] = self.takes;
+    }
+
+    /// Keeps a freed block hot if there's room. If not, returns the block to
+    /// drop the pages of (class and address) and go cold: one of a class wanted
+    /// less lately than this one's, and then this is asked again, or else this
+    /// one.
+    fn keep(&mut self, class: usize, addr: usize) -> Option<(usize, usize)> {
+        let size = POOL_MIN << class;
+        if self.hot_bytes + size <= HOT_LIMIT {
+            self.hot[class].push(addr);
+            self.hot_bytes += size;
+            return None;
+        }
+        let stale = (0..CLASSES)
+            .filter(|&c| self.last_take[c] < self.last_take[class] && !self.hot[c].is_empty())
+            .min_by_key(|&c| self.last_take[c]);
+        let Some(stale) = stale else {
+            return Some((class, addr));
+        };
+        self.hot_bytes -= POOL_MIN << stale;
+        self.hot[stale].pop().map(|block| (stale, block))
+    }
+}
 
 fn pool() -> std::sync::MutexGuard<'static, Pool> {
     // The pool's state stays consistent even if a holder panicked.
@@ -189,6 +226,7 @@ fn take_block(class: usize) -> Option<NonNull<u8>> {
     let size = POOL_MIN << class;
     {
         let mut pool = pool();
+        pool.wanted(class);
         if let Some(addr) = pool.hot[class].pop() {
             pool.hot_bytes -= size;
             return NonNull::new(addr as *mut u8);
@@ -220,24 +258,35 @@ fn take_block(class: usize) -> Option<NonNull<u8>> {
 fn give_block(class: usize, block: NonNull<u8>) {
     let size = POOL_MIN << class;
     let addr = block.as_ptr() as usize;
-    {
+    if pool_mode() == PoolMode::KeepPages {
         let mut pool = pool();
-        if pool.hot_bytes + size <= HOT_LIMIT || pool_mode() == PoolMode::KeepPages {
-            pool.hot[class].push(addr);
-            pool.hot_bytes += size;
+        pool.hot[class].push(addr);
+        pool.hot_bytes += size;
+        return;
+    }
+    loop {
+        let Some((going, going_addr)) = pool().keep(class, addr) else {
+            return;
+        };
+        let going_size = POOL_MIN << going;
+        // Blocks smaller than a page share it with neighbors, so only whole-page
+        // blocks can have their memory dropped.
+        if going_size >= page_size() {
+            // SAFETY: the block is ours and nothing refers to it any more, so
+            // its contents may be discarded.
+            unsafe {
+                libc::madvise(
+                    going_addr as *mut libc::c_void,
+                    going_size,
+                    libc::MADV_DONTNEED,
+                );
+            }
+        }
+        pool().cold[going].push(going_addr);
+        if going_addr == addr {
             return;
         }
     }
-    // Blocks smaller than a page share it with neighbors, so only whole-page
-    // blocks can have their memory dropped.
-    if size >= page_size() {
-        // SAFETY: the block is ours and nothing refers to it any more, so
-        // its contents may be discarded.
-        unsafe {
-            libc::madvise(block.as_ptr().cast(), size, libc::MADV_DONTNEED);
-        }
-    }
-    pool().cold[class].push(addr);
 }
 
 /// A fixed-capacity byte buffer for a segment: a pooled block when the
@@ -336,6 +385,46 @@ impl Drop for SegBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shard's segments get bigger as it fills. The small ones it frees later
+    /// mustn't keep out the blocks being used now, whose pages would then be
+    /// dropped and faulted back in each time.
+    #[test]
+    fn sizes_in_use_push_out_sizes_that_arent() {
+        let (small, big) = (0, 4);
+        let mut pool = Pool {
+            hot: [const { Vec::new() }; CLASSES],
+            hot_bytes: 0,
+            last_take: [0; CLASSES],
+            takes: 0,
+            cold: [const { Vec::new() }; CLASSES],
+        };
+        pool.wanted(small);
+        let mut addr = 0;
+        for _ in 0..HOT_LIMIT / (POOL_MIN << small) {
+            addr += 1;
+            assert_eq!(pool.keep(small, addr), None);
+        }
+        assert_eq!(pool.hot_bytes, HOT_LIMIT);
+        // Full. Nothing's wanted more lately than these, so another goes.
+        addr += 1;
+        assert_eq!(pool.keep(small, addr), Some((small, addr)));
+        // Now a bigger size is in use: what's in its way goes first.
+        pool.wanted(big);
+        let freed = addr + 1;
+        let room = (POOL_MIN << big) / (POOL_MIN << small);
+        for _ in 0..room {
+            let (class, _) = pool.keep(big, freed).expect("full");
+            assert_eq!(class, small);
+        }
+        assert_eq!(pool.keep(big, freed), None);
+        assert_eq!(pool.hot[big], [freed]);
+        assert_eq!(pool.hot_bytes, HOT_LIMIT);
+        // Filled with what's in use, and that stays.
+        pool.hot_bytes = HOT_LIMIT;
+        pool.hot[small].clear();
+        assert_eq!(pool.keep(big, freed + 1), Some((big, freed + 1)));
+    }
 
     #[test]
     fn segment_buffers_roundtrip_and_reuse_blocks() {

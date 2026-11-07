@@ -391,6 +391,109 @@ async fn scripts_are_atomic() {
     }
 }
 
+/// Scripts take shards as they reach them, in any order, undeclared keys
+/// included, so they can want a shard a command holds while it wants one of
+/// theirs. With everything that holds several shards running at once on keys
+/// sharing them, nothing gets stuck, and nothing half done is ever seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transactions_in_any_order_stay_whole_and_never_get_stuck() {
+    const ACCOUNTS: usize = 24;
+    const TOTAL: i64 = 1000 * ACCOUNTS as i64;
+    const MOVE: &str = "redis.call('decrby', ARGV[1], 1) \
+                        redis.call('incrby', ARGV[2], 1)";
+    const SUM: &str = "local sum = 0 \
+                       for i = 0, ARGV[1] - 1 do \
+                         sum = sum + tonumber(redis.call('get', 'account:' .. i)) \
+                       end return sum";
+    let account = |i: usize| format!("account:{i}");
+    for mode in MODES {
+        let (addr, _ctx) = start(mode).await;
+        let mut setup = Client::connect(addr).await;
+        for i in 0..ACCOUNTS {
+            setup.call(&["SET", &account(i), "1000"]).await;
+        }
+        let mut movers = Vec::new();
+        // Scripts moving between undeclared keys, in both directions.
+        for offset in 1..=3 {
+            movers.push(tokio::spawn(async move {
+                let mut c = Client::connect(addr).await;
+                for n in 0..300 {
+                    let (from, to) = (n % ACCOUNTS, (n * offset + offset) % ACCOUNTS);
+                    let (from, to) = (account(from), account(to));
+                    let (from, to) = if n % 2 == 0 { (from, to) } else { (to, from) };
+                    c.call(&["EVAL", MOVE, "0", &from, &to]).await;
+                }
+            }));
+        }
+        // Commands that hold two shards, and ones that run as transactions,
+        // on keys of their own that share those shards.
+        movers.push(tokio::spawn(async move {
+            let mut c = Client::connect(addr).await;
+            for n in 0..300 {
+                let (a, b) = (format!("name:{n}"), format!("name:{}", n + 1));
+                c.call(&["SET", &a, "x"]).await;
+                c.call(&["RENAME", &a, &b]).await;
+                c.call(&["COPY", &b, &a, "REPLACE"]).await;
+                c.call(&["MSETNX", &format!("new:{n}"), "1", &b, "2"]).await;
+                c.call(&["SADD", &a, "m"]).await;
+                c.call(&["DEL", &a, &b]).await;
+            }
+        }));
+        // Transactions moving too.
+        movers.push(tokio::spawn(async move {
+            let mut c = Client::connect(addr).await;
+            for n in 0..300 {
+                let (from, to) = (account(n % ACCOUNTS), account((n * 5 + 7) % ACCOUNTS));
+                c.call(&["MULTI"]).await;
+                c.call(&["DECRBY", &from, "1"]).await;
+                c.call(&["INCRBY", &to, "1"]).await;
+                let reply = c.call(&["EXEC"]).await;
+                assert!(reply.starts_with("*2"), "{mode:?}: {reply:?}");
+            }
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        // Every account, read by a script and by a transaction.
+        for _ in 0..2 {
+            let stop = stop.clone();
+            readers.push(tokio::spawn(async move {
+                let mut c = Client::connect(addr).await;
+                let mut reads = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let reply = c.call(&["EVAL", SUM, "0", &ACCOUNTS.to_string()]).await;
+                    assert_eq!(reply, format!(":{TOTAL}\r\n"), "{mode:?}");
+                    c.call(&["MULTI"]).await;
+                    for i in 0..ACCOUNTS {
+                        c.call(&["GET", &account(i)]).await;
+                    }
+                    let reply = c.call(&["EXEC"]).await;
+                    let sum: i64 = reply
+                        .split("\r\n")
+                        .filter(|l| !l.is_empty() && !l.starts_with(['*', '$']))
+                        .map(|l| l.parse::<i64>().unwrap())
+                        .sum();
+                    assert_eq!(sum, TOTAL, "{mode:?}: {reply:?}");
+                    reads += 1;
+                }
+                reads
+            }));
+        }
+        let finished = tokio::time::timeout(Duration::from_secs(120), async {
+            for mover in movers {
+                mover.await.unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            for reader in readers {
+                assert!(reader.await.unwrap() > 0);
+            }
+        })
+        .await;
+        assert!(finished.is_ok(), "{mode:?}: stuck");
+        let sum = setup.call(&["EVAL", SUM, "0", &ACCOUNTS.to_string()]).await;
+        assert_eq!(sum, format!(":{TOTAL}\r\n"), "{mode:?}");
+    }
+}
+
 /// A read-modify-write script run by many clients at once loses nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_scripts_lose_no_updates() {

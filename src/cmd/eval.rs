@@ -46,9 +46,9 @@ pub(super) fn evalsha_ro(
     run(ctx, session, now, args, out, true, true)
 }
 
-/// Checks the arguments in Redis' order, then runs the script holding
-/// every shard (a native one, the shards it uses), so nothing else touches
-/// them meanwhile.
+/// Checks the arguments in Redis' order, then runs the script as a transaction
+/// (a native one, holding the shards it uses), so nothing else touches what it
+/// touches meanwhile.
 fn run(
     ctx: &Context,
     session: &mut Session,
@@ -78,14 +78,14 @@ fn run(
         return Reply::Written;
     }
     // BullMQ's scripts natively, holding only the shards they use (but
-    // not inside EXEC, which holds every one already).
+    // not inside EXEC, whose transaction holds them).
     // (Not while something wants to hear of what scripts run.)
     let watched = session.special || ctx.monitoring();
     let native = sha
         && !read_only
         && ctx.settings.native_scripts
         && !watched
-        && !crate::shard_lock::holding_all();
+        && !crate::shard_lock::in_transaction();
     if native
         && ctx
             .scripting
