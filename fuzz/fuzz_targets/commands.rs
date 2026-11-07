@@ -9,13 +9,19 @@
 
 #![no_main]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use libfuzzer_sys::fuzz_target;
 use tantalum::cmd::{self, Args, Reply};
 use tantalum::context::{Context, Settings};
 use tantalum::resp;
 use tantalum::store::{Config, EvictionPolicy, Store};
+
+/// Stores with numbered databases. A store and those keep each other alive, for
+/// as long as the server runs (see `Store`), which here is a store per input: this
+/// keeps them where the leak check sees they aren't lost, so that it can go on
+/// finding what is.
+static WITH_DATABASES: Mutex<Vec<Arc<Store>>> = Mutex::new(Vec::new());
 
 fuzz_target!(|data: &[u8]| {
     let store = Store::with_config(Config {
@@ -59,4 +65,10 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(ctx.store.blocked_clients(), 0);
     drop(listener);
     assert_eq!(ctx.pubsub.channel_count(false) + ctx.pubsub.pattern_count(), 0);
+    if ctx.store.live().count() > 1 {
+        for db in ctx.store.live() {
+            db.clear();
+        }
+        WITH_DATABASES.lock().unwrap().push(ctx.store.clone());
+    }
 });
