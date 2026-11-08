@@ -158,9 +158,11 @@ impl<'a> Call<'a> {
         }
         self.reply.clear();
         let args = Args::new(&self.buf, &self.ranges);
+        // (Native scripts run only for users that may run everything.)
         if let Err(e) = cmd::call_from_script(
             self.ctx,
             &mut self.session,
+            (0, "evalsha"),
             self.now,
             &args,
             false,

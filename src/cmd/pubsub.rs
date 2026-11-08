@@ -339,7 +339,9 @@ pub(super) fn reset(
         client.pubsub = false;
         client.monitor = false;
     });
-    session.set_authenticated(!ctx.has_password());
+    // The default user, authenticated if it needs no password.
+    session.set_user(ctx, ctx.acl.default_user());
+    session.set_authenticated(ctx.open());
     out.extend_from_slice(b"+RESET\r\n");
     Reply::Written
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tantalum"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2024"
 
 [dependencies]
@@ -21,6 +21,8 @@ monoio = "0.2.4"
 hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more"] }
 mlua-sys = { version = "0.13", default-features = false, features = ["lua51", "external"] }
 sha1_smol = "1"
+# ACL passwords' SHA-256 and ACL GENPASS's random bits; rustls builds it already.
+ring = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

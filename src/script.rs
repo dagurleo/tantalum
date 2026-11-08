@@ -248,13 +248,21 @@ impl Scripting {
         }
         let keys = (3..3 + numkeys).map(|i| args.get(i));
         let argv = (3 + numkeys..args.len()).map(|i| args.get(i));
+        let command = match (sha, read_only) {
+            (false, false) => "eval",
+            (false, true) => "eval_ro",
+            (true, false) => "evalsha",
+            (true, true) => "evalsha_ro",
+        };
         let mut run = Run {
             ctx,
             session: Session {
                 db: caller.db,
                 special: caller.special,
+                user: caller.user.clone(),
                 ..Session::for_script()
             },
+            caller: (caller.id, command),
             now,
             read_only,
             started: Instant::now(),
@@ -401,6 +409,8 @@ struct Run<'a> {
     ctx: &'a Context,
     /// The session its commands run in.
     session: Session,
+    /// The connection that ran it, and with what command, for `ACL LOG`.
+    caller: (u64, &'static str),
     /// The time when it started: it stands still while a script runs.
     now: Millis,
     read_only: bool,
@@ -1102,12 +1112,13 @@ unsafe fn command(l: *mut lua_State) -> bool {
 impl Run<'_> {
     /// Runs the command in `args`, its reply in `reply`, or the error Lua
     /// raises instead.
-    fn call(&mut self) -> Result<(), &'static str> {
+    fn call(&mut self) -> Result<(), std::borrow::Cow<'static, str>> {
         let args = Args::new(&self.args, &self.ranges);
         self.reply.clear();
         let wrote = cmd::call_from_script(
             self.ctx,
             &mut self.session,
+            self.caller,
             self.now,
             &args,
             self.read_only,
@@ -1697,20 +1708,19 @@ unsafe extern "C-unwind" fn redis_set_repl(l: *mut lua_State) -> c_int {
 
 unsafe extern "C-unwind" fn redis_acl_check_cmd(l: *mut lua_State) -> c_int {
     // SAFETY: called by Lua while a script runs.
-    let known = unsafe {
+    let allowed = unsafe {
         let run = current();
         if !take_args(l, run) {
             lua::lua_error(l);
         }
-        cmd::is_command(Args::new(&run.args, &run.ranges).get(0))
+        cmd::may_run(&run.session, &Args::new(&run.args, &run.ranges))
     };
-    if !known {
+    let Some(allowed) = allowed else {
         // SAFETY: nothing to drop.
         unsafe { raise(l, b"Invalid command passed to redis.acl_check_cmd()") }
-    }
-    // No ACLs: everyone may run everything.
+    };
     // SAFETY: Lua's API.
-    unsafe { lua::lua_pushboolean(l, 1) };
+    unsafe { lua::lua_pushboolean(l, c_int::from(allowed)) };
     1
 }
 

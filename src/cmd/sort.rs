@@ -39,8 +39,9 @@ struct Options<'a> {
 }
 
 impl<'a> Options<'a> {
-    /// `None` after writing the error.
-    fn parse(args: &Args<'a>, read_only: bool, out: &mut Vec<u8>) -> Option<Self> {
+    /// `None` after writing the error. Patterns read other keys, which a user
+    /// may use only with every key to read (`patterns`).
+    fn parse(args: &Args<'a>, read_only: bool, patterns: bool, out: &mut Vec<u8>) -> Option<Self> {
         let mut options = Options {
             desc: false,
             alpha: false,
@@ -78,8 +79,22 @@ impl<'a> Options<'a> {
                 let pattern = args.get(i + 1);
                 options.by = Some(pattern);
                 options.dont_sort = !pattern.contains(&b'*');
+                if !options.dont_sort && !patterns {
+                    resp::write_error(
+                        out,
+                        b"ERR BY option of SORT denied due to insufficient ACL permissions.",
+                    );
+                    return None;
+                }
                 i += 1;
             } else if is(b"GET") && left >= 1 {
+                if !patterns {
+                    resp::write_error(
+                        out,
+                        b"ERR GET option of SORT denied due to insufficient ACL permissions.",
+                    );
+                    return None;
+                }
                 options.gets.push(args.get(i + 1));
                 i += 1;
             } else {
@@ -185,7 +200,9 @@ fn run(
     out: &mut Vec<u8>,
     read_only: bool,
 ) -> Reply {
-    let Some(mut options) = Options::parse(args, read_only, out) else {
+    let command = if read_only { "sort_ro" } else { "sort" };
+    let patterns = super::acl::may_sort_by_pattern(session, command, args);
+    let Some(mut options) = Options::parse(args, read_only, patterns, out) else {
         return Reply::Written;
     };
     let store = ctx.db(session);

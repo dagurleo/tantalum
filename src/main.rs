@@ -107,6 +107,10 @@ Options:
                     Clients must AUTH with this password first. The
                     TANTALUM_REQUIREPASS environment variable sets it too and
                     keeps it out of the process list [default: none]
+  --aclfile <FILE>  Users and what they may run (ACL SETUSER), as Redis'
+                    aclfile: loaded at startup, and by ACL LOAD; ACL SAVE
+                    writes them there [default: none, users last until a
+                    restart]
   --maxclients <N>  Connections beyond this are refused [default: 10000]
   --timeout <SECS>  Close connections idle this long; 0 never [default: 0]
   --tcp-keepalive <SECS>
@@ -293,6 +297,7 @@ fn parse_args() -> Result<Config, String> {
             "--requirepass" => {
                 config.settings.password = Some(value.into_bytes()).filter(|p| !p.is_empty())
             }
+            "--aclfile" => config.settings.aclfile = Some(PathBuf::from(value)),
             "--maxclients" => {
                 config.settings.maxclients = value.parse().map_err(|_| bad(()))?;
             }
@@ -375,6 +380,10 @@ fn main() -> std::io::Result<()> {
     raise_open_file_limit(config.settings.maxclients);
     let store = Arc::new(store::Store::with_config(config.store.clone()));
     let mut ctx = Context::new(store.clone(), config.settings.clone());
+    if let Err(errors) = ctx.load_acl_file() {
+        eprintln!("Aborting startup because of ACL errors: {errors}");
+        std::process::exit(1);
+    }
     // What `CONFIG GET` says of the options it was started with.
     ctx.config.set("port", &config.port.to_string());
     ctx.config.set("bind", &config.bind);

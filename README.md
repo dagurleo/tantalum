@@ -23,6 +23,7 @@ the least space. (It was called ferrokv until v0.2; the raw logs in
 cargo run --release -- --port 6379      # --threads N, --shards N, --bind ADDR
 cargo run --release -- --maxmemory 2gb --maxmemory-policy allkeys-lru
 TANTALUM_REQUIREPASS=s3cret cargo run --release -- --bind 0.0.0.0   # or --requirepass
+cargo run --release -- --aclfile users.acl   # users from ACL SETUSER kept across restarts
 cargo run --release -- --maxclients 2000 --timeout 300 --tcp-keepalive 60
 cargo run --release -- --snapshot data/tantalum.snapshot   # keep data across restarts
 cargo run --release -- --aof data/aof   # log every write too: a crash loses about a second
@@ -124,13 +125,14 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `KEYS pattern` | Every match at once, like Redis: it holds each shard's lock in turn while reading it, so prefer `SCAN` on big stores |
 | `RENAME key newkey`, `RENAMENX key newkey` | Atomic across shards; keeps the type and TTL. As in Redis, it overwrites `newkey` of any type and ignores `maxmemory` |
 | `FLUSHALL [ASYNC\|SYNC]`, `FLUSHDB [ASYNC\|SYNC]` | Not atomic across shards: writes running at the same time may survive |
-| `AUTH [username] password` | With `--requirepass` (or `TANTALUM_REQUIREPASS`). One user, `default`, as in Redis without ACLs |
+| `AUTH [username] password` | The `default` user's password is `--requirepass` (or `TANTALUM_REQUIREPASS`); other users are made with `ACL SETUSER` |
+| `ACL SETUSER\|GETUSER\|DELUSER\|LIST\|USERS\|WHOAMI\|CAT\|DRYRUN\|LOG\|GENPASS\|LOAD\|SAVE\|HELP` | Redis 7.2's users: passwords, `on`/`off`, commands, categories and subcommands (`+@all -@dangerous +config\|get`), key patterns with read and write (`~app:*`, `%R~cache:*`), channels, selectors in parentheses, and how `ACL LIST` and `GETUSER` write them back, each byte as Redis' (see Design). Rules may name every command Redis 7.2.4 has, those missing here too, so an ACL file from Redis loads. `ACL LOAD` and `SAVE` use `--aclfile`, which is also loaded at startup |
 | `HELLO [2\|3 [AUTH user pass] [SETNAME name]]` | RESP3 too: redis-py 8 won't connect without it. For these commands it only changes nulls, maps (`HELLO`, `CONFIG GET`, `HGETALL`), sets (`COMMAND` flags) and `INFO` (verbatim text) |
 | `CLIENT SETNAME\|GETNAME\|ID\|SETINFO` | What client libraries send on connect |
 | `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, database, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and how many subscriptions) reads as 0, `N` or `NULL` |
-| `CLIENT KILL addr:port`, `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port] [LADDR addr:port] [SKIPME yes\|no]` | Closes other connections at once, and the caller's own after its reply. The only user is `default` |
+| `CLIENT KILL addr:port`, `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port] [LADDR addr:port] [SKIPME yes\|no]` | Closes other connections at once, and the caller's own after its reply |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS\|GETKEYS\|GETKEYSANDFLAGS]` | Each entry is Redis 7.2.4's own, ACL categories, key specifications, tips and documentation included (`tools/command-table.py`). `COUNT` and `LIST` say what's here, not what Redis has |
-| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`). The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started, `save` with `--snapshot`, `notify-keyspace-events`, and LFU and random policies. `CONFIG REWRITE` says there's no config file |
+| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `acllog-max-len`, `acl-pubsub-default`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`). The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started, `save` with `--snapshot`, `notify-keyspace-events`, and LFU and random policies. `CONFIG REWRITE` says there's no config file |
 | `MONITOR` | Every command run, as Redis' lines show them: what's secret `(redacted)`, a script's own commands as `lua`, admin commands left out. It costs commands nothing until someone runs it (see Design) |
 | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` | As Redis', with what's secret `(redacted)`, and the commands inside `EXEC` and scripts too. At its default of 10 ms and above, durations are in 5 ms ticks, and commands Redis flags `fast` aren't timed (see Design); below that, a real clock as in Redis |
 | `LATENCY LATEST\|HISTORY\|RESET\|GRAPH\|DOCTOR\|HELP`, `LATENCY HISTOGRAM` | With `latency-monitor-threshold`, spikes in `command` and `fast-command`, as Redis keeps them. `HISTOGRAM` is empty: no per-command statistics are kept |
@@ -190,17 +192,17 @@ pass on Redis 7.2.4 and fail on Tantalum, by library (`bench/frameworks/results-
 
 | Suite | Pass on Redis | Lost on Tantalum |
 |---|---|---|
-| redis-py 7.4.0 | 2,357 | 84 |
-| Predis 3.6.1 | 4,525 | 35 |
-| node-redis 6.3.1 | 1,486 | 49 |
-| redis-rb 6.0.0 | 893 | 7 |
-| ioredis 5.11.0 | 566 | 1 |
+| redis-py 7.4.0 | 2,357 | 23 |
+| Predis 3.6.1 | 4,525 | 28 |
+| node-redis 6.3.1 | 1,486 | 40 |
+| redis-rb 6.0.0 | 893 | 4 |
+| ioredis 5.11.0 | 566 | 0 |
 | phpredis 6.3.0 | 203 | 4 |
 
-That's 180 of 10,530, and 162 of them need something that isn't here: `ACL`, `FUNCTION`, `CLIENT
-TRACKING`, or `DUMP` and `RESTORE`. The other 18 are listed under
-"Not there yet". `tools/admin-diff.py` compares the admin commands with Redis 7.2.4 directly:
-3,353 commands and checks, every command's `COMMAND` entries and every setting among them, no
+That's 99 of 10,530 (180 before users and ACLs came in 0.27.0), and 81 of them need something
+that isn't here: `FUNCTION`, `CLIENT TRACKING`, or `DUMP` and `RESTORE`. The other 18 are listed
+under "Not there yet". `tools/admin-diff.py` compares the admin commands with Redis 7.2.4 directly:
+3,358 commands and checks, every command's `COMMAND` entries and every setting among them, no
 differences.
 
 ## Design
@@ -669,6 +671,24 @@ differences.
     without this a panic on `--io uring` would take down a whole I/O thread.
   - Server counters are per thread (one cache line each) and published once
     per read, so `INFO`'s totals cost the request path no shared writes.
+- **Users and ACLs** (`src/acl.rs`, `src/cmd/acl.rs`) follow Redis 7.2.4's `acl.c`: a
+  selector holds a bit per command and subcommand of Redis 7.2.4 (from
+  `src/acl_commands.txt`, which `tools/acl-table.py` makes from Redis' `commands.def`, so
+  rules can name the commands missing here too), key patterns with what each allows, channel
+  patterns, and the rules in the order given, which is how `ACL LIST` writes them back. A
+  command runs if one of the user's selectors allows it, keys found by the key specs Redis'
+  `COMMAND` gives (compiled once, so a check reads no table); a refusal picks the error Redis
+  picks and goes to `ACL LOG`. Users are kept whole and replaced when they change, so a
+  connection reads the one it holds without a lock; a change counts up in the word
+  connections already read once a batch, and each takes up its user's new rules at its next
+  batch (a batch read before then still runs under the old ones). A connection whose user may
+  run everything, as `default` may until told otherwise, stays on the fast path and holds
+  nothing shared, so ACLs cost it nothing (speed guard: see the commit). Deleting a user
+  closes its connections, and taking channels away closes the subscribers that had them, as
+  in Redis; scripts check each `redis.call`, and BullMQ's native scripts run only for users
+  that may run everything. `tools/acl-diff.py` runs 296 scenario steps over several
+  connections against Redis 7.2.4, with no differences, and Redis' own `unit/acl` and
+  `unit/acl-v2` pass (but for a check of `INFO commandstats` and one of `MIGRATE`'s keys).
 - **TLS** (`--tls-port`, with `--tls-cert-file` and `--tls-key-file` as in
   Redis): a second listener next to the plain port (`--port 0` leaves only
   TLS), using rustls with its `ring` backend. Plain and TLS connections share
@@ -1265,13 +1285,13 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
-- **Missing, by how many client library tests need it** (see above; 180 of 10,530): `ACL` (81),
+- **Missing, by how many client library tests need it** (see above; 99 of 10,530):
   `FUNCTION` and `FCALL` (39), client-side caching with `CLIENT
   TRACKING` (22), `DUMP`, `RESTORE` and `MIGRATE` (20), turning the log on with `CONFIG SET appendonly`
   (5), `LATENCY HISTOGRAM` (5), `INFO commandstats` (3), `OBJECT IDLETIME` (1), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
-  the 224 commands that are here (1, which expects over 300).
+  the 225 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1335,7 +1355,11 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- Replication, ACL users, `DUMP`/`RESTORE`.
+- Replication, `DUMP`/`RESTORE`.
+- **ACL gaps**: `ACL DRYRUN` of a command Redis has and Tantalum doesn't (`FCALL`, `MIGRATE`)
+  checks only the command rules, not knowing its keys. There's no config file, so no `user`
+  lines in one (use `--aclfile`), and no module authentication. A rule change reaches another
+  connection at its next batch: what it has already read runs under the old rules.
 - **Settings with a syntax of their own aren't checked**: `client-output-buffer-limit`,
   `latency-tracking-info-percentiles`, `oom-score-adj-values`, `locale-collate` and
   `proc-title-template` take anything, as none of them does anything here.
