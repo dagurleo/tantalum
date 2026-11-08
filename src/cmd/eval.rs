@@ -160,7 +160,7 @@ pub(super) fn script(
         }
     } else if is(b"KILL") {
         if arity(n == 2, "kill", out) {
-            ctx.scripting.kill(out);
+            ctx.scripting.kill(out, false);
         }
     } else if is(b"DEBUG") {
         if arity(n == 3, "debug", out) {
@@ -222,7 +222,7 @@ fn refused_in_script(name: &str, flags: &[&str], args: &Args<'_>) -> bool {
     let sub = |names: &[&[u8]]| args.len() > 1 && is_any(args.get(1), names);
     match name {
         // Every subcommand but HELP.
-        "client" | "script" => !sub(&[b"HELP"]),
+        "client" | "script" | "function" => !sub(&[b"HELP"]),
         "config" => sub(&[b"GET", b"SET", b"RESETSTAT", b"REWRITE"]),
         _ => false,
     }

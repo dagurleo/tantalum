@@ -20,6 +20,7 @@ mod latency;
 mod list;
 mod pages;
 pub mod pubsub;
+mod rdb;
 pub mod resp;
 mod script;
 mod segment;

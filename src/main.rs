@@ -404,6 +404,8 @@ fn main() -> std::io::Result<()> {
     if let Some(options) = &config.aof {
         start_aof(&ctx, options.clone());
     }
+    // The function libraries whose code a snapshot or the log brought back.
+    ctx.load_functions();
     let ctx = Arc::new(ctx);
     // After the log's commands ran again: they may still use keys that have
     // expired since.

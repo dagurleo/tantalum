@@ -17,8 +17,10 @@
 //! on load.
 //!
 //! Version 1 has only strings, version 2 adds hashes, version 3 the other
-//! collections, version 4 streams and version 5 streams' consumer groups (after
-//! a stream's chunks). A save writes the lowest version that holds its data,
+//! collections, version 4 streams, version 5 streams' consumer groups (after
+//! a stream's chunks), version 6 numbered databases (a record that says which
+//! the records after it are in) and version 7 function libraries (a record of
+//! each library's code, 0x08, before the keys). A save writes the lowest version that holds its data,
 //! so a build from before a kind existed can still read a snapshot without
 //! it (after a rollback, say), and loading reads every version.
 //!
@@ -41,13 +43,14 @@ use crate::stream::BigStream;
 use crate::{collection, hash};
 
 /// The header, with the version in its next-to-last byte.
-const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 6\n";
+const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 7\n";
 const VERSION_AT: usize = MAGIC.len() - 2;
 const MAGIC_V1: &[u8] = b"TANTALUM SNAPSHOT 1\n";
 const MAGIC_V2: &[u8] = b"TANTALUM SNAPSHOT 2\n";
 const MAGIC_V3: &[u8] = b"TANTALUM SNAPSHOT 3\n";
 const MAGIC_V4: &[u8] = b"TANTALUM SNAPSHOT 4\n";
 const MAGIC_V5: &[u8] = b"TANTALUM SNAPSHOT 5\n";
+const MAGIC_V6: &[u8] = b"TANTALUM SNAPSHOT 6\n";
 const STRING: u8 = 1;
 const HASH: u8 = 2;
 const LIST: u8 = 3;
@@ -56,6 +59,8 @@ const ZSET: u8 = 5;
 const STREAM: u8 = 6;
 /// The records after it are in the database numbered next: until then, in 0.
 const DB: u8 = 7;
+/// A function library's code (`FUNCTION LOAD`).
+const FUNCTION: u8 = 8;
 const END: u8 = 0;
 
 /// A record's tag and the first format version that has it.
@@ -169,6 +174,14 @@ fn write_file(
     out.inner.write_all(&magic)?;
     let mut keys = 0u64;
     let mut buf = Vec::new();
+    for code in store.function_codes().1 {
+        magic[VERSION_AT] = magic[VERSION_AT].max(b'7');
+        buf.clear();
+        buf.push(FUNCTION);
+        put_varint(&mut buf, code.len() as u64);
+        buf.extend_from_slice(&code);
+        out.write_all(&buf)?;
+    }
     for db in store.live() {
         if db.index() != 0 {
             if db.is_empty() {
@@ -270,7 +283,8 @@ fn load_file(
         MAGIC_V3 => 3,
         MAGIC_V4 => 4,
         MAGIC_V5 => 5,
-        MAGIC => 6,
+        MAGIC_V6 => 6,
+        MAGIC => 7,
         _ if magic.starts_with(&MAGIC[..VERSION_AT]) => {
             return Err(invalid(
                 "a snapshot from a newer Tantalum: upgrade to load it",
@@ -286,10 +300,16 @@ fn load_file(
     let (mut key, mut value) = (Vec::new(), Vec::new());
     let mut records = 0u64;
     let mut db = store;
+    let mut functions = Vec::new();
     loop {
         let mut tag = [0];
         reader.read_exact(&mut tag)?;
         let kind = match tag[0] {
+            FUNCTION if version >= 7 => {
+                read_bytes(&mut reader, &mut value)?;
+                functions.push(std::sync::Arc::<[u8]>::from(&value[..]));
+                continue;
+            }
             DB if version >= 6 => {
                 let index = read_varint(&mut reader)? as usize;
                 if index >= store.databases() {
@@ -346,6 +366,10 @@ fn load_file(
     reader.read_exact(&mut count)?;
     if u64::from_le_bytes(count) != records {
         return Err(invalid("key count doesn't match"));
+    }
+    // The server makes the libraries again from their code (see `script/functions.rs`).
+    if !functions.is_empty() {
+        store.set_function_codes(functions);
     }
     Ok(Some(loaded))
 }
@@ -1136,7 +1160,7 @@ mod tests {
             ),
             ("an empty hash", file_of(MAGIC, &record(HASH, b"\x00"), 1)),
             ("an unknown kind", file_of(MAGIC, &record(9, b"x"), 1)),
-            ("a newer version", file_of(b"TANTALUM SNAPSHOT 7\n", &[], 0)),
+            ("a newer version", file_of(b"TANTALUM SNAPSHOT 8\n", &[], 0)),
         ] {
             fs::write(&path, file).unwrap();
             let err = load(&Arc::new(Store::new(1)), &path).unwrap_err();
@@ -1221,7 +1245,7 @@ mod tests {
         // Made but empty: it isn't written.
         s.db(7);
         assert_eq!(save(&s, &path).unwrap(), 3);
-        assert_eq!(&fs::read(&path).unwrap()[..MAGIC.len()], MAGIC);
+        assert_eq!(&fs::read(&path).unwrap()[..MAGIC.len()], MAGIC_V6);
 
         let t = Arc::new(Store::new(4));
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 3);
@@ -1293,5 +1317,30 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn function_libraries_come_back_and_only_they_need_version_7() {
+        let dir = std::env::temp_dir().join(format!("tantalum-snap-fn-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.snapshot");
+        let s = Store::new(4);
+        s.set(b"k", b"v", Condition::Always, Expiry::Never, 1, false)
+            .unwrap();
+        save(&s, &path).unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V1));
+        let code: Arc<[u8]> = Arc::from(
+            &b"#!lua name=lib\nredis.register_function('f', function() return 1 end)"[..],
+        );
+        s.set_function_codes(vec![code.clone()]);
+        assert_eq!(save(&s, &path).unwrap(), 1);
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        let t = Arc::new(Store::new(4));
+        assert_eq!(load(&t, &path).unwrap().unwrap().keys, 1);
+        assert_eq!(get(&t, b"k").unwrap(), b"v");
+        let (generation, codes) = t.function_codes();
+        assert!(generation > 0);
+        assert_eq!(codes, vec![code]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

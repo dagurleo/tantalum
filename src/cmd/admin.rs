@@ -396,6 +396,9 @@ fn apply(ctx: &Context, name: &str, value: &str) {
         "stream-node-max-bytes" => ctx.set_stream_node_bytes(number().max(0) as usize),
         "hll-sparse-max-bytes" => ctx.set_hll_sparse_max_bytes(number().max(0) as usize),
         "acllog-max-len" => ctx.acl.set_log_max(number().max(0) as usize),
+        "busy-reply-threshold" | "lua-time-limit" => {
+            ctx.scripting.set_busy_threshold(number().max(0) as u64)
+        }
         "acl-pubsub-default" => ctx
             .acl
             .set_all_channels(value.eq_ignore_ascii_case("allchannels")),

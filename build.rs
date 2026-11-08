@@ -1,5 +1,6 @@
 //! Builds Redis 7.2.4's Lua (with its libraries) and number formatting from
-//! `vendor/`, for scripting (`src/script.rs`). See `vendor/README.md`.
+//! `vendor/`, for scripting (`src/script.rs`), and its LZF for RDB payloads
+//! (`src/rdb.rs`). See `vendor/README.md`.
 
 fn main() {
     let lua = "vendor/lua/src";
@@ -60,6 +61,16 @@ fn main() {
         .file("vendor/fpconv/fpconv_dtoa.c")
         .file("src/long_double.c")
         .compile("redis_lua");
+    // Redis' LZF, for RDB payloads (`src/rdb.rs`), with its hash table cleared
+    // first so that the same input always compresses the same way.
+    cc::Build::new()
+        .include("vendor/lzf")
+        .define("INIT_HTAB", Some("1"))
+        .opt_level(2)
+        .warnings(false)
+        .file("vendor/lzf/lzf_c.c")
+        .file("vendor/lzf/lzf_d.c")
+        .compile("redis_lzf");
     println!("cargo:rerun-if-changed=vendor");
     println!("cargo:rerun-if-changed=src/long_double.c");
 }
