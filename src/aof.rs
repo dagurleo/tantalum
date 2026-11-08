@@ -722,6 +722,10 @@ pub(crate) fn record(name: &str, args: &Args<'_>, reply: &[u8]) {
     if !logging() || reply.first() == Some(&b'-') {
         return;
     }
+    // What it deleted here was logged as `DEL`s; the rest happened elsewhere.
+    if name == "migrate" {
+        return;
+    }
     // Without `STORE` it changed nothing.
     if matches!(name, "sort" | "georadius" | "georadiusbymember") && reply.first() != Some(&b':') {
         return;

@@ -390,6 +390,37 @@ impl Chunk {
     }
 }
 
+/// A chunk as Redis' RDB format writes its listpack node, for `DUMP`.
+pub struct Node<'a>(&'a Chunk);
+
+impl<'a> Node<'a> {
+    /// Its master entry's ID: the first ever added to it.
+    pub fn master(&self) -> StreamId {
+        self.0.first
+    }
+
+    pub fn live(&self) -> u32 {
+        self.0.live
+    }
+
+    /// Its master entry's field names.
+    pub fn fields(&self) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let fields: &'a [u8] = &self.0.fields;
+        let mut p = 0;
+        let count = get_varint(fields, &mut p).expect("valid chunk");
+        (0..count).map(move |_| get_bytes(fields, &mut p).expect("valid chunk"))
+    }
+
+    /// Its entries, each with whether it has the master entry's fields
+    /// (Redis' `SAMEFIELDS`).
+    pub fn entries(&self) -> impl Iterator<Item = (Entry<'a>, bool)> + 'a {
+        let chunk = self.0;
+        chunk
+            .entries()
+            .map(move |(start, _, entry)| (entry, chunk.data[start] & SAME_FIELDS != 0))
+    }
+}
+
 /// An entry delivered to a consumer and not acknowledged. There can be millions,
 /// so it's packed, and knows its consumer by number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -702,6 +733,11 @@ impl BigStream {
     /// How many chunks it has: Redis' `radix-tree-keys`.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Its chunks, as Redis' listpack nodes.
+    pub fn nodes(&self) -> impl Iterator<Item = Node<'_>> {
+        self.chunks.iter().map(Node)
     }
 
     /// `XSETID`: what it checks first, then this.

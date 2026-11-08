@@ -342,6 +342,15 @@ pub(crate) fn keys_of(args: &[&[u8]]) -> Result<Vec<KeyAt>, NoKeys> {
     if name == "sort" {
         return Ok(sort_keys(args));
     }
+    if name == "migrate" {
+        let (first, count) = migrate_keys(args.len(), |i| args[i]).ok_or_else(invalid)?;
+        let flags: Vec<Vec<u8>> = [&b"RW"[..], b"access", b"delete"]
+            .map(<[u8]>::to_vec)
+            .into();
+        return Ok((first..first + count)
+            .map(|at| (at, flags.clone()))
+            .collect());
+    }
     let mut keys = Vec::new();
     for spec in specs {
         let flags: Vec<Vec<u8>> = spec
@@ -370,6 +379,30 @@ pub(crate) fn keys_of(args: &[&[u8]]) -> Result<Vec<KeyAt>, NoKeys> {
         }
     }
     Ok(keys)
+}
+
+/// Redis' `migrateGetKeys`: where `MIGRATE`'s keys start and how many there are
+/// (the key, or those after `KEYS`); `None` when `KEYS` comes after a key,
+/// which the command refuses.
+pub(crate) fn migrate_keys<'a>(
+    len: usize,
+    arg: impl Fn(usize) -> &'a [u8],
+) -> Option<(usize, usize)> {
+    let mut i = 6;
+    while i < len {
+        let word = arg(i);
+        if word.eq_ignore_ascii_case(b"KEYS") {
+            return arg(3).is_empty().then_some((i + 1, len - i - 1));
+        }
+        // Skip what options take.
+        if word.eq_ignore_ascii_case(b"AUTH") {
+            i += 1;
+        } else if word.eq_ignore_ascii_case(b"AUTH2") {
+            i += 2;
+        }
+        i += 1;
+    }
+    Some((3, 1))
 }
 
 /// `SET`'s key is read too if it has `GET`.
@@ -548,6 +581,8 @@ enum Special {
     Bitfield,
     /// `SORT`: the key, and the last `STORE`'s.
     Sort,
+    /// `MIGRATE`: the key, or those after `KEYS`.
+    Migrate,
 }
 
 /// A command's key specs, compiled for the ACL checks a restricted user's
@@ -561,6 +596,7 @@ pub(crate) struct KeySpecs {
 const RO_ACCESS: u16 = 1 | 1 << 4;
 const RW_ACCESS_UPDATE: u16 = 1 << 1 | 1 << 4 | 1 << 5;
 const OW_UPDATE: u16 = 1 << 2 | 1 << 5;
+const RW_ACCESS_DELETE: u16 = 1 << 1 | 1 << 4 | 1 << 7;
 
 impl KeySpecs {
     fn compile(name: &str, item: &Value<'static>) -> Option<KeySpecs> {
@@ -568,6 +604,7 @@ impl KeySpecs {
             "set" => Special::Set,
             "bitfield" => Special::Bitfield,
             "sort" => Special::Sort,
+            "migrate" => Special::Migrate,
             _ => Special::No,
         };
         let mut specs = Vec::new();
@@ -674,6 +711,16 @@ impl KeySpecs {
                     && let Some(at) = store
                 {
                     f(at, OW_UPDATE);
+                }
+                return;
+            }
+            Special::Migrate => {
+                if let Some((first, count)) = migrate_keys(args.len(), |i| args.get(i)) {
+                    for at in first..first + count {
+                        if !f(at, RW_ACCESS_DELETE) {
+                            break;
+                        }
+                    }
                 }
                 return;
             }
@@ -821,6 +868,17 @@ mod tests {
             ],
             &["pfmerge", "d", "a", "b"],
             &["memory", "usage", "k"],
+            &["migrate", "h", "1", "k", "0", "100"],
+            &["migrate", "h", "1", "", "0", "100", "KEYS", "a", "b"],
+            &[
+                "migrate", "h", "1", "", "0", "100", "AUTH", "KEYS", "KEYS", "a",
+            ],
+            &[
+                "migrate", "h", "1", "", "0", "100", "AUTH2", "KEYS", "KEYS", "KEYS", "a",
+            ],
+            &["migrate", "h", "1", "k", "0", "100", "COPY", "REPLACE"],
+            &["dump", "k"],
+            &["restore", "k", "0", "x", "REPLACE"],
         ];
         let names = |bits: u16| -> Vec<Vec<u8>> {
             [

@@ -1339,3 +1339,77 @@ fn function_libraries_come_back() {
     call(&mut c, &["FCALL", "setx", "1", "k", "x"], "+OK\r\n");
     call(&mut c, &["FCALL", "two", "0"], ":2\r\n");
 }
+
+/// Sends `args` and reads one whole reply.
+fn call_raw(stream: &mut std::net::TcpStream, args: &[&[u8]]) -> Vec<u8> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    stream.write_all(&common::req(args)).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line).unwrap();
+    if line[0] == b'$' {
+        let n: i64 = std::str::from_utf8(&line[1..line.len() - 2])
+            .unwrap()
+            .parse()
+            .unwrap();
+        if n >= 0 {
+            let mut body = vec![0; n as usize + 2];
+            reader.read_exact(&mut body).unwrap();
+            line.extend_from_slice(&body);
+        }
+    }
+    assert!(reader.buffer().is_empty(), "one reply at a time");
+    line
+}
+
+/// A key `RESTORE`d comes back from the log as it was; one `MIGRATE` moved
+/// away is logged as its `DEL`, and one it copied isn't logged at all.
+#[test]
+fn restored_and_migrated_keys_come_back() {
+    let dir = temp_dir("dump");
+    let target_dir = temp_dir("dump-target");
+    let (_target, target) = server(&target_dir);
+    let port = target.peer_addr().unwrap().port().to_string();
+    let (server1, mut c) = server(&dir);
+    call(&mut c, &["SET", "a", "1"], "+OK\r\n");
+    call(&mut c, &["SET", "b", "2"], "+OK\r\n");
+    call(&mut c, &["RPUSH", "l", "x", "y"], ":2\r\n");
+    let dumped = call_raw(&mut c, &[b"DUMP", b"l"]);
+    let payload = &dumped[dumped.iter().position(|&b| b == b'\n').unwrap() + 1..dumped.len() - 2];
+    let restored = call_raw(&mut c, &[b"RESTORE", b"r", b"100000", payload]);
+    assert_eq!(restored, b"+OK\r\n");
+    let to = ["MIGRATE", "127.0.0.1", port.as_str()];
+    call(&mut c, &[&to[..], &["a", "0", "1000"]].concat(), "+OK\r\n");
+    call(
+        &mut c,
+        &[&to[..], &["b", "0", "1000", "COPY"]].concat(),
+        "+OK\r\n",
+    );
+    call(
+        &mut c,
+        &[&to[..], &["nosuch", "0", "1000"]].concat(),
+        "+NOKEY\r\n",
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    drop(server1); // SIGKILL
+    let log = std::fs::read(log_file(&dir)).unwrap();
+    let times = |word: &[u8]| log.windows(word.len()).filter(|w| *w == word).count();
+    assert_eq!(times(b"MIGRATE"), 0, "MIGRATE itself was logged");
+    assert_eq!(times(b"DEL"), 1);
+    assert_eq!(times(b"RESTORE"), 1);
+
+    let (_server2, mut c) = server(&dir);
+    call(&mut c, &["EXISTS", "a"], ":0\r\n");
+    call(&mut c, &["GET", "b"], "$1\r\n2\r\n");
+    call(
+        &mut c,
+        &["LRANGE", "r", "0", "-1"],
+        "*2\r\n$1\r\nx\r\n$1\r\ny\r\n",
+    );
+    let ttl = call_raw(&mut c, &[b"PTTL", b"r"]);
+    let ttl: i64 = std::str::from_utf8(&ttl[1..ttl.len() - 2])
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((90_000..=100_000).contains(&ttl), "{ttl}");
+}

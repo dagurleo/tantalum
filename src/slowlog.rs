@@ -54,6 +54,25 @@ pub(crate) fn secret_args(args: &Args<'_>) -> Vec<bool> {
                 break;
             }
         }
+    } else if name.eq_ignore_ascii_case(b"MIGRATE") {
+        // Its options as it reads them, up to one it doesn't know.
+        let mut i = 6;
+        while i < args.len() {
+            let more = args.len() - 1 - i;
+            let option = args.get(i);
+            if option.eq_ignore_ascii_case(b"COPY") || option.eq_ignore_ascii_case(b"REPLACE") {
+                i += 1;
+            } else if option.eq_ignore_ascii_case(b"AUTH") && more >= 1 {
+                secret[i + 1] = true;
+                i += 2;
+            } else if option.eq_ignore_ascii_case(b"AUTH2") && more >= 2 {
+                secret[i + 1] = true;
+                secret[i + 2] = true;
+                i += 3;
+            } else {
+                break;
+            }
+        }
     } else if name.eq_ignore_ascii_case(b"ACL")
         && args.len() >= 3
         && args.get(1).eq_ignore_ascii_case(b"SETUSER")

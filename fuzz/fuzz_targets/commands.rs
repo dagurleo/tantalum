@@ -4,6 +4,9 @@
 //! block stay blocked for a few more commands, which may serve them.
 //! Subscribing commands run on a second client, which the first one's
 //! PUBLISHes reach (subscribed, the first could run little else).
+//! `MIGRATE` doesn't run: it would connect wherever the input says, a server
+//! on this machine included. (`RESTORE`'s readers have a test of their own
+//! for damaged payloads, which seldom pass the checksum here.)
 //!
 //! cargo +nightly fuzz run commands corpus/commands seeds/commands -- -max_total_time=600
 
@@ -46,6 +49,10 @@ fuzz_target!(|data: &[u8]| {
             out.clear();
             let args = Args::new(data, &ranges);
             let name = args.get(0);
+            if name.eq_ignore_ascii_case(b"MIGRATE") {
+                pos = next;
+                continue;
+            }
             let subscribing = name.len() >= 9
                 && name[name.len() - 9..].eq_ignore_ascii_case(b"SUBSCRIBE")
                 || name.eq_ignore_ascii_case(b"RESET");

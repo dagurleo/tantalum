@@ -1,4 +1,4 @@
-Client libraries' own test suites on Tantalum 0.28.0, 2026-11-08, against Redis 7.2.4 as the control.
+Client libraries' own test suites on Tantalum 0.29.0, 2026-11-09, against Redis 7.2.4 as the control.
 
 redis-py 7.4.0 (sync and asyncio; no cluster, modules, TLS, replicas or cloud), Predis 3.6.1 (phpunit's
 default groups), redis-rb 6.0.0 (redis and distributed), ioredis 5.11.0 (unit and functional), phpredis 6.3.0
@@ -8,24 +8,25 @@ and sentinels up first. A test counts as lost when it passes on Redis and fails 
 
 Lost tests by the feature they need, sorted by the name or error each one failed on, so roughly:
 
-suite totals: {'redis-py': (16, 2357), 'predis': (8, 4525), 'redis-rb': (4, 893), 'ioredis': (0, 566), 'phpredis': (4, 203), 'node-redis': (28, 1486)}
+suite totals: {'redis-py': (3, 2357), 'predis': (5, 4525), 'redis-rb': (2, 893), 'ioredis': (0, 566), 'phpredis': (4, 203), 'node-redis': (27, 1486)}
                                                       redis-py    predis  redis-rb   ioredis  phpredis node-redi    all
 Client-side caching (TRACKING)                               1                                       1        20     22
-DUMP / RESTORE / MIGRATE                                    13         3         2                   1         1     20
 CONFIG SET / RESETSTAT / more CONFIG GET                               5                             1                6
 LATENCY                                                                                                        5      5
 INFO commandstats and fields                                                     2                                    2
 other                                                                                                          2      2
 BGSAVE SCHEDULE                                              1                                                        1
 COMMAND GETKEYS, DOCS, full table                            1                                                        1
+DUMP / RESTORE / MIGRATE                                                                             1                1
 OBJECT IDLETIME                                                                                      1                1
 
-That's 60 of 10,530, and 42 of them need one of the first two: something that isn't here. Each of the other
-18 was read: WAITAOF's (5) turn the log on with CONFIG SET appendonly, which needs --aof at the start here;
+That's 41 of 10,530, and 22 of them need the first: something that isn't here. Each of the other 19 was
+read: WAITAOF's (5) turn the log on with CONFIG SET appendonly, which needs --aof at the start here;
 LATENCY HISTOGRAM (5) and INFO commandstats (3, counting phpredis' testConfig) need per-command statistics, which
 would cost every command, so they wait for a measurement; BGSAVE and BGREWRITEAOF (3) refuse without --snapshot or
---aof, where Redis saves to its default; COMMAND LIST (1) expects over 300 commands, and there are 228;
-OBJECT IDLETIME (1) is always 0, as no access time is kept per key.
+--aof, where Redis saves to its default; COMMAND LIST (1) expects over 300 commands, and there are 231;
+OBJECT IDLETIME (2: phpredis' testTouch, and its testDumpRestore, which reads it after RESTORE ... IDLETIME 200)
+is always 0, as no access time is kept per key.
 
 Both servers now run with DEBUG allowed, as the libraries' own setups have it, so 21 more redis-py tests pass on
 the control than in the table below. Tests of Redis 7.4 and 8 commands (HEXPIRE and the like) fail on the control
@@ -37,6 +38,11 @@ Tantalum but for --requirepass and --enable-debug-command.
 Besides these suites, tools/admin-diff.py sends 3,373 commands and checks to Redis 7.2.4 and to Tantalum, with no
 differences: every command's COMMAND INFO and DOCS in both protocols, every setting's default, what each setting says
 to bad values, `~` trims with nodes of other sizes, the latency monitor, MONITOR's lines and SLOWLOG's entries.
+
+== Before: 0.28.0, 60 of 10,530 lost
+
+DUMP / RESTORE / MIGRATE (19 of its 20: redis-py 13, Predis 3, redis-rb 2, node-redis 1) was what's now gone; the
+one left, phpredis', now needs OBJECT IDLETIME. The rest is as above.
 
 == Before: 0.27.0, 99 of 10,530 lost
 
