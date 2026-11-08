@@ -103,6 +103,9 @@ pub struct Waiter {
     keys: Range<usize>,
     attempt: Try,
     client: u64,
+    /// Its user, if one that may not run everything: checked again when it
+    /// runs again, as its rules may have changed meanwhile (as in Redis).
+    user: Option<Arc<crate::acl::User>>,
     resp3: bool,
     /// The database it's blocked in.
     db: u32,
@@ -226,10 +229,17 @@ impl Waiter {
 
     /// Runs its command again, for a writer that claimed it.
     fn run_again(&self, ctx: &Context, now: Millis, out: &mut Vec<u8>) -> Attempt {
+        if let Some(user) = &self.user {
+            let args = Args::new(&self.buf, &self.ranges);
+            if crate::cmd::refused_when_served(ctx, self.client, user, &args, out) {
+                return Attempt::Done;
+            }
+        }
         let mut session = Session {
             id: self.client,
             authenticated: true,
             unrestricted: true,
+            user: None,
             pubsub: None,
             multi: None,
             watching: None,
@@ -248,6 +258,7 @@ impl Waiter {
             hits: 0,
             misses: 0,
             socket: -1,
+            seen: 0,
         };
         let args = Args::new(&self.buf, &self.ranges);
         (self.attempt)(ctx, &mut session, now, &args, out)
@@ -377,6 +388,7 @@ pub(crate) fn block(
         keys,
         attempt,
         client: session.id,
+        user: session.user.clone().filter(|u| !u.may_run_everything()),
         resp3: session.resp3,
         db: session.db,
         // A subscriber's connection writes messages while it waits.
@@ -437,6 +449,7 @@ pub(crate) fn block_for(
         keys: 0..0,
         attempt: never,
         client: session.id,
+        user: None,
         resp3: session.resp3,
         db: session.db,
         socket: -1,
@@ -628,6 +641,7 @@ mod tests {
             keys: 0..0,
             attempt: |_, _, _, _, _| Attempt::Done,
             client: 1,
+            user: None,
             resp3: false,
             socket: -1,
             reply: Mutex::new(Vec::new()),

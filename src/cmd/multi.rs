@@ -125,6 +125,12 @@ pub(super) fn exec(
             let args = queue.command(i);
             let command = find_command(args.get(0)).expect("checked when queued");
             let start = out.len();
+            // The user's rules may have changed since it was queued.
+            if session.user.is_some()
+                && super::acl::refused_in_exec(ctx, session, queue.len(), command, &args, out)
+            {
+                continue;
+            }
             let reply = if session.special {
                 super::watched_inside(ctx, session, now, command, &args, out)
             } else {

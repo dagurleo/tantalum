@@ -3,13 +3,15 @@
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::watch;
 
+use crate::acl::{Acl, User};
 use crate::cmd::Args;
 use crate::config::ConfigTable;
 use crate::latency::Latency;
@@ -27,6 +29,9 @@ use crate::transaction::{Queue, Watching};
 pub struct Settings {
     /// `requirepass`: clients must `AUTH` with it before anything else.
     pub password: Option<Vec<u8>>,
+    /// `aclfile`: where `ACL SAVE` writes users and `ACL LOAD` reads them,
+    /// read at startup too.
+    pub aclfile: Option<PathBuf>,
     /// Connections beyond this many are refused with an error.
     pub maxclients: usize,
     /// Connections idle this long are closed. `None` keeps them forever.
@@ -49,6 +54,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             password: None,
+            aclfile: None,
             maxclients: 10_000,
             timeout: None,
             tcp_keepalive: Some(Duration::from_secs(300)),
@@ -60,10 +66,13 @@ impl Default for Settings {
 }
 
 /// In [`Context::special`]: something's watching every command.
-const SPECIAL_ON: u8 = 1;
+const SPECIAL_ON: u32 = 1;
 /// In [`Context::special`]: the ticking clock's asleep, as nothing has run for a while. In the
-/// same byte, so that the first batch after a quiet spell wakes it, and it costs the others nothing.
-const CLOCK_ASLEEP: u8 = 2;
+/// same word, so that the first batch after a quiet spell wakes it, and it costs the others nothing.
+const CLOCK_ASLEEP: u32 = 2;
+/// In [`Context::special`], counted in the bits above: users changed (`ACL SETUSER` and
+/// the like), so each connection takes up its user's new rules at its next batch.
+const USERS_CHANGED: u32 = 4;
 
 /// `--enable-debug-command`, as in Redis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,7 +150,7 @@ pub struct Context {
     /// Connections look once a batch (which also wakes the clock: see [`CLOCK_ASLEEP`]),
     /// and while it's on, take the restricted path, whose checks are the ones that
     /// see to it. So none of this costs a command anything when it's off.
-    special: AtomicU8,
+    special: AtomicU32,
     /// The thread that ticks the clock.
     clock: OnceLock<std::thread::Thread>,
     monitoring: AtomicBool,
@@ -153,8 +162,10 @@ pub struct Context {
     /// In milliseconds, 0 for none.
     timeout: AtomicU64,
     tcp_keepalive: AtomicU64,
+    /// `requirepass` as set, for `CONFIG GET` (the default user has its hash).
     password: Mutex<Option<Vec<u8>>>,
-    has_password: AtomicBool,
+    /// Users and what they may run.
+    pub(crate) acl: Acl,
     /// Lua scripts and their interpreter, made on the first one.
     pub(crate) scripting: Scripting,
     started: Instant,
@@ -186,7 +197,7 @@ impl Context {
             hll_sparse_max_bytes: AtomicUsize::new(3000),
             stream_node_bytes: AtomicUsize::new(NodeLimits::default().bytes),
             ticks: AtomicU64::new(0),
-            special: AtomicU8::new(0),
+            special: AtomicU32::new(0),
             clock: OnceLock::new(),
             monitoring: AtomicBool::new(false),
             monitors: Mutex::new(Vec::new()),
@@ -197,7 +208,7 @@ impl Context {
                 settings.tcp_keepalive.map_or(0, |t| t.as_millis() as u64),
             ),
             password: Mutex::new(settings.password.clone()),
-            has_password: AtomicBool::new(settings.password.is_some()),
+            acl: Acl::new(settings.password.as_deref(), settings.aclfile.clone()),
             scripting: Scripting::default(),
             store,
             settings,
@@ -225,17 +236,18 @@ impl Context {
         }
     }
 
-    /// Whether a connection's commands take the watched path, once a batch.
+    /// Whether a connection's commands take the watched path, and its user's
+    /// rules, once a batch.
     #[inline]
     pub(crate) fn follow_special(&self, session: &mut Session) {
         let state = self.special.load(Relaxed);
-        if state != u8::from(session.special) {
+        if state != session.seen {
             self.special_changed(session, state);
         }
     }
 
     #[cold]
-    fn special_changed(&self, session: &mut Session, state: u8) {
+    fn special_changed(&self, session: &mut Session, state: u32) {
         if state & CLOCK_ASLEEP != 0 {
             let was = self.special.fetch_and(!CLOCK_ASLEEP, Relaxed);
             if was & CLOCK_ASLEEP != 0 {
@@ -245,11 +257,35 @@ impl Context {
                 }
             }
         }
+        let state = state & !CLOCK_ASLEEP;
+        if state & !SPECIAL_ON != session.seen & !SPECIAL_ON {
+            self.take_up_user(session);
+        }
+        session.seen = state;
         let special = state & SPECIAL_ON != 0;
         if special != session.special {
             session.special = special;
-            session.refresh();
         }
+        session.refresh();
+    }
+
+    /// Users changed: every connection takes up its user's new rules.
+    pub(crate) fn acl_changed(&self) {
+        self.special.fetch_add(USERS_CHANGED, Relaxed);
+    }
+
+    /// The connection's user as it is now: the same one changed, or, if it
+    /// was deleted, one that closes the connection.
+    fn take_up_user(&self, session: &mut Session) {
+        let name: &[u8] = session.user.as_ref().map_or(b"default", |u| u.name());
+        let current = self.acl.get(name);
+        let user = match (current, &session.user) {
+            (Some(user), Some(had)) if user.serial() != had.serial() => had.tombstone(),
+            (Some(user), _) => user,
+            (None, Some(had)) => had.tombstone(),
+            (None, None) => self.acl.default_user(),
+        };
+        session.user = Session::held(user);
     }
 
     /// After what `special` goes by changed.
@@ -430,6 +466,7 @@ impl Context {
         self.rejected_connections.store(0, Relaxed);
         self.memory_peak.store(0, Relaxed);
         self.store.reset_stats();
+        // (Not the ACL counts, which Redis keeps too.)
     }
 
     pub(crate) fn maxclients(&self) -> usize {
@@ -470,10 +507,12 @@ impl Context {
         self.password.lock().clone()
     }
 
-    /// Clients already authenticated stay so, as in Redis.
+    /// The default user's password (`requirepass`). Clients already
+    /// authenticated stay so, as in Redis.
     pub(crate) fn set_password(&self, password: Option<Vec<u8>>) {
-        self.has_password.store(password.is_some(), Relaxed);
+        self.acl.set_default_password(password.as_deref());
         *self.password.lock() = password;
+        self.acl_changed();
     }
 
     /// Whether this connection may run `DEBUG`.
@@ -554,6 +593,7 @@ impl Context {
                     pubsub: false,
                     monitor: false,
                     last_command: None,
+                    user: None,
                 },
             );
         }
@@ -655,15 +695,125 @@ impl Context {
         let now = self.started.elapsed();
         let mut out = Vec::with_capacity(300 * listed.len());
         for id in listed {
+            let mine = id == me.id;
             client_line(
                 &mut out,
                 id,
                 &clients[&id],
                 now,
-                (id == me.id).then_some((me, cmd)),
+                mine.then_some(me),
+                mine.then_some(cmd),
+                None,
             );
         }
         out
+    }
+
+    /// A connection's `CLIENT INFO` line, without its newline, as `ACL LOG`
+    /// keeps it: `cmd` is the command it's running.
+    pub(crate) fn client_info(&self, session: &Session, cmd: &str) -> Vec<u8> {
+        let mut line = self.client_lines(session, &[session.id], cmd);
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        line
+    }
+
+    /// The same for a connection running `EXEC` of `queued` commands, which
+    /// shows as still in its transaction, as in Redis.
+    pub(crate) fn client_info_in_exec(&self, session: &Session, queued: usize) -> Vec<u8> {
+        let clients = self.clients.lock();
+        let mut out = Vec::new();
+        if let Some(client) = clients.get(&session.id) {
+            let now = self.started.elapsed();
+            client_line(
+                &mut out,
+                session.id,
+                client,
+                now,
+                Some(session),
+                Some("exec"),
+                Some(queued),
+            );
+        }
+        if out.last() == Some(&b'\n') {
+            out.pop();
+        }
+        out
+    }
+
+    /// The same for a connection by id, from what the registry knows (for a
+    /// script's caller, which is running `cmd`).
+    pub(crate) fn client_info_of(&self, id: u64, cmd: &str) -> Vec<u8> {
+        let clients = self.clients.lock();
+        let mut out = Vec::new();
+        if let Some(client) = clients.get(&id) {
+            client_line(
+                &mut out,
+                id,
+                client,
+                self.started.elapsed(),
+                None,
+                Some(cmd),
+                None,
+            );
+        }
+        if out.last() == Some(&b'\n') {
+            out.pop();
+        }
+        out
+    }
+
+    /// Closes the connections authenticated as the user `name` (as `ACL
+    /// DELUSER` does), but for `me`'s, which the caller closes.
+    pub(crate) fn kill_user_clients(&self, me: u64, name: &[u8]) {
+        let filter = KillFilter {
+            addr: None,
+            laddr: None,
+            id: 0,
+            pubsub: None,
+            none: false,
+            skip_me: true,
+            user: Some(name),
+        };
+        self.kill_clients(me, &filter);
+    }
+
+    /// Closes the subscribed connections of `user` (just changed) whose
+    /// subscriptions it no longer allows, as Redis does, but for `me`'s.
+    pub(crate) fn kill_unsubscribable(&self, me: u64, user: &User) {
+        let ids: Vec<u64> = {
+            let clients = self.clients.lock();
+            clients
+                .iter()
+                .filter(|&(&id, client)| {
+                    id != me
+                        && client.pubsub
+                        && client.user.as_deref().unwrap_or(b"default") == user.name()
+                })
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        for id in ids {
+            let (channels, patterns, shard) = self.pubsub.subscriptions_of(id);
+            let allowed = channels
+                .iter()
+                .chain(&shard)
+                .all(|c| crate::acl::may_keep(user, c, false))
+                && patterns.iter().all(|p| crate::acl::may_keep(user, p, true));
+            if !allowed {
+                let filter = KillFilter {
+                    addr: None,
+                    laddr: None,
+                    id,
+                    pubsub: None,
+                    none: false,
+                    skip_me: true,
+                    user: None,
+                };
+                self.kill_clients(me, &filter);
+            }
+        }
     }
 
     /// BullMQ scripts run natively, and calls sent back to Lua
@@ -677,19 +827,16 @@ impl Context {
         self.connected.load(Relaxed)
     }
 
-    pub fn has_password(&self) -> bool {
-        self.has_password.load(Relaxed)
+    /// Loads users from the ACL file, if one was given: at startup, where an
+    /// error should stop the server, as in Redis.
+    pub fn load_acl_file(&self) -> Result<(), String> {
+        self.acl.load_at_startup()
     }
 
-    /// Whether these credentials are valid. There is one user, `default`,
-    /// which takes any password when none is configured (as in Redis).
-    pub fn check_password(&self, user: &[u8], password: &[u8]) -> bool {
-        user == b"default"
-            && self
-                .password
-                .lock()
-                .as_ref()
-                .is_none_or(|expected| constant_time_eq(expected, password))
+    /// Whether connections start authenticated: the default user is on and
+    /// needs no password.
+    pub fn open(&self) -> bool {
+        self.acl.open()
     }
 
     /// Adds a session's counts since the last call to the server's totals.
@@ -718,12 +865,6 @@ impl Context {
             keyspace_misses: sum(|c| &c.misses),
         }
     }
-}
-
-/// Compares without stopping at the first difference, so response times
-/// don't reveal how much of a guessed password was right.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Server totals for `INFO`. Counts lag by up to one read's worth of
@@ -759,11 +900,13 @@ pub struct Client<'a> {
 impl Client<'_> {
     /// Per-connection state for commands.
     pub fn session(&self) -> Session {
-        let authenticated = !self.ctx.has_password();
-        Session {
+        let authenticated = self.ctx.open();
+        let user = Session::held(self.ctx.acl.default_user());
+        let mut session = Session {
             id: self.id,
             authenticated,
-            unrestricted: authenticated,
+            unrestricted: false,
+            user,
             pubsub: None,
             multi: None,
             watching: None,
@@ -782,7 +925,10 @@ impl Client<'_> {
             hits: 0,
             misses: 0,
             socket: -1,
-        }
+            seen: 0,
+        };
+        session.refresh();
+        session
     }
 
     /// Records the connection's buffer capacity, which counts against
@@ -830,6 +976,8 @@ pub(crate) struct Registered {
     pub(crate) monitor: bool,
     /// What it last ran, where that's known: what subscribed it.
     pub(crate) last_command: Option<&'static str>,
+    /// The user it's authenticated as, if not `default`.
+    pub(crate) user: Option<Box<[u8]>>,
 }
 
 fn new_run_id() -> String {
@@ -880,6 +1028,8 @@ pub(crate) struct KillFilter<'a> {
     /// A kind of client there's none of here: replicas, a master.
     pub(crate) none: bool,
     pub(crate) skip_me: bool,
+    /// Authenticated as this user.
+    pub(crate) user: Option<&'a [u8]>,
 }
 
 impl KillFilter<'_> {
@@ -888,6 +1038,12 @@ impl KillFilter<'_> {
             return false;
         }
         if self.pubsub.is_some_and(|pubsub| pubsub != client.pubsub) {
+            return false;
+        }
+        if self
+            .user
+            .is_some_and(|user| user != client.user.as_deref().unwrap_or(b"default"))
+        {
             return false;
         }
         if self.addr.is_some() || self.laddr.is_some() {
@@ -933,14 +1089,15 @@ fn client_line(
     id: u64,
     client: &Registered,
     now: Duration,
-    me: Option<(&Session, &str)>,
+    session: Option<&Session>,
+    cmd: Option<&str>,
+    exec: Option<usize>,
 ) {
     let (peer, local) = client.addresses();
     let text = |v: &Option<Box<[u8]>>| {
         v.as_deref()
             .map_or_else(String::new, |v| String::from_utf8_lossy(v).into_owned())
     };
-    let session = me.map(|(session, _)| session);
     let subscriptions = session.and_then(|s| s.pubsub.as_deref());
     let count = |to| subscriptions.map_or(0, |s| s.count_of(to));
     let mut flags = String::new();
@@ -950,7 +1107,7 @@ fn client_line(
     if client.monitor {
         flags.push('O');
     }
-    if session.is_some_and(|s| s.multi.is_some()) {
+    if session.is_some_and(|s| s.multi.is_some()) || exec.is_some() {
         flags.push('x');
     }
     if session.is_some_and(|s| s.no_evict) {
@@ -966,11 +1123,13 @@ fn client_line(
     let db = session.map_or(client.db, |s| s.db);
     let multi = session
         .and_then(|s| s.multi.as_ref())
-        .map_or(-1, |queue| queue.len() as i64);
+        .map(|queue| queue.len())
+        .or(exec)
+        .map_or(-1, |queued| queued as i64);
     let line = format!(
         "id={id} addr={} laddr={} fd={} name={} age={} idle=0 flags={flags} db={db} sub={} psub={} \
          ssub={} multi={multi} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 \
-         oll=0 omem=0 tot-mem=0 events=r cmd={} user=default redir=-1 resp={} lib-name={} \
+         oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir=-1 resp={} lib-name={} \
          lib-ver={}\n",
         peer,
         local,
@@ -980,7 +1139,11 @@ fn client_line(
         count(crate::pubsub::To::Channels),
         count(crate::pubsub::To::Patterns),
         count(crate::pubsub::To::ShardChannels),
-        me.map_or(client.last_command.unwrap_or("NULL"), |(_, cmd)| cmd),
+        cmd.unwrap_or(client.last_command.unwrap_or("NULL")),
+        client
+            .user
+            .as_deref()
+            .map_or("default".into(), String::from_utf8_lossy),
         if resp3 { 3 } else { 2 },
         text(&client.lib_name),
         text(&client.lib_ver),
@@ -992,9 +1155,13 @@ fn client_line(
 pub struct Session {
     pub(crate) id: u64,
     pub(crate) authenticated: bool,
-    /// Authenticated, not subscribed and not in `MULTI`: commands take the
-    /// fast path and skip the checks below it. Kept by [`Session::refresh`].
+    /// Authenticated, not subscribed and not in `MULTI`, and its user may run
+    /// everything: commands take the fast path and skip the checks below it.
+    /// Kept by [`Session::refresh`].
     pub(crate) unrestricted: bool,
+    /// The user it runs as: `None` for the default user while that may run
+    /// everything (most connections, which then hold nothing shared).
+    pub(crate) user: Option<Arc<User>>,
     /// What the client is subscribed to, if anything.
     pub(crate) pubsub: Option<Box<Subscriptions>>,
     /// The commands queued since `MULTI`.
@@ -1027,6 +1194,8 @@ pub struct Session {
     /// Its connection's plain TCP socket, for a write that serves it while
     /// it's blocked to send the reply on (see `blocking`); -1 for none.
     pub(crate) socket: RawFd,
+    /// [`Context::special`] as it last saw it, but for the sleeping clock.
+    pub(crate) seen: u32,
 }
 
 impl Session {
@@ -1046,6 +1215,7 @@ impl Session {
             id: 0,
             authenticated: true,
             unrestricted: true,
+            user: None,
             pubsub: None,
             multi: None,
             watching: None,
@@ -1064,6 +1234,7 @@ impl Session {
             hits: 0,
             misses: 0,
             socket: -1,
+            seen: 0,
         }
     }
 
@@ -1099,9 +1270,31 @@ impl Session {
         self.refresh();
     }
 
+    /// How a session holds `user`: the default user that may run everything
+    /// as `None`.
+    pub(crate) fn held(user: Arc<User>) -> Option<Arc<User>> {
+        (!(user.may_run_everything() && user.name() == b"default" && user.serial() == 0))
+            .then_some(user)
+    }
+
+    /// Authenticated as `user` from now on.
+    pub(crate) fn set_user(&mut self, ctx: &Context, user: Arc<User>) {
+        let name = (user.name() != b"default").then(|| user.name().into());
+        ctx.update_client(self.id, |client| client.user = name);
+        self.user = Session::held(user);
+        self.authenticated = true;
+        self.refresh();
+    }
+
+    /// The name of its user.
+    pub(crate) fn user_name(&self) -> &[u8] {
+        self.user.as_ref().map_or(b"default", |u| u.name())
+    }
+
     /// Recomputes `unrestricted` after what it depends on changed.
     pub(crate) fn refresh(&mut self) {
         self.unrestricted = self.authenticated
+            && self.user.as_ref().is_none_or(|u| u.may_run_everything())
             && self.pubsub.is_none()
             && self.multi.is_none()
             && self.monitor.is_none()

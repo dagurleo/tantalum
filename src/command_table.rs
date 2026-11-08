@@ -278,6 +278,15 @@ pub(crate) fn refused_subcommand(name: &str, sub: &[u8], argc: usize) -> bool {
     (arity > 0 && arity != argc) || argc < -arity
 }
 
+/// The arity of a command or subcommand (`name|sub`), lowercase.
+pub(crate) fn arity_of(full: &str) -> Option<i64> {
+    let (name, sub) = match full.split_once('|') {
+        Some((name, sub)) => (name, Some(sub.as_bytes())),
+        None => (full, None),
+    };
+    Some(parsed(name, sub)?.list()[ARITY].int())
+}
+
 /// Whether command `name` is in ACL category `category` (without its `@`).
 pub(crate) fn in_category(name: &str, category: &[u8]) -> bool {
     let Some(entry) = entry(name) else {
@@ -491,9 +500,371 @@ fn range(spec: &Value<'_>, args: &[&[u8]], first: i64) -> Result<(i64, i64, i64)
     }
 }
 
+/// A key spec flag's bit, as Redis numbers its `CMD_KEY_*`.
+fn key_flag(name: &[u8]) -> u16 {
+    const NAMES: [&[u8]; 11] = [
+        b"RO",
+        b"RW",
+        b"OW",
+        b"RM",
+        b"access",
+        b"update",
+        b"insert",
+        b"delete",
+        b"not_key",
+        b"incomplete",
+        b"variable_flags",
+    ];
+    NAMES.iter().position(|&n| n == name).map_or(0, |i| 1 << i)
+}
+
+/// Where a key spec's keys start.
+enum Begin {
+    Index(i64),
+    Keyword { keyword: &'static [u8], from: i64 },
+    Unknown,
+}
+
+/// How a key spec's keys go on from there.
+enum Find {
+    Range { last: i64, step: i64, limit: i64 },
+    Keynum { index: i64, first: i64, step: i64 },
+    Unknown,
+}
+
+struct Spec {
+    flags: u16,
+    begin: Begin,
+    find: Find,
+}
+
+/// Commands whose keys their specs can't tell, which Redis finds by their
+/// own rules (`getkeys_proc`).
+enum Special {
+    No,
+    /// `SET`: read too with `GET`.
+    Set,
+    /// `BITFIELD`: read only, if all it does is `GET`.
+    Bitfield,
+    /// `SORT`: the key, and the last `STORE`'s.
+    Sort,
+}
+
+/// A command's key specs, compiled for the ACL checks a restricted user's
+/// commands get, which run them for every command (`COMMAND GETKEYS`, which
+/// is rare, reads the table instead).
+pub(crate) struct KeySpecs {
+    special: Special,
+    specs: Vec<Spec>,
+}
+
+const RO_ACCESS: u16 = 1 | 1 << 4;
+const RW_ACCESS_UPDATE: u16 = 1 << 1 | 1 << 4 | 1 << 5;
+const OW_UPDATE: u16 = 1 << 2 | 1 << 5;
+
+impl KeySpecs {
+    fn compile(name: &str, item: &Value<'static>) -> Option<KeySpecs> {
+        let special = match name {
+            "set" => Special::Set,
+            "bitfield" => Special::Bitfield,
+            "sort" => Special::Sort,
+            _ => Special::No,
+        };
+        let mut specs = Vec::new();
+        for spec in item.list()[KEY_SPECS].list() {
+            let flags = spec.field(b"flags").map_or(0, |f| {
+                f.list().iter().fold(0, |bits, v| bits | key_flag(v.text()))
+            });
+            if flags & key_flag(b"not_key") != 0 {
+                continue;
+            }
+            let begin = spec.field(b"begin_search").and_then(|search| {
+                let detail = search.field(b"spec")?;
+                Some(match search.field(b"type")?.text() {
+                    b"index" => Begin::Index(detail.field(b"index")?.int()),
+                    b"keyword" => Begin::Keyword {
+                        keyword: detail.field(b"keyword")?.text(),
+                        from: detail.field(b"startfrom")?.int(),
+                    },
+                    _ => Begin::Unknown,
+                })
+            });
+            let find = spec.field(b"find_keys").and_then(|find| {
+                let detail = find.field(b"spec")?;
+                Some(match find.field(b"type")?.text() {
+                    b"range" => Find::Range {
+                        last: detail.field(b"lastkey")?.int(),
+                        step: detail.field(b"keystep")?.int(),
+                        limit: detail.field(b"limit")?.int(),
+                    },
+                    b"keynum" => Find::Keynum {
+                        index: detail.field(b"keynumidx")?.int(),
+                        first: detail.field(b"firstkey")?.int(),
+                        step: detail.field(b"keystep")?.int(),
+                    },
+                    _ => Find::Unknown,
+                })
+            });
+            specs.push(Spec {
+                flags,
+                begin: begin.unwrap_or(Begin::Unknown),
+                find: find.unwrap_or(Find::Unknown),
+            });
+        }
+        (!specs.is_empty() || !matches!(special, Special::No))
+            .then_some(KeySpecs { special, specs })
+    }
+
+    /// Calls `f` with each key's position and flags, until it says to stop:
+    /// those Redis' `getKeysFromCommandWithSpecs` finds, which is none when a
+    /// spec can't make sense of the arguments (the command then fails anyway).
+    pub(crate) fn each_key(
+        &self,
+        args: &crate::cmd::Args<'_>,
+        mut f: impl FnMut(usize, u16) -> bool,
+    ) {
+        let argc = args.len() as i64;
+        match self.special {
+            Special::No => {}
+            Special::Set => {
+                let get = (3..args.len()).any(|i| args.get(i).eq_ignore_ascii_case(b"GET"));
+                f(1, if get { RW_ACCESS_UPDATE } else { OW_UPDATE });
+                return;
+            }
+            Special::Bitfield => {
+                let mut read_only = true;
+                let mut i = 2;
+                while i < args.len() {
+                    let more = args.len() - i - 1;
+                    let arg = args.get(i);
+                    if arg.eq_ignore_ascii_case(b"GET") && more >= 2 {
+                        i += 3;
+                    } else if arg.eq_ignore_ascii_case(b"OVERFLOW") && more >= 1 {
+                        i += 2;
+                    } else {
+                        read_only = false;
+                        break;
+                    }
+                }
+                f(
+                    1,
+                    if read_only {
+                        RO_ACCESS
+                    } else {
+                        RW_ACCESS_UPDATE
+                    },
+                );
+                return;
+            }
+            Special::Sort => {
+                let (mut i, mut store) = (2, None);
+                while i < args.len() {
+                    let arg = args.get(i);
+                    if arg.eq_ignore_ascii_case(b"LIMIT") {
+                        i += 2;
+                    } else if arg.eq_ignore_ascii_case(b"GET") || arg.eq_ignore_ascii_case(b"BY") {
+                        i += 1;
+                    } else if arg.eq_ignore_ascii_case(b"STORE") && i + 1 < args.len() {
+                        store = Some(i + 1);
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if f(1, RO_ACCESS)
+                    && let Some(at) = store
+                {
+                    f(at, OW_UPDATE);
+                }
+                return;
+            }
+        }
+        // Every spec first, so that one that makes no sense means no keys.
+        let mut ranges = [(0i64, 0i64, 0i64, 0u16); 4];
+        let mut found = Vec::new();
+        let mut count = 0;
+        for spec in &self.specs {
+            let first = match spec.begin {
+                Begin::Index(at) => at,
+                Begin::Keyword { keyword, from } => {
+                    let start = if from > 0 { from } else { argc + from };
+                    let end = if from > 0 { argc - 1 } else { 1 };
+                    let mut i = start;
+                    let mut first = 0;
+                    while i != end {
+                        if i >= argc || i < 1 {
+                            break;
+                        }
+                        if args.get(i as usize).eq_ignore_ascii_case(keyword) {
+                            first = i + 1;
+                            break;
+                        }
+                        i += if start <= end { 1 } else { -1 };
+                    }
+                    if first == 0 {
+                        continue;
+                    }
+                    first
+                }
+                Begin::Unknown => return,
+            };
+            let (first, last, step) = match spec.find {
+                Find::Range { last, step, limit } => {
+                    let last = if last >= 0 {
+                        first + last
+                    } else if limit == 0 {
+                        argc + last
+                    } else {
+                        first + ((argc - first) / limit + last)
+                    };
+                    (first, last, step)
+                }
+                Find::Keynum {
+                    index,
+                    first: first_key,
+                    step,
+                } => {
+                    if index >= argc || first + index >= argc {
+                        return;
+                    }
+                    let Some(numkeys) = crate::resp::parse_int(args.get((first + index) as usize))
+                        .filter(|&n| n >= 0)
+                    else {
+                        return;
+                    };
+                    let first = first + first_key;
+                    (first, first + numkeys - 1, step)
+                }
+                Find::Unknown => return,
+            };
+            if last >= argc || last < first || first >= argc {
+                return;
+            }
+            let range = (first, last, step.max(1), spec.flags);
+            if count < ranges.len() {
+                ranges[count] = range;
+            } else {
+                found.push(range);
+            }
+            count += 1;
+        }
+        for &(first, last, step, flags) in ranges[..count.min(ranges.len())].iter().chain(&found) {
+            let mut i = first;
+            while i <= last {
+                if !f(i as usize, flags) {
+                    return;
+                }
+                i += step;
+            }
+        }
+    }
+}
+
+/// The compiled key specs of a command or subcommand (`name|sub`), lowercase;
+/// `None` for one without keys.
+pub(crate) fn key_specs(full: &str) -> Option<&'static KeySpecs> {
+    static ALL: OnceLock<HashMap<String, Option<KeySpecs>>> = OnceLock::new();
+    let all = ALL.get_or_init(|| {
+        let mut all = HashMap::new();
+        for (name, entry) in entries() {
+            let (value, _) = parse(entry.info, 0);
+            for sub in value.list()[SUBCOMMANDS].list() {
+                let full = String::from_utf8_lossy(sub.list()[0].text()).into_owned();
+                let specs = KeySpecs::compile(&full, sub);
+                all.insert(full, specs);
+            }
+            all.insert((*name).to_string(), KeySpecs::compile(name, &value));
+        }
+        all
+    });
+    all.get(full)?.as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The compiled specs find the keys `COMMAND GETKEYSANDFLAGS` finds.
+    #[test]
+    fn compiled_specs_find_the_same_keys() {
+        let cases: &[&[&str]] = &[
+            &["get", "k"],
+            &["set", "k", "v"],
+            &["set", "k", "v", "GET"],
+            &["mset", "a", "1", "b", "2", "c", "3"],
+            &["del", "a", "b", "c"],
+            &["eval", "return 1", "2", "a", "b", "x"],
+            &["zunionstore", "d", "2", "a", "b", "WEIGHTS", "1", "2"],
+            &["xread", "COUNT", "2", "STREAMS", "a", "b", "0", "0"],
+            &["xreadgroup", "GROUP", "g", "c", "STREAMS", "a", "0"],
+            &["georadius", "k", "1", "2", "3", "m", "STORE", "d"],
+            &["sort", "k", "BY", "w_*", "GET", "#", "STORE", "d"],
+            &["sort_ro", "k"],
+            &["bitfield", "k", "GET", "u8", "0"],
+            &["bitfield", "k", "SET", "u8", "0", "1"],
+            &["lmove", "a", "b", "LEFT", "RIGHT"],
+            &["blmpop", "0", "2", "a", "b", "LEFT"],
+            &["object", "encoding", "k"],
+            &["xinfo", "stream", "k"],
+            &["rename", "a", "b"],
+            &["copy", "a", "b"],
+            &["smove", "a", "b", "m"],
+            &[
+                "geosearchstore",
+                "d",
+                "s",
+                "FROMLONLAT",
+                "1",
+                "2",
+                "BYRADIUS",
+                "1",
+                "m",
+            ],
+            &["pfmerge", "d", "a", "b"],
+            &["memory", "usage", "k"],
+        ];
+        let names = |bits: u16| -> Vec<Vec<u8>> {
+            [
+                b"RO".as_ref(),
+                b"RW",
+                b"OW",
+                b"RM",
+                b"access",
+                b"update",
+                b"insert",
+                b"delete",
+            ]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| bits & (1 << i) != 0)
+            .map(|(_, n)| n.to_vec())
+            .collect()
+        };
+        for case in cases {
+            let bytes: Vec<&[u8]> = case.iter().map(|s| s.as_bytes()).collect();
+            let mut buf = Vec::new();
+            let mut ranges = Vec::new();
+            for arg in &bytes {
+                let start = buf.len();
+                buf.extend_from_slice(arg);
+                ranges.push(start..buf.len());
+            }
+            let args = crate::cmd::Args::new(&buf, &ranges);
+            let full = if hidden(case[0], None).container {
+                format!("{}|{}", case[0], case[1])
+            } else {
+                case[0].to_string()
+            };
+            let mut compiled = Vec::new();
+            if let Some(specs) = key_specs(&full) {
+                specs.each_key(&args, |at, flags| {
+                    compiled.push((at, names(flags)));
+                    true
+                });
+            }
+            let expected = keys_of(&bytes).unwrap_or_default();
+            assert_eq!(compiled, expected, "{case:?}");
+        }
+    }
 
     fn has_map(value: &Value<'_>) -> bool {
         match value {

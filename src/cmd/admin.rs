@@ -11,7 +11,7 @@ use crate::glob;
 use crate::resp;
 use crate::store::{EvictionPolicy, Millis, View};
 
-fn help(out: &mut Vec<u8>, lines: &[&str]) {
+pub(super) fn help(out: &mut Vec<u8>, lines: &[&str]) {
     resp::write_array_header(out, lines.len());
     for line in lines {
         resp::write_simple(out, line.as_bytes());
@@ -177,6 +177,10 @@ fn live_setting(ctx: &Context, name: &str) -> Option<String> {
         "timeout" => ctx.timeout().map_or(0, |t| t.as_secs()).to_string(),
         "tcp-keepalive" => ctx.tcp_keepalive().map_or(0, |t| t.as_secs()).to_string(),
         "requirepass" => String::from_utf8_lossy(&ctx.password().unwrap_or_default()).into_owned(),
+        "aclfile" => ctx
+            .acl
+            .file()
+            .map_or(String::new(), |f| f.display().to_string()),
         "slowlog-log-slower-than" => ctx.slowlog.threshold().to_string(),
         "slowlog-max-len" => ctx.slowlog.max_len().to_string(),
         "appendonly" => if ctx.aof().is_some() { "yes" } else { "no" }.to_string(),
@@ -391,6 +395,10 @@ fn apply(ctx: &Context, name: &str, value: &str) {
         "stream-node-max-entries" => ctx.set_stream_node_entries(number().max(0) as usize),
         "stream-node-max-bytes" => ctx.set_stream_node_bytes(number().max(0) as usize),
         "hll-sparse-max-bytes" => ctx.set_hll_sparse_max_bytes(number().max(0) as usize),
+        "acllog-max-len" => ctx.acl.set_log_max(number().max(0) as usize),
+        "acl-pubsub-default" => ctx
+            .acl
+            .set_all_channels(value.eq_ignore_ascii_case("allchannels")),
         _ => {}
     }
 }

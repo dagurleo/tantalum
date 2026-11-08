@@ -36,6 +36,8 @@ type Hasher = foldhash::fast::RandomState;
 type Subscribers = HashMap<u64, Arc<Subscriber>, Hasher>;
 /// Channels (or patterns) and their subscribers.
 type Registry = HashMap<Box<[u8]>, Subscribers, Hasher>;
+/// Channel or pattern names.
+type Names = Vec<Box<[u8]>>;
 
 /// Outbox sizes past which a subscriber is disconnected: at once, or after
 /// staying over the soft limit this long (Redis' defaults).
@@ -116,6 +118,21 @@ impl Channels {
             .read()
             .get(channel)
             .map_or(0, HashMap::len)
+    }
+
+    /// The channels connection `id` is subscribed to.
+    fn of(&self, id: u64) -> Vec<Box<[u8]>> {
+        let mut found = Vec::new();
+        for shard in self.shards.iter() {
+            let shard = shard.read();
+            found.extend(
+                shard
+                    .iter()
+                    .filter(|(_, subscribers)| subscribers.contains_key(&id))
+                    .map(|(channel, _)| channel.clone()),
+            );
+        }
+        found
     }
 
     /// The channels with subscribers that match `pattern` (all if `None`).
@@ -234,6 +251,19 @@ impl PubSub {
     /// `PUBSUB NUMSUB`, or with `shard`, `SHARDNUMSUB`, for one channel.
     pub(crate) fn subscribers(&self, shard: bool, channel: &[u8]) -> usize {
         self.namespace(shard).subscribers(channel)
+    }
+
+    /// What connection `id` is subscribed to: channels, patterns and shard
+    /// channels (for `ACL SETUSER`, which looks through them all).
+    pub(crate) fn subscriptions_of(&self, id: u64) -> (Names, Names, Names) {
+        let patterns = self
+            .patterns
+            .read()
+            .iter()
+            .filter(|(_, subscribers)| subscribers.contains_key(&id))
+            .map(|(pattern, _)| pattern.clone())
+            .collect();
+        (self.channels.of(id), patterns, self.shard_channels.of(id))
     }
 
     /// Channels with subscribers, for `INFO`.

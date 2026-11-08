@@ -1,6 +1,8 @@
 //! Scripts: `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO` and `SCRIPT` (the
 //! interpreter is `src/script.rs`), and running a script's `redis.call`.
 
+use std::borrow::Cow;
+
 use super::{Args, Reply, find_command, unknown_subcommand, wrong_arity};
 use crate::context::{Context, Session};
 use crate::resp;
@@ -81,10 +83,17 @@ fn run(
     // not inside EXEC, whose transaction holds them).
     // (Not while something wants to hear of what scripts run.)
     let watched = session.special || ctx.monitoring();
+    // A user that may not run everything has each of its commands checked,
+    // which only Lua does.
+    let checked = session
+        .user
+        .as_ref()
+        .is_some_and(|u| !u.may_run_everything());
     let native = sha
         && !read_only
         && ctx.settings.native_scripts
         && !watched
+        && !checked
         && !crate::shard_lock::in_transaction();
     if native
         && ctx
@@ -97,7 +106,7 @@ fn run(
         ctx.scripting.eval(
             ctx,
             session,
-            !native && !watched,
+            !native && !watched && !checked,
             now,
             args,
             numkeys as usize,
@@ -222,28 +231,35 @@ fn refused_in_script(name: &str, flags: &[&str], args: &Args<'_>) -> bool {
 /// Runs one of a script's `redis.call`s (Redis' `scriptCall`) with its
 /// reply in `out`, returning whether it was a write command, or the error
 /// Lua raises instead.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn call_from_script(
     ctx: &Context,
     session: &mut Session,
+    caller: (u64, &str),
     now: Millis,
     args: &Args<'_>,
     read_only: bool,
     out: &mut Vec<u8>,
-) -> Result<bool, &'static str> {
+) -> Result<bool, Cow<'static, str>> {
     let Some(command) = find_command(args.get(0)) else {
-        return Err("Unknown Redis command called from script");
+        return Err("Unknown Redis command called from script".into());
     };
     if !command.arity_allows(args.len()) {
-        return Err("Wrong number of args calling Redis command from script");
+        return Err("Wrong number of args calling Redis command from script".into());
     }
     if refused_in_script(command.name, command.flags, args) {
-        return Err("This Redis command is not allowed from script");
+        return Err("This Redis command is not allowed from script".into());
+    }
+    if session.user.is_some()
+        && let Some(e) = super::acl::refused_in_script(ctx, session, caller, command, args)
+    {
+        return Err(e.into());
     }
     let write = command.flags.contains(&"write");
     // Commands Redis flags `may_replicate` (a flag `COMMAND` doesn't show).
     let may_replicate = matches!(command.name, "publish" | "spublish" | "pfcount");
     if read_only && (write || may_replicate) {
-        return Err("Write commands are not allowed from read-only scripts.");
+        return Err("Write commands are not allowed from read-only scripts.".into());
     }
     // The log can't be written: the write fails as a command's error would.
     if write && let Some(aof) = ctx.aof().filter(|aof| aof.failing()) {

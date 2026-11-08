@@ -54,6 +54,12 @@ pub(crate) fn secret_args(args: &Args<'_>) -> Vec<bool> {
                 break;
             }
         }
+    } else if name.eq_ignore_ascii_case(b"ACL")
+        && args.len() >= 3
+        && args.get(1).eq_ignore_ascii_case(b"SETUSER")
+    {
+        // The user's name too, as Redis has it.
+        secret[2..].fill(true);
     } else if name.eq_ignore_ascii_case(b"CONFIG")
         && args.len() > 3
         && args.get(1).eq_ignore_ascii_case(b"SET")

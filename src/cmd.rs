@@ -1,5 +1,6 @@
 //! Command dispatch. Replies match Redis 7 byte for byte where practical.
 
+mod acl;
 mod admin;
 mod bit;
 mod eval;
@@ -81,6 +82,15 @@ impl<'a> Args<'a> {
 
     pub fn get(&self, i: usize) -> &'a [u8] {
         &self.buf[self.ranges[i].clone()]
+    }
+
+    /// The arguments from `i` on, as a command of their own (`ACL DRYRUN`'s).
+    pub(crate) fn after(&self, i: usize) -> Args<'a> {
+        Args {
+            buf: self.buf,
+            ranges: &self.ranges[i..],
+            key_hash: None,
+        }
     }
 }
 
@@ -190,6 +200,7 @@ static COMMANDS: &[Command] = &[
     Command { name: "info", arity: -1, flags: &["loading", "stale"], fast: false, keys: NO_KEYS, run: info },
     Command { name: "auth", arity: -2, flags: &["noscript", "loading", "stale", "fast", "no_auth"], fast: true, keys: NO_KEYS, run: auth },
     Command { name: "hello", arity: -1, flags: &["noscript", "loading", "stale", "fast", "no_auth"], fast: true, keys: NO_KEYS, run: hello },
+    Command { name: "acl", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: acl::acl },
     Command { name: "client", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: client },
     Command { name: "command", arity: -1, flags: &["loading", "stale"], fast: false, keys: NO_KEYS, run: command },
     Command { name: "config", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::config },
@@ -426,6 +437,19 @@ pub fn execute(
         resp::write_error(out, b"NOAUTH Authentication required.");
         refuse_in_multi(session);
         return Reply::Written;
+    }
+    // A user that may not run everything: its rules, checked after what a
+    // transaction refuses outright, as in Redis.
+    if !session.unrestricted
+        && session
+            .user
+            .as_ref()
+            .is_some_and(|u| !u.may_run_everything())
+        && !(session.multi.is_some() && multi::refused_in_multi(command.name))
+        && let Some(reply) = acl::refused(ctx, session, command, args, out)
+    {
+        refuse_in_multi(session);
+        return reply;
     }
     if let Some(aof) = ctx.aof()
         && aof.failing()
@@ -853,6 +877,12 @@ fn set_command() -> &'static Command {
     SET.get_or_init(|| find_command(b"SET").expect("SET is in the table"))
 }
 
+/// Every command's name (for tests that hold them against tables).
+#[cfg(test)]
+pub(crate) fn command_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS.iter().map(|command| command.name)
+}
+
 /// The name of the write command called `name`, if it is one.
 pub(crate) fn find_write_command(name: &[u8]) -> Option<&'static str> {
     find_command(name)
@@ -860,6 +890,7 @@ pub(crate) fn find_write_command(name: &[u8]) -> Option<&'static str> {
         .map(|command| command.name)
 }
 
+pub(crate) use acl::{may_run, refused_when_served};
 pub(crate) use eval::call_from_script;
 
 /// Whether `name` is a command here, in any case.
@@ -1812,7 +1843,7 @@ fn auth(
         return Reply::Written;
     }
     let (user, password) = if args.len() == 2 {
-        if !ctx.has_password() {
+        if ctx.acl.default_user().nopass() {
             resp::write_error(
                 out,
                 b"ERR AUTH <password> called without any password configured for the default \
@@ -1824,8 +1855,7 @@ fn auth(
     } else {
         (args.get(1), args.get(2))
     };
-    if ctx.check_password(user, password) {
-        session.set_authenticated(true);
+    if acl::authenticate(ctx, session, args, user, password) {
         out.extend_from_slice(resp::OK);
     } else {
         resp::write_error(out, WRONGPASS);
@@ -1869,6 +1899,10 @@ fn hello(
             credentials = Some((args.get(i + 1), args.get(i + 2)));
             i += 3;
         } else if opt.eq_ignore_ascii_case(b"SETNAME") && more >= 1 {
+            // Checked as it's read, before any AUTH, as in Redis.
+            if !valid_client_attr(args.get(i + 1), "Client names", out) {
+                return Reply::Written;
+            }
             name = Some(args.get(i + 1));
             i += 2;
         } else {
@@ -1879,12 +1913,11 @@ fn hello(
             return Reply::Written;
         }
     }
-    if let Some((user, password)) = credentials {
-        if !ctx.check_password(user, password) {
-            resp::write_error(out, WRONGPASS);
-            return Reply::Written;
-        }
-        session.set_authenticated(true);
+    if let Some((user, password)) = credentials
+        && !acl::authenticate(ctx, session, args, user, password)
+    {
+        resp::write_error(out, WRONGPASS);
+        return Reply::Written;
     }
     if !session.authenticated {
         resp::write_error(
@@ -2160,6 +2193,7 @@ fn client_kill(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
         pubsub: None,
         none: false,
         skip_me: true,
+        user: None,
     };
     let n = args.len();
     if n < 3 {
@@ -2210,13 +2244,14 @@ fn client_kill(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
             } else if is(b"LADDR") {
                 filter.laddr = Some(value);
             } else if is(b"USER") {
-                if value != b"default" {
+                if ctx.acl.get(value).is_none() {
                     let mut msg = b"ERR No such user '".to_vec();
                     msg.extend_from_slice(value);
                     msg.push(b'\'');
                     resp::write_error(out, &msg);
                     return Reply::Written;
                 }
+                filter.user = Some(value);
             } else if is(b"SKIPME") {
                 if value.eq_ignore_ascii_case(b"YES") {
                     filter.skip_me = true;
@@ -2732,12 +2767,15 @@ fn info(
         s.push_str("\r\n");
     }
     if wants("stats", true) {
+        let denied = ctx.acl.denied();
         let _ = write!(
             s,
             "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
              rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
              keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
-             pubsubshard_channels:{}\r\nnative_scripts:{}\r\nnative_script_fallbacks:{}\r\n\r\n",
+             pubsubshard_channels:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
+             acl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\nnative_scripts:{}\r\n\
+             native_script_fallbacks:{}\r\n\r\n",
             server.total_connections,
             server.total_commands,
             server.rejected_connections,
@@ -2748,6 +2786,10 @@ fn info(
             ctx.pubsub.channel_count(false),
             ctx.pubsub.pattern_count(),
             ctx.pubsub.channel_count(true),
+            denied[0],
+            denied[1],
+            denied[2],
+            denied[3],
             ctx.scripting_stats().0,
             ctx.scripting_stats().1,
         );
