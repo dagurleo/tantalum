@@ -84,6 +84,8 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `COPY source destination [DB db] [REPLACE]`, `TOUCH key [key ...]`, `RANDOMKEY` | `COPY` is atomic, TTL included. `RANDOMKEY` is about uniform |
 | `SELECT index`, `MOVE key db`, `SWAPDB index1 index2` | Numbered databases, 16 unless `--databases` says otherwise. `MOVE` copies a big collection rather than handing it over, so it takes time in proportion to its size, holding that key's shard |
 | `OBJECT ENCODING\|FREQ\|IDLETIME\|REFCOUNT key`, `OBJECT HELP` | `ENCODING` is what Redis would use for what's held now, built from nothing (see "Not there yet"). `IDLETIME` is always 0: no last-access time is kept per key. `FREQ` is Redis' error without an LFU policy, as there's none |
+| `DUMP key`, `RESTORE key ttl payload [REPLACE] [ABSTTL] [IDLETIME seconds] [FREQ n]` | Redis' RDB format, so values move between Redis and Tantalum either way. `RESTORE` reads what Redis 2.4 to 7.2 write (zipmaps, ziplists, quicklists, intsets, listpacks, the three stream formats; not modules' types); `DUMP` writes what Redis 7.2 would, byte for byte for strings, small collections, sorted sets, lists made by appending and streams with nothing deleted (see "Not there yet"). `IDLETIME` and `FREQ` are checked, and kept nowhere |
+| `MIGRATE host port key\|"" db timeout [COPY] [REPLACE] [AUTH password\|AUTH2 user password] [KEYS key ...]` | `RESTORE`s the keys there and deletes them here, as Redis: over a connection kept for 10 seconds (`INFO`'s `migrate_cached_sockets`), sending `SELECT` only for another database, trying once more when a kept one was closed. It waits for the other server on its connection's thread, as Redis does on its only one, and is logged as the `DEL` of what it moved |
 | `SORT key [BY pattern] [LIMIT offset count] [GET pattern ...] [ASC\|DESC] [ALPHA] [STORE destination]`, `SORT_RO` | Atomic. Lists, sets and sorted sets, `*->field` for hashes |
 | `HSET key field value [field value ...]`, `HSETNX`, `HMSET` | Hashes keep their fields in the order they were added (as Redis does for small hashes) and keep the key's TTL |
 | `HGET key field`, `HMGET key field [field ...]`, `HGETALL`, `HKEYS`, `HVALS` | `HGETALL` is a map in RESP3 |
@@ -139,7 +141,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `MEMORY USAGE key [SAMPLES n]\|STATS\|DOCTOR\|PURGE\|MALLOC-STATS\|HELP` | `STATS` has Redis' fields; the allocator's are what's in use and the process's RSS |
 | `WAIT numreplicas timeout`, `WAITAOF numlocal numreplicas timeout` | There are no replicas: `WAIT` for any waits its time out and says 0, as Redis does. `WAITAOF 1` syncs the log at once with `--aof`, and is refused without |
 | `ROLE`, `REPLICAOF NO ONE`, `SLAVEOF NO ONE` | Always a master. Following another server is refused |
-| `DEBUG POPULATE\|SLEEP\|ERROR\|OBJECT` | With `--enable-debug-command yes` or `local`, as in Redis |
+| `DEBUG POPULATE\|SLEEP\|ERROR\|OBJECT\|SET-ACTIVE-EXPIRE` | With `--enable-debug-command yes` or `local`, as in Redis |
 | `LOLWUT`, `MODULE LIST` | No modules |
 | `CLIENT PAUSE timeout [WRITE\|ALL]`, `CLIENT UNPAUSE` | Holds back what Redis holds back, for as long, and those it holds run after in order. Nothing expires by itself meanwhile |
 | `CLIENT UNBLOCK id [TIMEOUT\|ERROR]`, `CLIENT REPLY ON\|OFF\|SKIP`, `CLIENT NO-EVICT`, `CLIENT NO-TOUCH`, `CLIENT GETREDIR`, `CLIENT TRACKINGINFO` | `NO-EVICT` and `NO-TOUCH` are shown in the client list and do nothing else: clients aren't evicted, and keys hold no access times to protect |
@@ -193,16 +195,16 @@ pass on Redis 7.2.4 and fail on Tantalum, by library (`bench/frameworks/results-
 
 | Suite | Pass on Redis | Lost on Tantalum |
 |---|---|---|
-| redis-py 7.4.0 | 2,357 | 16 |
-| Predis 3.6.1 | 4,525 | 8 |
-| node-redis 6.3.1 | 1,486 | 28 |
-| redis-rb 6.0.0 | 893 | 4 |
+| redis-py 7.4.0 | 2,357 | 3 |
+| Predis 3.6.1 | 4,525 | 5 |
+| node-redis 6.3.1 | 1,486 | 27 |
+| redis-rb 6.0.0 | 893 | 2 |
 | ioredis 5.11.0 | 566 | 0 |
 | phpredis 6.3.0 | 203 | 4 |
 
-That's 60 of 10,530 (180 before users and ACLs came in 0.27.0, 99 before functions in 0.28.0),
-and 42 of them need something that isn't here: `CLIENT TRACKING`, or `DUMP` and `RESTORE`. The
-other 18 are listed under "Not there yet". `tools/admin-diff.py` compares the admin commands with
+That's 41 of 10,530 (180 before users and ACLs came in 0.27.0, 99 before functions in 0.28.0,
+60 before `DUMP`, `RESTORE` and `MIGRATE` in 0.29.0), and 22 of them need something that isn't
+here: `CLIENT TRACKING`. The other 19 are listed under "Not there yet". `tools/admin-diff.py` compares the admin commands with
 Redis 7.2.4 directly: 3,373 commands and checks, every command's `COMMAND` entries and every
 setting among them, no differences.
 
@@ -532,6 +534,19 @@ setting among them, no differences.
   runs past `busy-reply-threshold` (5 s) makes other connections' commands `-BUSY`,
   but for `FUNCTION KILL`, `SCRIPT KILL` and the few Redis lets through: the flag
   rides in the word connections read once a batch, so it costs nothing until then.
+- **`DUMP`, `RESTORE` and `MIGRATE`** (`src/rdb.rs`, `src/cmd/dump.rs`) speak Redis'
+  RDB format: listpacks, ziplists, intsets, quicklists, zipmaps and stream nodes, read
+  with every bound checked (a test feeds it 500,000 damaged payloads), as Redis does only
+  with `sanitize-dump-payload yes`. `DUMP` writes a value in the encoding `OBJECT ENCODING`
+  names, as Redis 7.2's `rdbSaveObject` does: a list's nodes split where Redis splits one
+  made by appending, a stream's chunks as its listpack nodes (they're where Redis'
+  nodes would be). `RESTORE` builds the value as a write would, so a stream's entries
+  fall into chunks by this server's limits. `tools/dump-diff.py` runs 468 lines against
+  Redis 7.2.4 with no differences: each type in each encoding, every error in Redis'
+  order, payloads Redis 6.2 writes, and every value `MIGRATE`d from each server to the
+  other and read back there. Redis' own `unit/dump` passes the 10 tests that need
+  neither access times kept per key (`IDLETIME`, `FREQ`), replication, nor servers its
+  harness starts itself.
 - **Native BullMQ scripts** (`src/bullmq.rs`): BullMQ's three hottest
   scripts, `addStandardJob` (a job is added), `moveToActive` (a worker takes
   one) and `moveToFinished` (it completes or fails one, and takes the next),
@@ -702,7 +717,7 @@ setting among them, no differences.
   in Redis; scripts check each `redis.call`, and BullMQ's native scripts run only for users
   that may run everything. `tools/acl-diff.py` runs 296 scenario steps over several
   connections against Redis 7.2.4, with no differences, and Redis' own `unit/acl` and
-  `unit/acl-v2` pass (but for a check of `INFO commandstats` and one of `MIGRATE`'s keys).
+  `unit/acl-v2` pass (but for a check of `INFO commandstats`).
 - **TLS** (`--tls-port`, with `--tls-cert-file` and `--tls-key-file` as in
   Redis): a second listener next to the plain port (`--port 0` leaves only
   TLS), using rustls with its `ring` backend. Plain and TLS connections share
@@ -1300,13 +1315,14 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
-- **Missing, by how many client library tests need it** (see above; 60 of 10,530):
+- **Missing, by how many client library tests need it** (see above; 41 of 10,530):
   client-side caching with `CLIENT
-  TRACKING` (22), `DUMP`, `RESTORE` and `MIGRATE` (20), turning the log on with `CONFIG SET appendonly`
-  (5), `LATENCY HISTOGRAM` (5), `INFO commandstats` (3), `OBJECT IDLETIME` (1), and Unix sockets,
+  TRACKING` (22), turning the log on with `CONFIG SET appendonly`
+  (5), `LATENCY HISTOGRAM` (5), `INFO commandstats` (3), `OBJECT IDLETIME` (2, one after `RESTORE`'s
+  `IDLETIME`), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
-  the 228 commands that are here (1, which expects over 300).
+  the 231 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1370,9 +1386,14 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- Replication, `DUMP`/`RESTORE`.
-- **ACL gaps**: `ACL DRYRUN` of a command Redis has and Tantalum doesn't (`FCALL`, `MIGRATE`)
-  checks only the command rules, not knowing its keys. There's no config file, so no `user`
+- Replication.
+- **`DUMP` in Redis' order but for hash tables**: a big hash or set (past 128 members)
+  comes out in Tantalum's order, a list made otherwise than by appending (`LPUSH`,
+  `LINSERT`, ...) with its nodes split where an appended one's would be, and a stream
+  without the entries deleted from it, which Redis keeps in their node, marked. Each
+  `RESTORE`s to the same value in either server; only the bytes differ.
+- **ACL gaps**: `ACL DRYRUN` of a command Redis has and Tantalum doesn't checks only the
+  command rules, not knowing its keys. There's no config file, so no `user`
   lines in one (use `--aclfile`), and no module authentication. A rule change reaches another
   connection at its next batch: what it has already read runs under the old rules.
 - **Settings with a syntax of their own aren't checked**: `client-output-buffer-limit`,

@@ -143,6 +143,11 @@ pub struct Context {
     pub config: ConfigTable,
     pub(crate) slowlog: SlowLog,
     pub(crate) latency: Latency,
+    /// The connections `MIGRATE` keeps.
+    pub(crate) migrate_sockets: crate::cmd::MigrateSockets,
+    /// Whether keys expire in the background, not only when read: `DEBUG
+    /// SET-ACTIVE-EXPIRE` turns it off for tests.
+    active_expire: AtomicBool,
     /// `stream-node-max-entries` and `-bytes`, as streams read them.
     stream_node_entries: AtomicUsize,
     /// `hll-sparse-max-bytes`.
@@ -197,6 +202,8 @@ impl Context {
             run_id: new_run_id(),
             config: ConfigTable::default(),
             slowlog: SlowLog::default(),
+            migrate_sockets: Default::default(),
+            active_expire: AtomicBool::new(true),
             latency: Latency::default(),
             stream_node_entries: AtomicUsize::new(NodeLimits::default().entries),
             hll_sparse_max_bytes: AtomicUsize::new(3000),
@@ -458,6 +465,15 @@ impl Context {
     pub(crate) fn unpause_clients(&self) {
         *self.pause.lock() = None;
         self.update_special();
+    }
+
+    /// Whether keys expire in the background (see `active_expire`).
+    pub(crate) fn active_expire(&self) -> bool {
+        self.active_expire.load(Relaxed)
+    }
+
+    pub(crate) fn set_active_expire(&self, on: bool) {
+        self.active_expire.store(on, Relaxed);
     }
 
     /// Whether clients are paused: `Some(true)` for every command, `Some(false)` for

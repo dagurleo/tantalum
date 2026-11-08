@@ -3,6 +3,8 @@
 mod acl;
 mod admin;
 mod bit;
+mod dump;
+pub(crate) use dump::MigrateSockets;
 mod eval;
 mod function;
 mod geo;
@@ -261,6 +263,9 @@ static COMMANDS: &[Command] = &[
     Command { name: "move", arity: 3, flags: &["write", "fast"], fast: true, keys: (1, 1, 1), run: keys::move_key },
     Command { name: "swapdb", arity: 3, flags: &["write", "fast"], fast: true, keys: NO_KEYS, run: keys::swapdb },
     Command { name: "object", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: keys::object },
+    Command { name: "dump", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: dump::dump },
+    Command { name: "restore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: dump::restore },
+    Command { name: "migrate", arity: -6, flags: &["write", "movablekeys"], fast: false, keys: (3, 3, 1), run: dump::migrate },
     Command { name: "hget", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hget },
     Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hset },
     Command { name: "hgetall", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: hash::hgetall },
@@ -810,7 +815,7 @@ pub fn spawn_expirer(
                 let Some(ctx) = ctx.upgrade() else { break };
                 let now = ctx.store.now();
                 // As in Redis, what's paused doesn't change by itself meanwhile.
-                if ctx.pause_mode().is_none() {
+                if ctx.pause_mode().is_none() && ctx.active_expire() {
                     for db in ctx.store.live() {
                         db.expire_cycle(now);
                     }
@@ -2813,7 +2818,8 @@ fn info(
             "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
              rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
              keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
-             pubsubshard_channels:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
+             pubsubshard_channels:{}\r\nmigrate_cached_sockets:{}\r\n\
+             acl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
              acl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\nnative_scripts:{}\r\n\
              native_script_fallbacks:{}\r\n\r\n",
             server.total_connections,
@@ -2826,6 +2832,7 @@ fn info(
             ctx.pubsub.channel_count(false),
             ctx.pubsub.pattern_count(),
             ctx.pubsub.channel_count(true),
+            ctx.migrate_sockets.count(),
             denied[0],
             denied[1],
             denied[2],

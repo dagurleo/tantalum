@@ -369,7 +369,7 @@ fn listpack_entry_size(element: &[u8]) -> usize {
 /// The encoding Redis would use for what the value holds now, built up from
 /// nothing. Redis' also depends on the value's past: a string made by `APPEND`
 /// is `raw`, and a collection that has shrunk back may stay big.
-fn encoding(value: &ValueRef<'_>) -> &'static str {
+pub(super) fn encoding(value: &ValueRef<'_>) -> &'static str {
     const PACKED_ENTRIES: usize = 128;
     const PACKED_VALUE: usize = 64;
     const INTSET_ENTRIES: usize = 512;

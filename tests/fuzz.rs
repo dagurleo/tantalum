@@ -8,6 +8,13 @@ use tantalum::cmd::{self, Args, Reply};
 use tantalum::context::{Context, Settings};
 use tantalum::store::{Config, EvictionPolicy, Store};
 
+/// A bulk string reply's contents (`None` for a null).
+fn bulk_body(reply: &[u8]) -> Option<Vec<u8>> {
+    let end = reply.iter().position(|&b| b == b'\r')?;
+    let len: usize = std::str::from_utf8(&reply[1..end]).ok()?.parse().ok()?;
+    reply.get(end + 2..end + 2 + len).map(<[u8]>::to_vec)
+}
+
 /// Deterministic xorshift, so a failure reproduces.
 struct Rng(u64);
 
@@ -582,6 +589,8 @@ fn random_commands_never_panic() {
         let mut now = 1;
         let mut out = Vec::new();
         let mut blocked = Vec::new();
+        // What the last DUMP gave, for a RESTORE.
+        let mut payload: Option<Vec<u8>> = None;
         for step in 0..100_000 {
             // Transactions end soon, so most commands run.
             let args = if session.in_transaction() && rng.below(4) == 0 {
@@ -592,6 +601,17 @@ fn random_commands_never_panic() {
                 }]
             } else if rng.below(6) == 0 {
                 blocking_or_serving(&mut rng)
+            } else if let Some(dumped) = payload.take().filter(|_| rng.below(2) == 0) {
+                let ttl = [&b"0"[..], b"100", b"5"][rng.below(3)].to_vec();
+                vec![
+                    b"RESTORE".to_vec(),
+                    random_arg(&mut rng),
+                    ttl,
+                    dumped,
+                    b"REPLACE".to_vec(),
+                ]
+            } else if rng.below(20) == 0 {
+                vec![b"DUMP".to_vec(), random_arg(&mut rng)]
             } else {
                 let mut args = vec![rng.pick(COMMANDS).to_vec()];
                 for _ in 0..rng.below(7) {
@@ -644,6 +664,17 @@ fn random_commands_never_panic() {
                     assert!(several || out.is_empty(), "step {step}");
                     blocked.push(b);
                 }
+            }
+            if args[0] == b"DUMP"
+                && out.starts_with(b"$")
+                && let Some(dumped) = bulk_body(&out)
+            {
+                payload = Some(dumped);
+            }
+            // RESTORE takes what DUMP gives (if it may run here at all).
+            if args[0] == b"RESTORE" {
+                let refused = out.starts_with(b"-ERR Bad data") || out.starts_with(b"-ERR DUMP");
+                assert!(!refused, "step {step}: {args:?}");
             }
             // Now and then one is done waiting: its one reply (served, or
             // timed out), or its client leaves.

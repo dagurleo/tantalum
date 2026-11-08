@@ -942,6 +942,21 @@ pub(super) fn debug(
             ),
             None => resp::write_error(out, b"ERR no such key"),
         }
+    } else if is(b"SET-ACTIVE-EXPIRE") && args.len() == 3 {
+        // `atoi`, as Redis reads it: anything but a number is 0.
+        let on = std::str::from_utf8(args.get(2))
+            .ok()
+            .and_then(|s| {
+                let s = s.trim_start();
+                let end = s
+                    .char_indices()
+                    .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))
+                    .map_or(s.len(), |(i, _)| i);
+                s[..end].parse::<i64>().ok()
+            })
+            .is_some_and(|n| n != 0);
+        ctx.set_active_expire(on);
+        out.extend_from_slice(resp::OK);
     } else if is(b"HELP") && args.len() == 2 {
         help(
             out,
@@ -951,6 +966,10 @@ pub(super) fn debug(
                 "    Show low level info about `key` and associated value.",
                 "POPULATE <count> [<prefix>] [<size>]",
                 "    Create <count> string keys named key:<num>.",
+                "SET-ACTIVE-EXPIRE <0|1>",
+                "    Setting it to 0 disables expiring keys in background when they are not",
+                "    accessed (otherwise the Redis behavior). Setting it to 1 reenables back the",
+                "    default.",
                 "SLEEP <seconds>",
                 "    Stop the server for <seconds>.",
                 "ERROR <string>",
