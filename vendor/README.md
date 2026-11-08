@@ -1,6 +1,6 @@
 # Vendored C code
 
-Built by `build.rs` into the server, for Lua scripting (`EVAL`). All of it
+Built by `build.rs` into the server, for Lua scripting (`EVAL`) and RDB payloads. All of it
 comes unchanged from Redis 7.2.4 (BSD-3-Clause, the last release before
 Redis changed its license), so scripts run on exactly the Lua Redis runs:
 
@@ -15,3 +15,6 @@ Redis changed its license), so scripts run on exactly the Lua Redis runs:
   which formats numbers passed to `redis.call` as Redis does.
 - `lua/redis_random.c`: Redis' `src/rand.c` and its `math.random` for
   scripts (BSD-3-Clause, notice inside).
+- `lzf`: Redis' `src/lzf*.{c,h}`, LibLZF 3.6 by Marc Alexander Lehmann (BSD-2-Clause,
+  notice in each file), for the compressed strings of RDB payloads (`FUNCTION DUMP`).
+  Built with `INIT_HTAB=1`, so the same input always compresses the same way.

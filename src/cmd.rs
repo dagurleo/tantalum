@@ -4,6 +4,7 @@ mod acl;
 mod admin;
 mod bit;
 mod eval;
+mod function;
 mod geo;
 mod group;
 mod hash;
@@ -222,6 +223,9 @@ static COMMANDS: &[Command] = &[
     Command { name: "eval_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: eval::eval_ro },
     Command { name: "evalsha_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: eval::evalsha_ro },
     Command { name: "script", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: eval::script },
+    Command { name: "fcall", arity: -3, flags: &["noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: function::fcall },
+    Command { name: "fcall_ro", arity: -3, flags: &["readonly", "noscript", "stale", "skip_monitor", "no_mandatory_keys", "movablekeys"], fast: false, keys: NO_KEYS, run: function::fcall_ro },
+    Command { name: "function", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: function::function },
     Command { name: "reset", arity: 1, flags: &["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"], fast: true, keys: NO_KEYS, run: pubsub::reset },
     Command { name: "subscribe", arity: -2, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: pubsub::subscribe },
     Command { name: "unsubscribe", arity: -1, flags: &["pubsub", "noscript", "loading", "stale"], fast: false, keys: NO_KEYS, run: pubsub::unsubscribe },
@@ -472,6 +476,15 @@ pub fn execute(
             refuse_in_multi(session);
             return Reply::Written;
         }
+        // A script running too long: only a few commands, as in Redis.
+        if session.special
+            && let Some(busy) = ctx.scripting.busy_error(ctx)
+            && !allowed_when_busy(command, args)
+        {
+            resp::write_error(out, busy);
+            refuse_in_multi(session);
+            return Reply::Written;
+        }
         // In a transaction, commands wait for EXEC.
         if let Some(queue) = &mut session.multi
             && !multi::runs_in_multi(command.name)
@@ -492,6 +505,18 @@ pub fn execute(
     dispatch(ctx, session, now, command, args, out)
 }
 
+/// What runs while a script has run too long (Redis' `allow_busy` flag).
+fn allowed_when_busy(command: &Command, args: &Args<'_>) -> bool {
+    let sub = |name: &[u8]| args.len() > 1 && args.get(1).eq_ignore_ascii_case(name);
+    match command.name {
+        "auth" | "hello" | "quit" | "reset" | "shutdown" | "discard" | "multi" | "unwatch"
+        | "watch" => true,
+        "function" => sub(b"KILL") || sub(b"STATS"),
+        "script" => sub(b"KILL"),
+        _ => false,
+    }
+}
+
 /// A command's run, past every check.
 #[inline]
 fn dispatch(
@@ -503,7 +528,12 @@ fn dispatch(
     out: &mut Vec<u8>,
 ) -> Reply {
     if let Some(aof) = ctx.aof()
-        && (command.writes() || matches!(command.name, "eval" | "evalsha" | "exec"))
+        && (command.writes()
+            || matches!(
+                command.name,
+                "eval" | "evalsha" | "exec" | "fcall" | "fcall_ro"
+            )
+            || (command.name == "function" && function::writes(args)))
     {
         return logged(ctx, session, aof, command, args, out);
     }
@@ -588,15 +618,22 @@ fn held_back(ctx: &Context, session: &Session, command: &Command) -> bool {
         Some(false) => {
             command.writes()
                 || match command.name {
-                    "publish" | "spublish" | "pfcount" | "eval" | "evalsha" | "script" | "wait"
-                    | "waitaof" => true,
+                    "publish" | "spublish" | "pfcount" | "eval" | "evalsha" | "fcall"
+                    | "script" | "wait" | "waitaof" => true,
                     "exec" => session.multi.as_ref().is_some_and(|queue| {
                         (0..queue.len()).any(|i| {
                             let name = queue.command(i);
                             find_write_command(name.get(0)).is_some()
                                 || matches!(
                                     find_command(name.get(0)).map(|c| c.name),
-                                    Some("publish" | "spublish" | "pfcount" | "eval" | "evalsha")
+                                    Some(
+                                        "publish"
+                                            | "spublish"
+                                            | "pfcount"
+                                            | "eval"
+                                            | "evalsha"
+                                            | "fcall"
+                                    )
                                 )
                         })
                     }),
@@ -627,7 +664,10 @@ fn watched(
 /// Monitors hear of a script before what it runs (even one that isn't found), and of the
 /// rest once they've run. Says whether this is a script.
 fn heard_first(ctx: &Context, session: &mut Session, command: &Command, args: &Args<'_>) -> bool {
-    let script = matches!(command.name, "eval" | "evalsha" | "eval_ro" | "evalsha_ro");
+    let script = matches!(
+        command.name,
+        "eval" | "evalsha" | "eval_ro" | "evalsha_ro" | "fcall" | "fcall_ro"
+    );
     if script && ctx.monitoring() {
         let peer = ctx.peer_of(session);
         ctx.feed_monitors(session.db, &peer, args);

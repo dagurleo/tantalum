@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use mlua_sys::{self as lua, lua_State};
 use parking_lot::Mutex;
 
+pub(crate) mod functions;
+
 use crate::bullmq;
 use crate::cmd::{self, Args};
 use crate::context::{Context, Session};
@@ -127,6 +129,10 @@ function __redis__err__handler(err)\n\
 \x20 return err\n\
 end\n";
 
+/// Redis' reply to `FUNCTION KILL` and `FUNCTION STATS` while a script runs.
+const BUSY_EVAL: &[u8] =
+    b"BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.";
+
 /// Lua instructions between checks for `SCRIPT KILL`, as in Redis.
 const HOOK_INSTRUCTIONS: c_int = 100_000;
 /// When a script running this long is logged as slow (Redis'
@@ -162,6 +168,29 @@ pub(crate) struct Scripting {
     /// Which native scripts are loaded (by `bullmq::find`'s number), so
     /// `EVALSHA` can run them without the interpreter's lock.
     natives_loaded: AtomicU8,
+    /// Function libraries (`FUNCTION`, `FCALL`).
+    pub(crate) functions: Mutex<functions::Functions>,
+    /// The function running, for `FUNCTION STATS` (`None` for a script, or
+    /// nothing).
+    running_function: Mutex<Option<RunningFunction>>,
+    /// Libraries and functions, for `FUNCTION STATS` while one runs.
+    function_counts: Mutex<(usize, usize)>,
+    /// `busy-reply-threshold` in milliseconds once set (0: never): past it a
+    /// running script makes other connections' commands `-BUSY`. Unset, Redis' 5000.
+    busy_set: AtomicBool,
+    busy_millis: AtomicU64,
+    /// The running script made the server busy.
+    made_busy: AtomicBool,
+}
+
+/// Redis' default `busy-reply-threshold`, in milliseconds.
+const BUSY_MILLIS: u64 = 5000;
+
+/// A function running, as `FUNCTION STATS` shows it.
+pub(crate) struct RunningFunction {
+    pub(crate) name: Vec<u8>,
+    pub(crate) command: Vec<Vec<u8>>,
+    pub(crate) started: Instant,
 }
 
 impl Scripting {
@@ -279,6 +308,7 @@ impl Scripting {
         unsafe { engine.run(&name, keys, argv, caller.resp3, out) };
         RUN.set(std::ptr::null_mut());
         self.state.store(IDLE, Relaxed);
+        self.ended(ctx);
         ctx.publish(&mut run.session);
         if let Some(panic) = run.panic {
             resume_unwind(panic);
@@ -386,9 +416,13 @@ impl Scripting {
         drop(old);
     }
 
-    /// `SCRIPT KILL`: stops the running script, unless it wrote already.
-    pub(crate) fn kill(&self, out: &mut Vec<u8>) {
-        match self.state.load(Relaxed) {
+    /// `SCRIPT KILL` (or with `function`, `FUNCTION KILL`): stops the
+    /// running script or function, unless it wrote already, or it's the
+    /// other kind (Redis' `scriptKill`).
+    pub(crate) fn kill(&self, out: &mut Vec<u8>, function: bool) {
+        let state = self.state.load(Relaxed);
+        let running_function = self.running_function.lock().is_some();
+        match state {
             IDLE => resp::write_error(out, b"NOTBUSY No scripts in execution right now."),
             WROTE => resp::write_error(
                 out,
@@ -396,10 +430,173 @@ impl Scripting {
                   dataset. You can either wait the script termination or kill the server in a \
                   hard way using the SHUTDOWN NOSAVE command.",
             ),
+            _ if running_function && !function => resp::write_error(
+                out,
+                b"BUSY Redis is busy running a script. You can only call FUNCTION KILL or \
+                  SHUTDOWN NOSAVE.",
+            ),
+            _ if !running_function && function => resp::write_error(out, BUSY_EVAL),
             _ => {
                 self.kill.store(true, Relaxed);
                 out.extend_from_slice(resp::OK);
             }
+        }
+    }
+
+    /// `CONFIG SET busy-reply-threshold`.
+    pub(crate) fn set_busy_threshold(&self, millis: u64) {
+        self.busy_millis.store(millis, Relaxed);
+        self.busy_set.store(true, Relaxed);
+    }
+
+    fn busy_threshold(&self) -> Option<Duration> {
+        let millis = if self.busy_set.load(Relaxed) {
+            self.busy_millis.load(Relaxed)
+        } else {
+            BUSY_MILLIS
+        };
+        (millis > 0).then(|| Duration::from_millis(millis))
+    }
+
+    /// The `-BUSY` error other connections get while a script runs too long
+    /// (`None` while none does).
+    pub(crate) fn busy_error(&self, ctx: &Context) -> Option<&'static [u8]> {
+        if !ctx.script_busy() {
+            return None;
+        }
+        Some(if self.running_function.lock().is_some() {
+            b"BUSY Redis is busy running a script. You can only call FUNCTION KILL or SHUTDOWN \
+              NOSAVE."
+        } else {
+            BUSY_EVAL
+        })
+    }
+
+    /// A script or function ended: the server isn't busy any more.
+    fn ended(&self, ctx: &Context) {
+        if self.made_busy.swap(false, Relaxed) {
+            ctx.set_script_busy(false);
+        }
+    }
+
+    /// `FUNCTION STATS`: the function running, if one is, and how many
+    /// libraries and functions there are.
+    pub(crate) fn function_stats(&self, out: &mut Vec<u8>, resp3: bool) {
+        let running = self.running_function.lock();
+        if running.is_none() && self.state.load(Relaxed) != IDLE {
+            return resp::write_error(out, BUSY_EVAL);
+        }
+        resp::write_map_header(out, 2, resp3);
+        resp::write_bulk(out, b"running_script");
+        match &*running {
+            None => out.extend_from_slice(if resp3 { resp::NULL } else { resp::NULL_BULK }),
+            Some(function) => {
+                resp::write_map_header(out, 3, resp3);
+                resp::write_bulk(out, b"name");
+                resp::write_bulk(out, &function.name);
+                resp::write_bulk(out, b"command");
+                resp::write_array_header(out, function.command.len());
+                for arg in &function.command {
+                    resp::write_bulk(out, arg);
+                }
+                resp::write_bulk(out, b"duration_ms");
+                resp::write_integer(out, function.started.elapsed().as_millis() as i64);
+            }
+        }
+        drop(running);
+        let (libraries, functions) = *self.function_counts.lock();
+        resp::write_bulk(out, b"engines");
+        resp::write_map_header(out, 1, resp3);
+        resp::write_bulk(out, b"LUA");
+        resp::write_map_header(out, 2, resp3);
+        resp::write_bulk(out, b"libraries_count");
+        resp::write_integer(out, libraries as i64);
+        resp::write_bulk(out, b"functions_count");
+        resp::write_integer(out, functions as i64);
+    }
+
+    /// Notes how many libraries and functions there are, for `FUNCTION STATS`.
+    pub(crate) fn count_functions(&self, functions: &functions::Functions) {
+        *self.function_counts.lock() = functions.counts();
+    }
+
+    /// Runs a function for `FCALL` (`FCALL_RO` with `read_only`): `args[1]`
+    /// is its name, `numkeys` keys follow `args[2]`, then its arguments.
+    /// Must run as a transaction (`Store::exclusive`), as `eval` does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fcall(
+        &self,
+        ctx: &Context,
+        caller: &Session,
+        now: Millis,
+        args: &Args<'_>,
+        numkeys: usize,
+        read_only: bool,
+        out: &mut Vec<u8>,
+    ) {
+        let mut functions = self.functions.lock();
+        functions.follow(&ctx.store);
+        self.count_functions(&functions);
+        let Some(function) = functions.find(args.get(1)) else {
+            return resp::write_error(out, b"ERR Function not found");
+        };
+        let no_writes = function.flags & functions::NO_WRITES != 0;
+        if !no_writes {
+            if let Some(aof) = ctx.aof().filter(|aof| aof.failing()) {
+                return resp::write_error(out, aof.failure().as_bytes());
+            }
+            if read_only {
+                return resp::write_error(
+                    out,
+                    b"ERR Can not execute a script with write flag using *_ro command.",
+                );
+            }
+        }
+        let allow_oom = function.flags & functions::ALLOW_OOM != 0;
+        let name = function.name.to_vec();
+        let command = if read_only { "fcall_ro" } else { "fcall" };
+        let mut run = Run {
+            ctx,
+            session: Session {
+                db: caller.db,
+                special: caller.special,
+                user: caller.user.clone(),
+                ..Session::for_script()
+            },
+            caller: (caller.id, command),
+            now,
+            read_only: read_only || no_writes,
+            started: Instant::now(),
+            warned: false,
+            args: Vec::new(),
+            ranges: Vec::new(),
+            reply: Vec::new(),
+            panic: None,
+        };
+        *self.running_function.lock() = Some(RunningFunction {
+            name: name.clone(),
+            command: (0..args.len()).map(|i| args.get(i).to_vec()).collect(),
+            started: run.started,
+        });
+        self.kill.store(false, Relaxed);
+        self.state.store(RUNNING, Relaxed);
+        RUN.set(&raw mut run as *mut c_void);
+        let keys = (3..3 + numkeys).map(|i| args.get(i));
+        let argv = (3 + numkeys..args.len()).map(|i| args.get(i));
+        // SAFETY: under the lock, with `RUN` set for the callbacks.
+        let call = || unsafe { functions.call(&name, keys, argv, caller.resp3, out) };
+        if allow_oom {
+            crate::store::allowing_oom(call);
+        } else {
+            call();
+        }
+        RUN.set(std::ptr::null_mut());
+        self.state.store(IDLE, Relaxed);
+        self.ended(ctx);
+        *self.running_function.lock() = None;
+        ctx.publish(&mut run.session);
+        if let Some(panic) = run.panic {
+            resume_unwind(panic);
         }
     }
 }
@@ -469,57 +666,7 @@ impl Engine {
     fn new() -> Engine {
         // SAFETY: a fresh state, set up by Lua's API.
         unsafe {
-            // As `luaL_newstate`, but allocating as the server does.
-            let l = lua::lua_newstate(allocate, std::ptr::null_mut());
-            assert!(!l.is_null(), "out of memory for Lua");
-            lua::lua_atpanic(l, unprotected_error);
-            // luaRegisterRedisAPI: while libraries load, the globals take
-            // only what's on the allow lists.
-            lua::lua_pushvalue(l, lua::LUA_GLOBALSINDEX);
-            set_metatable_function(l, c"__newindex", new_global);
-            lua::lua_pop(l, 1);
-            load_lib(l, c"", lua::luaopen_base);
-            load_lib(l, c"table", lua::luaopen_table);
-            load_lib(l, c"string", lua::luaopen_string);
-            load_lib(l, c"math", lua::luaopen_math);
-            load_lib(l, c"debug", lua::luaopen_debug);
-            load_lib(l, c"cjson", luaopen_cjson);
-            load_lib(l, c"struct", luaopen_struct);
-            load_lib(l, c"cmsgpack", luaopen_cmsgpack);
-            load_lib(l, c"bit", luaopen_bit);
-            lua::lua_pushcfunction(l, protected_pcall);
-            lua::lua_setglobal(l, c"pcall".as_ptr());
-
-            lua::lua_newtable(l);
-            set_function(l, c"call", redis_call);
-            set_function(l, c"pcall", redis_pcall);
-            set_function(l, c"log", redis_log);
-            set_number(l, c"LOG_DEBUG", 0.0);
-            set_number(l, c"LOG_VERBOSE", 1.0);
-            set_number(l, c"LOG_NOTICE", 2.0);
-            set_number(l, c"LOG_WARNING", 3.0);
-            set_number(l, c"REDIS_VERSION_NUM", REDIS_VERSION_NUM);
-            lua::lua_pushstring(l, c"REDIS_VERSION".as_ptr());
-            lua::lua_pushstring(l, c"7.2.4".as_ptr());
-            lua::lua_settable(l, -3);
-            set_function(l, c"setresp", redis_setresp);
-            set_function(l, c"sha1hex", redis_sha1hex);
-            set_function(l, c"error_reply", redis_error_reply);
-            set_function(l, c"status_reply", redis_status_reply);
-            set_function(l, c"set_repl", redis_set_repl);
-            set_number(l, c"REPL_NONE", 0.0);
-            set_number(l, c"REPL_AOF", 1.0);
-            set_number(l, c"REPL_SLAVE", 2.0);
-            set_number(l, c"REPL_REPLICA", 2.0);
-            set_number(l, c"REPL_ALL", 3.0);
-            set_function(l, c"acl_check_cmd", redis_acl_check_cmd);
-            lua::lua_setglobal(l, c"redis".as_ptr());
-
-            lua::lua_getglobal(l, c"math".as_ptr());
-            set_function(l, c"random", tantalum_math_random);
-            set_function(l, c"randomseed", tantalum_math_randomseed);
-            lua::lua_setglobal(l, c"math".as_ptr());
-
+            let l = new_state();
             // scriptingInit: the debugger's functions (no debugger here).
             lua::lua_getglobal(l, c"redis".as_ptr());
             set_function(l, c"breakpoint", redis_breakpoint);
@@ -623,6 +770,70 @@ impl Engine {
             // The error handler.
             lua::lua_pop(l, 1);
         }
+    }
+}
+
+/// A Lua state with the libraries and `redis` API scripts and functions
+/// get, as Redis' `luaRegisterRedisAPI` sets one up.
+///
+/// # Safety
+///
+/// Lua's API; the caller owns the state.
+unsafe fn new_state() -> *mut lua_State {
+    // SAFETY: a fresh state, set up by Lua's API.
+    unsafe {
+        // As `luaL_newstate`, but allocating as the server does.
+        let l = lua::lua_newstate(allocate, std::ptr::null_mut());
+        assert!(!l.is_null(), "out of memory for Lua");
+        lua::lua_atpanic(l, unprotected_error);
+        // luaRegisterRedisAPI: while libraries load, the globals take
+        // only what's on the allow lists.
+        lua::lua_pushvalue(l, lua::LUA_GLOBALSINDEX);
+        set_metatable_function(l, c"__newindex", new_global);
+        lua::lua_pop(l, 1);
+        load_lib(l, c"", lua::luaopen_base);
+        load_lib(l, c"table", lua::luaopen_table);
+        load_lib(l, c"string", lua::luaopen_string);
+        load_lib(l, c"math", lua::luaopen_math);
+        load_lib(l, c"debug", lua::luaopen_debug);
+        load_lib(l, c"cjson", luaopen_cjson);
+        load_lib(l, c"struct", luaopen_struct);
+        load_lib(l, c"cmsgpack", luaopen_cmsgpack);
+        load_lib(l, c"bit", luaopen_bit);
+        lua::lua_pushcfunction(l, protected_pcall);
+        lua::lua_setglobal(l, c"pcall".as_ptr());
+
+        lua::lua_newtable(l);
+        set_function(l, c"call", redis_call);
+        set_function(l, c"pcall", redis_pcall);
+        set_function(l, c"log", redis_log);
+        set_number(l, c"LOG_DEBUG", 0.0);
+        set_number(l, c"LOG_VERBOSE", 1.0);
+        set_number(l, c"LOG_NOTICE", 2.0);
+        set_number(l, c"LOG_WARNING", 3.0);
+        set_number(l, c"REDIS_VERSION_NUM", REDIS_VERSION_NUM);
+        lua::lua_pushstring(l, c"REDIS_VERSION".as_ptr());
+        lua::lua_pushstring(l, c"7.2.4".as_ptr());
+        lua::lua_settable(l, -3);
+        set_function(l, c"setresp", redis_setresp);
+        set_function(l, c"sha1hex", redis_sha1hex);
+        set_function(l, c"error_reply", redis_error_reply);
+        set_function(l, c"status_reply", redis_status_reply);
+        set_function(l, c"set_repl", redis_set_repl);
+        set_number(l, c"REPL_NONE", 0.0);
+        set_number(l, c"REPL_AOF", 1.0);
+        set_number(l, c"REPL_SLAVE", 2.0);
+        set_number(l, c"REPL_REPLICA", 2.0);
+        set_number(l, c"REPL_ALL", 3.0);
+        set_function(l, c"acl_check_cmd", redis_acl_check_cmd);
+        lua::lua_setglobal(l, c"redis".as_ptr());
+
+        lua::lua_getglobal(l, c"math".as_ptr());
+        set_function(l, c"random", tantalum_math_random);
+        set_function(l, c"randomseed", tantalum_math_randomseed);
+        lua::lua_setglobal(l, c"math".as_ptr());
+
+        l
     }
 }
 
@@ -1007,7 +1218,17 @@ unsafe fn check_running() -> bool {
             run.started.elapsed().as_millis()
         );
     }
-    let killed = run.ctx.scripting.kill.load(Relaxed);
+    let scripting = &run.ctx.scripting;
+    if !scripting.made_busy.load(Relaxed)
+        && scripting
+            .busy_threshold()
+            .is_some_and(|threshold| run.started.elapsed() >= threshold)
+    {
+        // From now on other connections' commands are `-BUSY` (see `cmd::execute`).
+        scripting.made_busy.store(true, Relaxed);
+        run.ctx.set_script_busy(true);
+    }
+    let killed = scripting.kill.load(Relaxed);
     if killed {
         eprintln!("Lua script killed by user with SCRIPT KILL.");
     }
@@ -1526,7 +1747,7 @@ unsafe fn write_table(l: *mut lua_State, out: &mut Vec<u8>, resp3: bool, script_
 
 /// The reply to a script that raised an error, which is on top (Redis'
 /// `luaCallFunction`).
-unsafe fn write_failure(l: *mut lua_State, name: &[u8; 40], out: &mut Vec<u8>) {
+unsafe fn write_failure(l: *mut lua_State, name: &[u8], out: &mut Vec<u8>) {
     // SAFETY: Lua's API; the error is on top, and stays.
     unsafe {
         if lua::lua_istable(l, -1) == 0 {

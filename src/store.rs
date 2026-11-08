@@ -1405,6 +1405,24 @@ impl ShardInner {
     }
 }
 
+thread_local! {
+    /// Writes on this thread go past `maxmemory` (a function flagged `allow-oom`
+    /// is running): looked at only when a write doesn't fit.
+    static ALLOW_OOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with writes allowed past `maxmemory` on this thread.
+pub(crate) fn allowing_oom<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ALLOW_OOM.set(self.0);
+        }
+    }
+    let _reset = Reset(ALLOW_OOM.replace(true));
+    f()
+}
+
 pub struct Store {
     shards: Box<[Shard]>,
     shard_mask: usize,
@@ -1441,6 +1459,10 @@ pub struct Store {
     base: Option<Arc<Store>>,
     /// The other databases, to database 0, made when first used.
     others: Box<[OnceLock<Arc<Store>>]>,
+    /// Function libraries' code (`FUNCTION LOAD`), in database 0, kept with the
+    /// data for snapshots and the log, with a version that goes up as it
+    /// changes. `FLUSHALL` leaves it, as Redis does.
+    functions: Mutex<(u64, Vec<Arc<[u8]>>)>,
 }
 
 fn new_shards(n: usize) -> Box<[Shard]> {
@@ -1582,6 +1604,7 @@ impl Store {
             flush_bytes: AtomicUsize::new(flush_bytes),
             ready: Ready::default(),
             transactions: Mutex::new(()),
+            functions: Mutex::new((0, Vec::new())),
             index: 0,
             base: None,
             others: (1..databases).map(|_| OnceLock::new()).collect(),
@@ -1674,6 +1697,7 @@ impl Store {
                 flush_bytes: AtomicUsize::new(self.flush_bytes.load(Relaxed)),
                 ready: Ready::default(),
                 transactions: Mutex::new(()),
+                functions: Mutex::new((0, Vec::new())),
                 index: index as u32,
                 base: Some(self.clone()),
                 others: Box::default(),
@@ -2055,7 +2079,10 @@ impl Store {
     ) -> Result<SetOutcome, OutOfMemory> {
         let (hash, index) = self.locate(key.hash);
         let key = key.bytes;
-        if self.maxmemory() != 0 && KeyValue::size_for(key.len(), value.len()) > self.maxmemory() {
+        if self.maxmemory() != 0
+            && KeyValue::size_for(key.len(), value.len()) > self.maxmemory()
+            && !ALLOW_OOM.get()
+        {
             // Can never fit; don't flush the cache trying.
             return Err(OutOfMemory);
         }
@@ -3207,11 +3234,28 @@ impl Store {
         }
     }
 
-    /// How many changes commands have made so far (see `Mem::writes`).
+    /// How many changes commands have made so far (see `Mem::writes`), with
+    /// each change to the function libraries.
     pub fn changes(&self) -> u64 {
-        self.live()
+        let data: u64 = self
+            .live()
             .flat_map(|db| db.shards.iter().map(move |s| db.lock(s).mem.writes))
-            .sum()
+            .sum();
+        data + self.base().functions.lock().0
+    }
+
+    /// The function libraries' code, and its version.
+    pub(crate) fn function_codes(&self) -> (u64, Vec<Arc<[u8]>>) {
+        let functions = self.base().functions.lock();
+        (functions.0, functions.1.clone())
+    }
+
+    /// Replaces the function libraries' code; returns its new version.
+    pub(crate) fn set_function_codes(&self, codes: Vec<Arc<[u8]>>) -> u64 {
+        let mut functions = self.base().functions.lock();
+        functions.0 += 1;
+        functions.1 = codes;
+        functions.0
     }
 
     pub fn maxmemory(&self) -> usize {
@@ -3237,6 +3281,10 @@ impl Store {
     /// `MAX_USAGE + 1` sweeps something must be reclaimable; if not, there's
     /// nothing evictable at all (e.g. no TTL keys for volatile-lru).
     fn make_room(&self, home: usize, seed: u32, incoming: usize, now: Millis) -> bool {
+        // A function flagged `allow-oom` writes past the limit, as in Redis.
+        if ALLOW_OOM.get() {
+            return true;
+        }
         let made = self.evict_for(home, seed, incoming, now);
         // Evictions are logged in the database of the one they came from.
         crate::aof::select(self.index());

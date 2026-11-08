@@ -23,6 +23,8 @@ bytes), optionally after:
     ?client   CLIENT INFO or LIST, with only those fields too
     ?info     INFO, with only its acl_access_denied lines
     ?ints     every integer masked (client ids, which Redis' own clients move on)
+    ?functions FUNCTION LIST in any order: its libraries, and each one's functions
+              (Redis lists them in its hash tables' order, seeded anew at each start)
 
 and lines `!reset` (users, log and data back to the start, connections closed)
 and `!sleep MS`. A connection the server closed reads as <closed>. With --rust
@@ -408,6 +410,8 @@ def parse_args(line):
 
 
 class Server:
+    reset_extra = []
+
     def __init__(self, port):
         self.port = port
         self.conns = {}
@@ -450,6 +454,7 @@ class Server:
             [b"ACL", b"LOG", b"RESET"],
             [b"CONFIG", b"RESETSTAT"],
             [b"FLUSHALL"],
+            *self.reset_extra,
         ):
             self.call(0, cmd)
 
@@ -472,12 +477,52 @@ def mask_client(text):
     return " ".join(f"{k}={fields.get(k, '?')}" for k in KEPT_CLIENT_FIELDS)
 
 
+def tree(f):
+    """A reply as (header line, children), or (raw, None) for a leaf."""
+    line = f.readline()
+    kind, rest = line[:1], line[1:-2]
+    if kind in b"$=!":
+        n = int(rest)
+        return (line + (f.read(n + 2) if n >= 0 else b""), None)
+    if kind in b"*~>%|":
+        n = int(rest)
+        if kind in b"%|":
+            n *= 2
+        return (line, [tree(f) for _ in range(max(n, 0))])
+    return (line, None)
+
+
+def flat(node):
+    head, children = node
+    return head if children is None else head + b"".join(flat(c) for c in children)
+
+
+def unordered_functions(reply):
+    """FUNCTION LIST with its libraries and their functions sorted."""
+    def fix(node):
+        head, children = node
+        if children is None:
+            return node
+        children = [fix(c) for c in children]
+        for i in range(len(children) - 1):
+            if children[i][1] is None and children[i][0].endswith(b"\r\nfunctions\r\n") and children[i + 1][1] is not None:
+                fn_head, fns = children[i + 1]
+                children[i + 1] = (fn_head, sorted(fns, key=flat))
+        return (head, children)
+    head, libraries = fix(tree(__import__("io").BytesIO(reply)))
+    if libraries is None:
+        return reply
+    return flat((head, sorted(libraries, key=flat)))
+
+
 def masked(mode, reply):
     if reply == b"<closed>" or reply[:1] in b"-!":
         return reply
     if mode == "sorted":
         head, elements = items(reply)
         return head + b"".join(sorted(elements))
+    if mode == "functions":
+        return unordered_functions(reply)
     if mode == "ints":
         return re.sub(rb":\d+\r\n", b":<n>\r\n", reply)
     if mode == "len":
@@ -524,7 +569,11 @@ def rust_bytes(b):
     return f'b"{out}"'
 
 
-def main():
+def main(scenarios=None, reset_extra=()):
+    """Runs `scenarios` (these, by default); `reset_extra` are commands `!reset`
+    sends too (another tool's state to clear)."""
+    scenarios = SCENARIOS if scenarios is None else scenarios
+    Server.reset_extra = [parse_args(c) for c in reset_extra]
     p = argparse.ArgumentParser()
     p.add_argument("--redis", type=int, default=6390)
     p.add_argument("--tantalum", type=int, default=6391)
@@ -537,7 +586,7 @@ def main():
         print(f"# {name}: {found.group(0).decode() if found else '?'}", file=sys.stderr)
         server.reset()
     compared = differ = 0
-    for raw in SCENARIOS.strip().splitlines():
+    for raw in scenarios.strip().splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             if a.rust and line.startswith("#"):
@@ -585,4 +634,5 @@ def main():
         print(f"{compared} compared, {differ} differ")
 
 
-main()
+if __name__ == "__main__":
+    main()

@@ -154,6 +154,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `TIME` | |
 | `EVAL script numkeys [key ...] [arg ...]`, `EVALSHA sha1 ...`, `EVAL_RO`, `EVALSHA_RO` | Lua scripts on Redis 7.2.4's own Lua and libraries (`cjson`, `cmsgpack`, `struct`, `bit`), with its sandbox and `redis` API (`call`, `pcall`, `error_reply`, `status_reply`, `sha1hex`, `log`, `setresp`, ...). A script runs with the whole store to itself, as in Redis. Replies, conversions and errors (with `script: <sha1>, on @user_script:<line>.`) as Redis 7.2.4's; `#!lua flags=no-writes` and the `_RO` forms refuse writes |
 | `SCRIPT LOAD\|EXISTS\|FLUSH\|KILL\|HELP` | `KILL` stops a busy script that hasn't written, from a connection on another thread. `SCRIPT DEBUG NO` only: no Lua debugger |
+| `FUNCTION LOAD [REPLACE] code`, `FUNCTION LIST [LIBRARYNAME pattern] [WITHCODE]\|DELETE\|FLUSH\|DUMP\|RESTORE\|STATS\|KILL\|HELP`, `FCALL function numkeys [key ...] [arg ...]`, `FCALL_RO` | Redis 7's function libraries (`#!lua name=...` and `redis.register_function`), in a Lua state of their own set up as Redis', with its flags (`no-writes`, `allow-oom`, ...), errors (`script: <function>, on @user_function:<line>.`) and limits (a library's top level gets only the library API, for at most 500 ms). `DUMP`'s payload is Redis' RDB format, LZF and CRC-64 included, so libraries move between Redis and Tantalum. Kept in snapshots and the log; `FLUSHALL` leaves them, as in Redis. `LIST` gives libraries by name, Redis in its hash tables' order |
 | `PING [msg]`, `ECHO msg`, `QUIT`, `RESET` | `RESET` drops subscriptions, a transaction, watched keys, RESP3 and the name, goes back to database 0, and with a password, drops authentication |
 
 Anything else gets `-ERR unknown command ...` and the connection stays open.
@@ -192,18 +193,18 @@ pass on Redis 7.2.4 and fail on Tantalum, by library (`bench/frameworks/results-
 
 | Suite | Pass on Redis | Lost on Tantalum |
 |---|---|---|
-| redis-py 7.4.0 | 2,357 | 23 |
-| Predis 3.6.1 | 4,525 | 28 |
-| node-redis 6.3.1 | 1,486 | 40 |
+| redis-py 7.4.0 | 2,357 | 16 |
+| Predis 3.6.1 | 4,525 | 8 |
+| node-redis 6.3.1 | 1,486 | 28 |
 | redis-rb 6.0.0 | 893 | 4 |
 | ioredis 5.11.0 | 566 | 0 |
 | phpredis 6.3.0 | 203 | 4 |
 
-That's 99 of 10,530 (180 before users and ACLs came in 0.27.0), and 81 of them need something
-that isn't here: `FUNCTION`, `CLIENT TRACKING`, or `DUMP` and `RESTORE`. The other 18 are listed
-under "Not there yet". `tools/admin-diff.py` compares the admin commands with Redis 7.2.4 directly:
-3,358 commands and checks, every command's `COMMAND` entries and every setting among them, no
-differences.
+That's 60 of 10,530 (180 before users and ACLs came in 0.27.0, 99 before functions in 0.28.0),
+and 42 of them need something that isn't here: `CLIENT TRACKING`, or `DUMP` and `RESTORE`. The
+other 18 are listed under "Not there yet". `tools/admin-diff.py` compares the admin commands with
+Redis 7.2.4 directly: 3,373 commands and checks, every command's `COMMAND` entries and every
+setting among them, no differences.
 
 ## Design
 
@@ -518,6 +519,19 @@ differences.
   One difference on purpose: Redis 7.2.4 crashes on an
   error table without `err` (`error({})`); Tantalum replies Redis 8's
   `ERR unknown error`.
+- **Functions** (`src/script/functions.rs`, `src/cmd/function.rs`) follow Redis 7.2.4's
+  functions.c and function_lua.c: their own Lua state, whose globals are an empty
+  read-only table leading to the real ones, and while a library loads, to a table with
+  only `register_function`, `log` and the version, so its top level can't run
+  commands. A library's code is kept on the store (`Store::function_codes`), where
+  snapshots (from version 7) and the log's base find it; when a snapshot brings other
+  code, the libraries are made again from it. The log has the `FUNCTION` commands that
+  change them, and `FCALL`'s writes as a script's are. `tools/function-diff.py` runs
+  148 scenario steps against Redis 7.2.4 with no differences, and Redis' own
+  `unit/functions` passes but for its `DEBUG RELOAD` tests. A script or function that
+  runs past `busy-reply-threshold` (5 s) makes other connections' commands `-BUSY`,
+  but for `FUNCTION KILL`, `SCRIPT KILL` and the few Redis lets through: the flag
+  rides in the word connections read once a batch, so it costs nothing until then.
 - **Native BullMQ scripts** (`src/bullmq.rs`): BullMQ's three hottest
   scripts, `addStandardJob` (a job is added), `moveToActive` (a worker takes
   one) and `moveToFinished` (it completes or fails one, and takes the next),
@@ -705,7 +719,8 @@ differences.
   expired while the server was down are dropped at startup. The format has a
   version in its header: 2 has hashes, 3 the other collections, 4 streams
   (with their chunks as they are, so `~` trims the same after a restart), 5
-  streams' consumer groups, kept after their chunks. A
+  streams' consumer groups, kept after their chunks, 6 numbered databases, and 7
+  function libraries' code. A
   save writes the lowest version that holds its data (without hashes still
   1, which builds from before hashes, 0.7, can read), and every build reads
   all versions up to its own (`tests/data/v1.snapshot` was written by 0.7.0). Each shard is copied out
@@ -1285,13 +1300,13 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
-- **Missing, by how many client library tests need it** (see above; 99 of 10,530):
-  `FUNCTION` and `FCALL` (39), client-side caching with `CLIENT
+- **Missing, by how many client library tests need it** (see above; 60 of 10,530):
+  client-side caching with `CLIENT
   TRACKING` (22), `DUMP`, `RESTORE` and `MIGRATE` (20), turning the log on with `CONFIG SET appendonly`
   (5), `LATENCY HISTOGRAM` (5), `INFO commandstats` (3), `OBJECT IDLETIME` (1), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
-  the 225 commands that are here (1, which expects over 300).
+  the 228 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1379,15 +1394,16 @@ hit rates share the seeding flaw described above.
   (Each write reads the clock on its turn, not once per batch: active expiry
   runs on the real clock, so with an older time a command could find a key gone
   that its replay would find alive.)
-- **Scripting gaps**: no `FUNCTION`/`FCALL` or Lua debugger (`SCRIPT DEBUG
-  YES`). While a script runs, other clients wait, where Redis replies
-  `-BUSY` after 5 s; `SCRIPT KILL` has to come from a connection on another
-  thread (so not with `--threads 1`), and with `--io shared` it may wait
-  behind the busy script on its runtime thread. The shebang flags `allow-oom`,
-  `allow-stale`, `no-cluster` and `allow-cross-slot-keys` are accepted with
-  nothing to relax: there's no check before a script runs that memory is
-  under `maxmemory` (a write over it fails inside the script instead). No
-  `used_memory_lua` or `number_of_cached_scripts` in `INFO`.
+- **Scripting gaps**: no Lua debugger (`SCRIPT DEBUG YES`). Before a script has
+  run for `busy-reply-threshold`, other clients' commands wait for the keys it
+  holds rather than all being held up; `SCRIPT KILL`, `FUNCTION KILL` and the
+  `-BUSY` replies come only to connections on another thread than the busy
+  script's (so not with `--threads 1`), and with `--io shared` they may wait behind
+  it on its runtime thread. `allow-oom` acts for functions; for `EVAL`'s shebang it,
+  `allow-stale`, `no-cluster` and `allow-cross-slot-keys` are accepted with nothing
+  to relax, and there's no check before a script runs that memory is under
+  `maxmemory` (a write over it fails inside the script instead). No
+  `used_memory_lua`, `number_of_cached_scripts` or `number_of_functions` in `INFO`.
 - **Stream gaps**: `XINFO STREAM` walks the stream's chunks for
   `radix-tree-nodes`, under the shard's lock, which a stream of billions of
   entries would feel.

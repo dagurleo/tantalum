@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -287,5 +288,129 @@ impl Client {
         tokio::time::timeout(Duration::from_secs(10), read_reply(&mut self.stream))
             .await
             .expect("timed out waiting for a reply")
+    }
+}
+
+// Scenarios over several connections (`tools/acl-diff.py` and the tools
+// built on it record them).
+
+/// A step of a scenario recorded from Redis (`tools/acl-diff.py --rust`).
+pub enum Step {
+    /// On connection N, this command, and Redis' reply (`<closed>` for none).
+    Run(usize, &'static [&'static [u8]], &'static [u8]),
+    /// On connection N, a command whose reply varies (Redis' is compared in
+    /// part by the tool): run, not checked.
+    Send(usize, &'static [&'static [u8]]),
+    /// Users, the log and the data back to the start, connections closed.
+    Reset,
+    Sleep(u64),
+}
+
+pub struct Connections {
+    addr: SocketAddr,
+    open: HashMap<usize, BufReader<TcpStream>>,
+}
+
+impl Connections {
+    pub async fn call(&mut self, n: usize, args: &[&[u8]]) -> Vec<u8> {
+        if !self.open.contains_key(&n) {
+            // (A server may still be coming up.)
+            let mut stream = None;
+            for _ in 0..100 {
+                if let Ok(s) = TcpStream::connect(self.addr).await {
+                    stream = Some(s);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let stream = stream.expect("the server comes up");
+            stream.set_nodelay(true).unwrap();
+            self.open.insert(n, BufReader::new(stream));
+        }
+        let conn = self.open.get_mut(&n).expect("open");
+        let read_only = args == [b"READ"];
+        if !read_only && conn.get_mut().write_all(&req(args)).await.is_err() {
+            self.open.remove(&n);
+            return b"<closed>".to_vec();
+        }
+        // A connection the server closed: nothing more to read.
+        let closed = match tokio::time::timeout(Duration::from_secs(10), conn.fill_buf()).await {
+            Ok(Ok(buf)) => buf.is_empty(),
+            Ok(Err(_)) => true,
+            Err(_) => panic!("no reply to {args:?}"),
+        };
+        if closed {
+            self.open.remove(&n);
+            return b"<closed>".to_vec();
+        }
+        read_reply(conn).await
+    }
+
+    pub async fn reset(&mut self, extra: &[&[&[u8]]]) {
+        self.open.clear();
+        let users = self.call(0, &[b"ACL", b"USERS"]).await;
+        let text = String::from_utf8(users).unwrap();
+        for name in text
+            .split("\r\n")
+            .filter(|l| !l.starts_with(['*', '$']) && !l.is_empty())
+        {
+            if name != "default" {
+                self.call(0, &[b"ACL", b"DELUSER", name.as_bytes()]).await;
+            }
+        }
+        for cmd in [
+            &[
+                &b"ACL"[..],
+                b"SETUSER",
+                b"default",
+                b"reset",
+                b"on",
+                b"nopass",
+                b"~*",
+                b"&*",
+                b"+@all",
+            ][..],
+            &[b"CONFIG", b"SET", b"requirepass", b""],
+            &[b"ACL", b"LOG", b"RESET"],
+            &[b"CONFIG", b"RESETSTAT"],
+            &[b"FLUSHALL"],
+        ] {
+            self.call(0, cmd).await;
+        }
+        for cmd in extra {
+            self.call(0, cmd).await;
+        }
+    }
+}
+
+fn shown(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Runs `steps` on a fresh server in `mode`, checking each reply; `extra` are
+/// commands a reset sends too.
+pub async fn replay_steps(steps: &[Step], extra: &[&[&[u8]]], mode: Mode) {
+    let (addr, _ctx) = start(mode).await;
+    let mut conns = Connections {
+        addr,
+        open: HashMap::new(),
+    };
+    for (i, step) in steps.iter().enumerate() {
+        match step {
+            Step::Run(n, args, expected) => {
+                let reply = conns.call(*n, args).await;
+                let command: Vec<String> = args.iter().map(|a| shown(a)).collect();
+                assert_eq!(
+                    shown(&reply),
+                    shown(expected),
+                    "step {i}, {mode:?}, on connection {n}: {command:?}"
+                );
+            }
+            Step::Send(n, args) => {
+                conns.call(*n, args).await;
+            }
+            Step::Reset => conns.reset(extra).await,
+            Step::Sleep(ms) => tokio::time::sleep(Duration::from_millis(*ms)).await,
+        }
     }
 }

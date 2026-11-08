@@ -70,9 +70,14 @@ const SPECIAL_ON: u32 = 1;
 /// In [`Context::special`]: the ticking clock's asleep, as nothing has run for a while. In the
 /// same word, so that the first batch after a quiet spell wakes it, and it costs the others nothing.
 const CLOCK_ASLEEP: u32 = 2;
+/// In [`Context::special`]: a script has run past `busy-reply-threshold`, so other
+/// connections' commands are refused with `-BUSY` but for a few, as in Redis.
+const SCRIPT_BUSY: u32 = 4;
 /// In [`Context::special`], counted in the bits above: users changed (`ACL SETUSER` and
 /// the like), so each connection takes up its user's new rules at its next batch.
-const USERS_CHANGED: u32 = 4;
+const USERS_CHANGED: u32 = 8;
+/// The flags in [`Context::special`] that put a connection on the watched path.
+const WATCHED: u32 = SPECIAL_ON | SCRIPT_BUSY;
 
 /// `--enable-debug-command`, as in Redis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -258,15 +263,29 @@ impl Context {
             }
         }
         let state = state & !CLOCK_ASLEEP;
-        if state & !SPECIAL_ON != session.seen & !SPECIAL_ON {
+        if state & !WATCHED != session.seen & !WATCHED {
             self.take_up_user(session);
         }
         session.seen = state;
-        let special = state & SPECIAL_ON != 0;
+        let special = state & WATCHED != 0;
         if special != session.special {
             session.special = special;
         }
         session.refresh();
+    }
+
+    /// A script has run past `busy-reply-threshold` (or stopped, with `false`).
+    pub(crate) fn set_script_busy(&self, busy: bool) {
+        if busy {
+            self.special.fetch_or(SCRIPT_BUSY, Relaxed);
+        } else {
+            self.special.fetch_and(!SCRIPT_BUSY, Relaxed);
+        }
+    }
+
+    /// Whether other connections' commands get `-BUSY`.
+    pub(crate) fn script_busy(&self) -> bool {
+        self.special.load(Relaxed) & SCRIPT_BUSY != 0
     }
 
     /// Users changed: every connection takes up its user's new rules.
@@ -831,6 +850,14 @@ impl Context {
     /// error should stop the server, as in Redis.
     pub fn load_acl_file(&self) -> Result<(), String> {
         self.acl.load_at_startup()
+    }
+
+    /// Makes the function libraries from the code on the store (loaded from a
+    /// snapshot or the log), at startup.
+    pub fn load_functions(&self) {
+        let mut functions = self.scripting.functions.lock();
+        functions.follow(&self.store);
+        self.scripting.count_functions(&functions);
     }
 
     /// Whether connections start authenticated: the default user is on and

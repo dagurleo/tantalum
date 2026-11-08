@@ -1278,3 +1278,64 @@ fn hyperloglogs_and_geo_come_back() {
         "*1\r\n$7\r\nCatania\r\n",
     );
 }
+
+/// Function libraries come back from the log, as the `FUNCTION` commands that
+/// made them, and from a rewrite's base, which holds their code; `FCALL` is
+/// logged as the writes it made, as a script is.
+#[test]
+fn function_libraries_come_back() {
+    let dir = temp_dir("functions");
+    let lib = "#!lua name=lib\nredis.register_function('setx', function(keys, args) \
+               return redis.call('set', keys[1], args[1]) end)";
+    let other = "#!lua name=other\nredis.register_function('two', function() return 2 end)";
+    let (server1, mut c) = server(&dir);
+    call(&mut c, &["FUNCTION", "LOAD", lib], "$3\r\nlib\r\n");
+    call(&mut c, &["FUNCTION", "LOAD", other], "$5\r\nother\r\n");
+    call(&mut c, &["FCALL", "setx", "1", "k", "v"], "+OK\r\n");
+    call(&mut c, &["FUNCTION", "DELETE", "other"], "+OK\r\n");
+    // Not logged: these change nothing.
+    call(
+        &mut c,
+        &["FUNCTION", "DELETE", "nosuch"],
+        "-ERR Library not found\r\n",
+    );
+    call(&mut c, &["FUNCTION", "LIST", "LIBRARYNAME", "x"], "*0\r\n");
+    std::thread::sleep(Duration::from_millis(300));
+    drop(server1); // SIGKILL
+    let log = std::fs::read(log_file(&dir)).unwrap();
+    let times = |word: &[u8]| log.windows(word.len()).filter(|w| *w == word).count();
+    assert_eq!(times(b"FCALL"), 0, "FCALL itself was logged");
+    assert_eq!(times(b"LIST"), 0);
+    assert_eq!(times(b"nosuch"), 0);
+    assert_eq!(times(b"FUNCTION"), 3);
+
+    let (server2, mut c) = server(&dir);
+    call(&mut c, &["GET", "k"], "$1\r\nv\r\n");
+    call(&mut c, &["FCALL", "setx", "1", "k", "w"], "+OK\r\n");
+    call(
+        &mut c,
+        &["FCALL", "two", "0"],
+        "-ERR Function not found\r\n",
+    );
+    call(
+        &mut c,
+        &["FUNCTION", "STATS"],
+        "*4\r\n$14\r\nrunning_script\r\n$-1\r\n$7\r\nengines\r\n*2\r\n$3\r\nLUA\r\n*4\r\n\
+         $15\r\nlibraries_count\r\n:1\r\n$15\r\nfunctions_count\r\n:1\r\n",
+    );
+    // A rewrite's base has the library's code.
+    call(
+        &mut c,
+        &["BGREWRITEAOF"],
+        "+Background append only file rewriting started\r\n",
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    call(&mut c, &["FUNCTION", "LOAD", other], "$5\r\nother\r\n");
+    std::thread::sleep(Duration::from_millis(300));
+    drop(server2);
+
+    let (_server3, mut c) = server(&dir);
+    call(&mut c, &["GET", "k"], "$1\r\nw\r\n");
+    call(&mut c, &["FCALL", "setx", "1", "k", "x"], "+OK\r\n");
+    call(&mut c, &["FCALL", "two", "0"], ":2\r\n");
+}
