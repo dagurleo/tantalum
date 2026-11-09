@@ -48,7 +48,9 @@ pub(super) fn slowlog(
 ) -> Reply {
     let sub = args.get(1);
     let is = |name: &[u8]| sub.eq_ignore_ascii_case(name);
-    if is(b"HELP") && args.len() == 2 {
+    if is(b"HELP") && args.len() != 2 {
+        wrong_arity(out, "slowlog|help");
+    } else if is(b"HELP") {
         help(
             out,
             &[
@@ -127,7 +129,7 @@ pub(super) fn config(
                 && !was_special
                 && let Some(command) = super::find_command(args.get(0))
             {
-                super::has_run(ctx, session, command, args, started, false);
+                super::has_run(ctx, session, command, args, started, false, None);
             }
         }
     } else if is(b"RESETSTAT") {
@@ -135,6 +137,10 @@ pub(super) fn config(
             wrong_arity(out, "config|resetstat");
         } else {
             ctx.reset_stats();
+            // From now on commands are counted, this one too (as in Redis, after the reset).
+            if ctx.stats.start(super::command_id(args)) {
+                ctx.update_special();
+            }
             out.extend_from_slice(resp::OK);
         }
     } else if is(b"REWRITE") {
@@ -143,7 +149,9 @@ pub(super) fn config(
         } else {
             resp::write_error(out, b"ERR The server is running without a config file");
         }
-    } else if is(b"HELP") && args.len() == 2 {
+    } else if is(b"HELP") && args.len() != 2 {
+        wrong_arity(out, "config|help");
+    } else if is(b"HELP") {
         help(
             out,
             &[
@@ -318,6 +326,15 @@ fn config_set(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
                 }
                 lower
             }
+            Kind::Text if name == "latency-tracking-info-percentiles" => {
+                match crate::stats::parse_percentiles(&text) {
+                    Ok((normal, _)) => normal,
+                    Err(why) => {
+                        failed(out, name, why);
+                        return;
+                    }
+                }
+            }
             Kind::Text => text,
         };
         if let Err(why) = can_set(ctx, name, &value) {
@@ -342,9 +359,6 @@ fn config_set(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
 /// being remembered and doing nothing.
 fn can_set(ctx: &Context, name: &str, value: &str) -> Result<(), &'static str> {
     match name {
-        "maxmemory-policy" if EvictionPolicy::parse(value).is_none() => {
-            Err("this server has noeviction, allkeys-lru and volatile-lru")
-        }
         "notify-keyspace-events" if !value.is_empty() => {
             Err("keyspace notifications aren't there yet")
         }
@@ -378,6 +392,12 @@ fn apply(ctx: &Context, name: &str, value: &str) {
             }
         }
         "maxclients" => ctx.set_maxclients(number().max(1) as usize),
+        "latency-tracking" => ctx.stats.set_latency_tracking(value == "yes"),
+        "latency-tracking-info-percentiles" => {
+            if let Ok((_, percentiles)) = crate::stats::parse_percentiles(value) {
+                ctx.stats.set_percentiles(percentiles);
+            }
+        }
         "timeout" => ctx.set_timeout(seconds()),
         "tcp-keepalive" => ctx.set_tcp_keepalive(seconds()),
         "requirepass" => {
@@ -465,7 +485,9 @@ pub(super) fn memory(
         if exact(2, "stats", out) {
             memory_stats(ctx, session, out);
         }
-    } else if is(b"HELP") && args.len() == 2 {
+    } else if is(b"HELP") && args.len() != 2 {
+        wrong_arity(out, "memory|help");
+    } else if is(b"HELP") {
         help(
             out,
             &[
@@ -749,7 +771,9 @@ pub(super) fn module(
             out,
             b"ERR Error unloading module: no such module with that name",
         );
-    } else if sub.eq_ignore_ascii_case(b"HELP") && args.len() == 2 {
+    } else if sub.eq_ignore_ascii_case(b"HELP") && args.len() != 2 {
+        wrong_arity(out, "module|help");
+    } else if sub.eq_ignore_ascii_case(b"HELP") {
         help(
             out,
             &[
@@ -826,9 +850,19 @@ pub(super) fn latency(
             resp::write_verbatim_text(out, report.as_bytes(), session.resp3);
         }
     } else if is(b"HISTOGRAM") {
-        // Each command's own histogram would cost every command: not kept.
-        resp::write_map_header(out, 0, session.resp3);
-    } else if is(b"HELP") && args.len() == 2 {
+        // Counted from now on, as for INFO's sections.
+        let started = ctx.stats.start(None);
+        if started {
+            ctx.update_special();
+        }
+        ctx.stats.latency_histogram(args, session.resp3, out);
+        if started && let Some(id) = super::command_id(args) {
+            // It counts as having run, after its reply as in Redis.
+            ctx.stats.start_counted(id);
+        }
+    } else if is(b"HELP") && args.len() != 2 {
+        wrong_arity(out, "latency|help");
+    } else if is(b"HELP") {
         help(
             out,
             &[

@@ -138,24 +138,54 @@ pub enum EvictionPolicy {
     AllKeysLru,
     /// Like `AllKeysLru`, but only keys with a TTL are candidates.
     VolatileLru,
+    /// Evict the least often used keys: by the same use counter as the LRU
+    /// policies, which counts up to three uses and loses one each time
+    /// eviction passes, so it keeps what's used often as well as lately.
+    AllKeysLfu,
+    /// Like `AllKeysLfu`, but only keys with a TTL.
+    VolatileLfu,
+    /// Evict keys regardless of use: a segment picked at random gives up all of its keys.
+    AllKeysRandom,
+    /// Like `AllKeysRandom`, but only keys with a TTL.
+    VolatileRandom,
+    /// Evict the keys with a TTL nearest their deadline: of the oldest segment
+    /// holding some, the half with the soonest.
+    VolatileTtl,
+}
+
+/// How a policy picks what goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    /// By the use counter: the LRU and LFU policies.
+    Use,
+    Random,
+    /// Soonest deadline first.
+    Soonest,
 }
 
 impl EvictionPolicy {
+    const ALL: [Self; 8] = [
+        Self::NoEviction,
+        Self::AllKeysLru,
+        Self::VolatileLru,
+        Self::AllKeysLfu,
+        Self::VolatileLfu,
+        Self::AllKeysRandom,
+        Self::VolatileRandom,
+        Self::VolatileTtl,
+    ];
+
     fn from_u8(n: u8) -> Self {
-        match n {
-            n if n == EvictionPolicy::AllKeysLru as u8 => EvictionPolicy::AllKeysLru,
-            n if n == EvictionPolicy::VolatileLru as u8 => EvictionPolicy::VolatileLru,
-            _ => EvictionPolicy::NoEviction,
-        }
+        Self::ALL
+            .get(usize::from(n))
+            .copied()
+            .unwrap_or(Self::NoEviction)
     }
 
     pub fn parse(name: &str) -> Option<Self> {
-        match name.to_ascii_lowercase().as_str() {
-            "noeviction" => Some(Self::NoEviction),
-            "allkeys-lru" => Some(Self::AllKeysLru),
-            "volatile-lru" => Some(Self::VolatileLru),
-            _ => None,
-        }
+        Self::ALL
+            .into_iter()
+            .find(|policy| policy.name().eq_ignore_ascii_case(name))
     }
 
     pub fn name(self) -> &'static str {
@@ -163,6 +193,41 @@ impl EvictionPolicy {
             Self::NoEviction => "noeviction",
             Self::AllKeysLru => "allkeys-lru",
             Self::VolatileLru => "volatile-lru",
+            Self::AllKeysLfu => "allkeys-lfu",
+            Self::VolatileLfu => "volatile-lfu",
+            Self::AllKeysRandom => "allkeys-random",
+            Self::VolatileRandom => "volatile-random",
+            Self::VolatileTtl => "volatile-ttl",
+        }
+    }
+
+    /// An LFU policy: `OBJECT FREQ` answers only under one, as in Redis.
+    pub fn is_lfu(self) -> bool {
+        matches!(self, Self::AllKeysLfu | Self::VolatileLfu)
+    }
+
+    /// An LRU or LFU policy, which goes by the use counter.
+    pub fn counts_uses(self) -> bool {
+        self.choice() == Some(Choice::Use)
+    }
+
+    /// Only keys with a TTL may go.
+    fn volatile_only(self) -> bool {
+        matches!(
+            self,
+            Self::VolatileLru | Self::VolatileLfu | Self::VolatileRandom | Self::VolatileTtl
+        )
+    }
+
+    /// How it picks what goes; `None` for `noeviction`.
+    fn choice(self) -> Option<Choice> {
+        match self {
+            Self::NoEviction => None,
+            Self::AllKeysLru | Self::VolatileLru | Self::AllKeysLfu | Self::VolatileLfu => {
+                Some(Choice::Use)
+            }
+            Self::AllKeysRandom | Self::VolatileRandom => Some(Choice::Random),
+            Self::VolatileTtl => Some(Choice::Soonest),
         }
     }
 }
@@ -384,6 +449,8 @@ pub struct Current<'a> {
     pub value: ValueRef<'a>,
     /// `Never` or `At`.
     pub expiry: Expiry,
+    /// Its use counter, which eviction goes by: 0 to [`MAX_USAGE`].
+    pub uses: u8,
 }
 
 /// A live key, as [`Store::update_collection`] shows it.
@@ -544,6 +611,17 @@ fn slot_hash(hasher: &Hasher, key: &[u8]) -> u32 {
     hasher.hash_one(key) as u32
 }
 
+/// The middle deadline of a segment's live keys with a TTL, if it has any.
+fn middle_due(seg: &Segment) -> Option<Millis> {
+    let mut due: Vec<Millis> = seg
+        .entries()
+        .filter(|(_, header)| !header.is_dead() && header.has_ttl())
+        .map(|(_, header)| header.deadline)
+        .collect();
+    let middle = due.len().checked_sub(1)? / 2;
+    Some(*due.select_nth_unstable(middle).1)
+}
+
 /// Whether eviction may remove this entry at all (volatile-lru spares keys
 /// without a TTL).
 fn evictable(volatile_only: bool, header: &Header) -> bool {
@@ -554,8 +632,26 @@ fn evictable(volatile_only: bool, header: &Header) -> bool {
 enum Compaction {
     /// Keep every live entry; just reclaim dead space.
     Defrag,
-    /// Keep only entries used since their last pass; drop the rest.
-    Evict { volatile_only: bool },
+    /// Drop the evictable entries `rule` picks; keep the rest.
+    Evict { volatile_only: bool, rule: Rule },
+}
+
+/// Which evictable entries a compaction drops.
+#[derive(Clone, Copy)]
+enum Rule {
+    /// Those unused since their last pass (the others lose a use).
+    Unused,
+    All,
+    /// Those due by this deadline.
+    DueBy(Millis),
+}
+
+/// What eviction asks of a shard: the policy's choice, and a random number for it.
+#[derive(Clone, Copy)]
+struct Eviction {
+    volatile_only: bool,
+    choice: Choice,
+    pick: u64,
 }
 
 // 128-byte alignment keeps each shard's lock on its own cache line (pair), so
@@ -1243,14 +1339,24 @@ impl ShardInner {
             let keep = !expired
                 && match mode {
                     Compaction::Defrag => true,
-                    Compaction::Evict { volatile_only } => {
-                        usage > 0 || !evictable(volatile_only, &header)
+                    Compaction::Evict {
+                        volatile_only,
+                        rule,
+                    } => {
+                        !evictable(volatile_only, &header)
+                            || match rule {
+                                Rule::Unused => usage > 0,
+                                Rule::All => false,
+                                Rule::DueBy(cutoff) => header.deadline > cutoff,
+                            }
                     }
                 };
             if keep {
                 let usage = match mode {
-                    Compaction::Evict { .. } => usage.saturating_sub(1),
-                    Compaction::Defrag => usage,
+                    Compaction::Evict {
+                        rule: Rule::Unused, ..
+                    } => usage.saturating_sub(1),
+                    Compaction::Evict { .. } | Compaction::Defrag => usage,
                 };
                 let bytes = &seg.buf[offset..offset + header.len];
                 let flags = segment::with_usage(header.flags, usage);
@@ -1284,19 +1390,24 @@ impl ShardInner {
         dropped
     }
 
-    /// Makes eviction progress in this shard: compacts the oldest suitable
-    /// segment if enough of it is reclaimable, otherwise ages it in place.
-    /// In `thorough` mode it keeps going through every segment (the active
-    /// one included) until one compacts. Returns the bytes reclaimed, 0 if
-    /// none were (everything looked at was aged, or nothing was suitable).
+    /// Makes eviction progress in this shard. By use (the LRU and LFU
+    /// policies), it compacts the oldest suitable segment if enough of it is
+    /// reclaimable, otherwise ages it in place. In `thorough` mode it keeps
+    /// going through every segment (the active one included) until one
+    /// compacts. Returns the bytes reclaimed, 0 if none were (everything looked
+    /// at was aged, or nothing was suitable).
     fn evict_segment(
         &mut self,
-        volatile_only: bool,
+        how: Eviction,
         thorough: bool,
         now: Millis,
         hasher: &Hasher,
         garbage: &mut Vec<Freed>,
     ) -> usize {
+        let volatile_only = how.volatile_only;
+        if how.choice != Choice::Use {
+            return self.evict_unaged(how, thorough, now, hasher, garbage);
+        }
         let suitable = |seg: &Segment| seg.live > 0 && (!volatile_only || seg.ttl_live > 0);
         let rounds = if thorough { self.sealed.len() + 1 } else { 1 };
         for round in 0..rounds {
@@ -1323,9 +1434,13 @@ impl ShardInner {
                 }
             }
             if reclaimable * 4 >= seg.buf.len() {
+                let rule = Rule::Unused;
                 self.compact(
                     id,
-                    Compaction::Evict { volatile_only },
+                    Compaction::Evict {
+                        volatile_only,
+                        rule,
+                    },
                     now,
                     hasher,
                     garbage,
@@ -1335,6 +1450,83 @@ impl ShardInner {
             self.age(id, volatile_only);
         }
         0
+    }
+
+    /// [`ShardInner::evict_segment`] for the random and `volatile-ttl`
+    /// policies, which age nothing, so whichever segment they pick gives up
+    /// keys: a random one all of its evictable keys, the oldest with TTL keys
+    /// the half of them nearest their deadline. The active segment is a
+    /// candidate only when `thorough`.
+    fn evict_unaged(
+        &mut self,
+        how: Eviction,
+        thorough: bool,
+        now: Millis,
+        hasher: &Hasher,
+        garbage: &mut Vec<Freed>,
+    ) -> usize {
+        let volatile_only = how.volatile_only;
+        let suitable = |seg: &Segment| seg.live > 0 && (!volatile_only || seg.ttl_live > 0);
+        // Fresh keys may be due soonest, so `volatile-ttl` looks at the active one too.
+        let active = self
+            .active
+            .filter(|_| thorough || how.choice == Choice::Soonest);
+        let ids: Vec<usize> = self
+            .sealed
+            .iter()
+            .map(|&id| id as usize)
+            .chain(active)
+            .filter(|&id| suitable(self.segment(id)))
+            .collect();
+        if ids.is_empty() {
+            return 0;
+        }
+        let pick = |n: u64| ids[(n % ids.len() as u64) as usize];
+        let (id, rule) = match how.choice {
+            Choice::Soonest => {
+                // Of the oldest, the newest and two at random, the one whose
+                // TTL keys are due soonest, by the middle one; its half due
+                // soonest goes.
+                let looks = [
+                    ids[0],
+                    ids[ids.len() - 1],
+                    pick(how.pick),
+                    pick(how.pick >> 24),
+                ];
+                let Some((due, id)) = looks
+                    .into_iter()
+                    .filter_map(|id| Some((middle_due(self.segment(id))?, id)))
+                    .min()
+                else {
+                    return 0;
+                };
+                (id, Rule::DueBy(due))
+            }
+            Choice::Random | Choice::Use => (pick(how.pick), Rule::All),
+        };
+        let seg = self.segment(id);
+        let mut reclaimable = seg.buf.len() - seg.live;
+        for (_, header) in seg.entries() {
+            let chosen = match rule {
+                Rule::DueBy(cutoff) => header.deadline <= cutoff,
+                Rule::All | Rule::Unused => true,
+            };
+            let goes = header.is_expired(now) || (chosen && evictable(volatile_only, &header));
+            if !header.is_dead() && goes {
+                reclaimable += header.len;
+            }
+        }
+        self.compact(
+            id,
+            Compaction::Evict {
+                volatile_only,
+                rule,
+            },
+            now,
+            hasher,
+            garbage,
+        );
+        reclaimable
     }
 
     /// Decrements the usage counters of segment `id` in place and moves it to
@@ -2372,6 +2564,7 @@ impl Store {
             f(existing.map(|(loc, header)| Current {
                 value: inner.value_ref(loc, header),
                 expiry: expiry_of(header),
+                uses: header.usage(),
             }))
         })
     }
@@ -3559,12 +3752,12 @@ impl Store {
     }
 
     fn evict_for(&self, home: usize, seed: u32, incoming: usize, now: Millis) -> bool {
-        let volatile_only = match self.policy() {
-            EvictionPolicy::NoEviction => return false,
-            EvictionPolicy::AllKeysLru => false,
-            EvictionPolicy::VolatileLru => true,
+        let policy = self.policy();
+        let Some(choice) = policy.choice() else {
+            return false;
         };
-        // How much a shard has to give: bytes, or for volatile-lru, TTL keys.
+        let volatile_only = policy.volatile_only();
+        // How much a shard has to give: bytes, or for the volatile policies, TTL keys.
         let weight = |(db, i): (&Store, usize)| {
             let shard = &db.shards[i];
             if volatile_only {
@@ -3576,6 +3769,7 @@ impl Store {
         let needed = (self.used_memory() + incoming).saturating_sub(self.maxmemory());
         let mut freed = 0;
         let mut rng = (u64::from(seed) << 1) | 1;
+        let mut picks = rng.rotate_left(29) ^ 0x9e37_79b9_7f4a_7c15;
         // xorshift64: a cheap, good-enough source of shard choices.
         // Every database gives, as in Redis, whichever one needs the room.
         let dbs: Vec<&Store> = self.live().collect();
@@ -3623,13 +3817,17 @@ impl Store {
                 Some(mut guard) => {
                     let inner = &mut *guard;
                     let before = inner.footprint();
-                    let reclaimed = inner.evict_segment(
+                    // A second xorshift stream, for the random policies' segment.
+                    picks ^= picks << 13;
+                    picks ^= picks >> 7;
+                    picks ^= picks << 17;
+                    let how = Eviction {
                         volatile_only,
-                        sweep.is_some(),
-                        now,
-                        &self.hasher,
-                        &mut garbage,
-                    );
+                        choice,
+                        pick: picks >> 16,
+                    };
+                    let reclaimed =
+                        inner.evict_segment(how, sweep.is_some(), now, &self.hasher, &mut garbage);
                     inner.shrink_if_sparse();
                     let after = inner.footprint();
                     db.sync_usage(shard, inner, true);

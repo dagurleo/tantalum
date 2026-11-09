@@ -8,7 +8,7 @@ use crate::context::{Context, Session};
 use crate::glob;
 use crate::resp;
 use crate::store::{
-    EvictionPolicy, Expiry, Key, Kind, Millis, OutOfMemory, Renamed, Store, Update, ValueRef, View,
+    Expiry, Key, Kind, Millis, OutOfMemory, Renamed, Store, Update, ValueRef, View,
 };
 use crate::{list, set, zset};
 
@@ -473,8 +473,9 @@ const OBJECT_HELP: &[&str] = &[
 
 /// `OBJECT ENCODING|FREQ|IDLETIME|REFCOUNT key` and `OBJECT HELP`. Tantalum
 /// keeps no last-access time per key (it would add bytes to every key), so
-/// `IDLETIME` is always 0, and no LFU policy, so `FREQ` is the error Redis gives
-/// without one.
+/// `IDLETIME` is always 0. `FREQ`, under an LFU policy, is the key's use
+/// counter, 0 to 3, which eviction goes by (Redis' counts on a log scale to
+/// 255); otherwise it's the error Redis gives.
 pub(super) fn object(
     ctx: &Context,
     session: &mut Session,
@@ -515,16 +516,19 @@ pub(super) fn object(
                     c.value.kind() == Kind::String
                         && resp::parse_int(c.value.as_bytes())
                             .is_some_and(|n| (0..10_000).contains(&n)),
+                    c.uses,
                 )),
             ),
         })
         .unwrap_or(None);
-    let Some((encoding, small_int)) = found else {
+    let Some((encoding, small_int, uses)) = found else {
         out.extend_from_slice(null);
         return Reply::Written;
     };
     if is(b"ENCODING") {
         resp::write_bulk(out, encoding.as_bytes());
+    } else if is(b"FREQ") && store.policy().is_lfu() {
+        resp::write_integer(out, i64::from(uses));
     } else if is(b"FREQ") {
         resp::write_error(
             out,
@@ -533,9 +537,8 @@ pub(super) fn object(
     } else if is(b"IDLETIME") {
         resp::write_integer(out, 0);
     } else {
-        // Redis shares small integers, but not under an LRU policy.
-        let shared =
-            small_int && (store.maxmemory() == 0 || store.policy() == EvictionPolicy::NoEviction);
+        // Redis shares small integers, but not under an LRU or LFU policy.
+        let shared = small_int && (store.maxmemory() == 0 || !store.policy().counts_uses());
         resp::write_integer(out, if shared { i64::from(i32::MAX) } else { 1 });
     }
     Reply::Written

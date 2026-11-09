@@ -68,7 +68,8 @@ struct Commands {
     no_auth: Vec<bool>,
     parent: Vec<u16>,
     subcommands: Vec<Vec<u16>>,
-    ids: HashMap<&'static str, u16>,
+    /// (Its keys are Redis' fixed names, so a fast hash will do.)
+    ids: HashMap<&'static str, u16, foldhash::fast::FixedState>,
 }
 
 fn commands() -> &'static Commands {
@@ -80,7 +81,7 @@ fn commands() -> &'static Commands {
             no_auth: Vec::new(),
             parent: Vec::new(),
             subcommands: Vec::new(),
-            ids: HashMap::new(),
+            ids: HashMap::default(),
         };
         for line in TABLE.lines().filter(|l| !l.starts_with('#')) {
             let mut fields = line.split(' ');
@@ -869,21 +870,61 @@ impl Target {
     }
 }
 
+/// The id of the command `name` (Tantalum's, lowercase) run with `args`: a
+/// container's subcommand's when it names one. `None` for a subcommand it
+/// doesn't have.
+pub(crate) fn command_id(name: &str, args: &Args<'_>) -> Option<u16> {
+    let table = commands();
+    let base = *table.ids.get(name)?;
+    if !table.subcommands[base as usize].is_empty() && args.len() >= 2 {
+        let mut full = String::with_capacity(name.len() + 1 + args.get(1).len());
+        full.push_str(name);
+        full.push('|');
+        full.push_str(&String::from_utf8_lossy(args.get(1)).to_ascii_lowercase());
+        table.ids.get(full.as_str()).copied()
+    } else {
+        Some(base)
+    }
+}
+
+/// A command's own id (Tantalum's name, lowercase), and whether it has subcommands:
+/// for command statistics, which keep it per command.
+pub(crate) fn base_id(name: &str) -> Option<(u16, bool)> {
+    let table = commands();
+    let id = *table.ids.get(name)?;
+    Some((id, !table.subcommands[id as usize].is_empty()))
+}
+
+/// For command statistics: how many ids there are (commands and subcommands).
+pub(crate) fn command_count() -> usize {
+    commands().names.len()
+}
+
+/// A command's name by id: `config|get` for a subcommand.
+pub(crate) fn command_name(id: u16) -> &'static str {
+    commands().names[id as usize]
+}
+
+/// A command's id from its name, as Redis' `lookupCommandBySds` finds it.
+pub(crate) fn find_command_id(name: &[u8]) -> Option<u16> {
+    lookup(name)
+}
+
+/// A container command's subcommands' ids.
+pub(crate) fn subcommand_ids(id: u16) -> &'static [u16] {
+    &commands().subcommands[id as usize]
+}
+
 /// What ACLs check of the command `name` (Tantalum's, lowercase) run with
 /// `args`. `None` for a subcommand it doesn't have: the command replies with
 /// its error, as Redis does before any check.
 pub(crate) fn target(name: &'static str, args: &Args<'_>) -> Option<Target> {
     let table = commands();
-    let base = *table.ids.get(name)?;
-    let (id, full) = if !table.subcommands[base as usize].is_empty() && args.len() >= 2 {
-        let mut full = String::with_capacity(name.len() + 1 + args.get(1).len());
-        full.push_str(name);
-        full.push('|');
-        full.push_str(&String::from_utf8_lossy(args.get(1)).to_ascii_lowercase());
-        let id = *table.ids.get(full.as_str())?;
-        (id, table.names[id as usize])
+    let id = command_id(name, args)?;
+    let full = if table.parent[id as usize] == NO_PARENT {
+        name
     } else {
-        (base, name)
+        table.names[id as usize]
     };
     let channels = match name {
         "subscribe" | "ssubscribe" => Some((false, None)),

@@ -571,12 +571,33 @@ async fn config_reads_and_sets() {
         c.call(&["CONFIG", "GET", "maxmemory-policy"]).await,
         "*2\r\n$16\r\nmaxmemory-policy\r\n$11\r\nallkeys-lru\r\n"
     );
+    // Every policy Redis has.
+    for policy in [
+        "volatile-lru",
+        "volatile-lfu",
+        "volatile-random",
+        "volatile-ttl",
+        "allkeys-lfu",
+        "allkeys-random",
+        "noeviction",
+        "allkeys-lru",
+    ] {
+        assert_eq!(
+            c.call(&["CONFIG", "SET", "maxmemory-policy", policy]).await,
+            "+OK\r\n"
+        );
+        assert_eq!(ctx.store.policy().name(), policy);
+    }
+    // Under an LFU policy, OBJECT FREQ is the key's use counter.
+    c.call(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"])
+        .await;
+    c.call(&["SET", "used", "1"]).await;
+    c.call(&["GET", "used"]).await;
+    c.call(&["GET", "used"]).await;
+    assert_eq!(c.call(&["OBJECT", "FREQ", "used"]).await, ":2\r\n");
+    c.call(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lru"])
+        .await;
     // Those that can't be done say so.
-    assert!(
-        c.call(&["CONFIG", "SET", "maxmemory-policy", "allkeys-lfu"])
-            .await
-            .contains("noeviction, allkeys-lru and volatile-lru")
-    );
     assert!(
         c.call(&["CONFIG", "SET", "maxmemory-policy", "x"])
             .await
@@ -1265,4 +1286,215 @@ async fn debug_when_it_is_allowed() {
         c.call(&["DEBUG", "NOPE"]).await,
         "-ERR unknown subcommand or wrong number of arguments for 'NOPE'. Try DEBUG HELP.\r\n"
     );
+}
+
+/// The value after `name:` on a line of an `INFO` reply.
+fn info_field(info: &str, name: &str) -> Option<String> {
+    let at = info.find(&format!("\r\n{name}:"))? + name.len() + 3;
+    Some(info[at..].split("\r\n").next()?.to_string())
+}
+
+/// A command's calls, rejected and failed calls, from `INFO commandstats`.
+async fn counts(c: &mut Client, command: &str) -> (u64, u64, u64) {
+    let info = c.call(&["INFO", "commandstats"]).await;
+    let Some(line) = info_field(&info, &format!("cmdstat_{command}")) else {
+        return (0, 0, 0);
+    };
+    let field = |name: &str| -> u64 {
+        let at = line.find(&format!("{name}=")).expect(name) + name.len() + 1;
+        line[at..].split(',').next().unwrap().parse().unwrap()
+    };
+    assert!(
+        line.contains(",usec=") && line.contains(",usec_per_call="),
+        "{line}"
+    );
+    (
+        field("calls"),
+        field("rejected_calls"),
+        field("failed_calls"),
+    )
+}
+
+/// An error code's count, from `INFO errorstats`.
+async fn errors(c: &mut Client, code: &str) -> Option<String> {
+    let info = c.call(&["INFO", "errorstats"]).await;
+    info_field(&info, &format!("errorstat_{code}"))
+}
+
+#[tokio::test]
+async fn command_statistics_count_as_redis_does() {
+    for mode in MODES {
+        let (addr, _ctx) = start(mode).await;
+        let mut c = Client::connect(addr).await;
+        let mut b = Client::connect(addr).await;
+        // Counting starts when something asks; what asked counts once it's replied.
+        c.call(&["SET", "a", "b"]).await;
+        let first = c.call(&["INFO", "commandstats"]).await;
+        assert_eq!(first, "$16\r\n# Commandstats\r\n\r\n");
+        assert_eq!(counts(&mut c, "info").await, (1, 0, 0), "{mode:?}");
+
+        // Rejected for its arguments, then two that ran (Redis' unit/info).
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        c.call(&["SET", "k"]).await;
+        c.call(&["SET", "k1", "v1"]).await;
+        c.call(&["SET", "k2", "v2"]).await;
+        assert_eq!(counts(&mut c, "set").await, (2, 1, 0));
+        assert_eq!(errors(&mut c, "ERR").await.as_deref(), Some("count=1"));
+        let stats = c.call(&["INFO", "stats"]).await;
+        assert_eq!(
+            info_field(&stats, "total_error_replies").as_deref(),
+            Some("1")
+        );
+
+        // Failed in a transaction, and EXEC's own error.
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        c.call(&["MULTI"]).await;
+        c.call(&["SET", "a", "b"]).await;
+        c.call(&["AUTH", "a"]).await;
+        c.call(&["EXEC"]).await;
+        assert_eq!(counts(&mut c, "set").await, (1, 0, 0));
+        assert_eq!(counts(&mut c, "auth").await, (1, 0, 1));
+        assert_eq!(counts(&mut c, "exec").await, (1, 0, 0));
+        assert_eq!(errors(&mut c, "ERR").await.as_deref(), Some("count=1"));
+        c.call(&["EXEC"]).await;
+        assert_eq!(counts(&mut c, "exec").await, (2, 0, 1));
+        assert_eq!(errors(&mut c, "ERR").await.as_deref(), Some("count=2"));
+        // Refused while queued: the transaction then fails.
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        c.call(&["MULTI"]).await;
+        c.call(&["SET"]).await;
+        c.call(&["EXEC"]).await;
+        assert_eq!(counts(&mut c, "set").await, (0, 1, 0));
+        assert_eq!(counts(&mut c, "multi").await, (1, 0, 0));
+        assert_eq!(counts(&mut c, "exec").await, (1, 0, 1));
+        assert_eq!(
+            errors(&mut c, "EXECABORT").await.as_deref(),
+            Some("count=1")
+        );
+
+        // In a script: the command it called failed, the script didn't.
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        let pcall = "redis.pcall('XGROUP', 'CREATECONSUMER', 's1', 'mygroup', 'consumer') return";
+        c.call(&["EVAL", pcall, "0"]).await;
+        assert_eq!(counts(&mut c, "xgroup|createconsumer").await, (1, 0, 1));
+        assert_eq!(counts(&mut c, "eval").await, (1, 0, 0));
+        c.call(&["EVAL", "a"]).await;
+        assert_eq!(counts(&mut c, "eval").await, (1, 1, 0));
+        assert_eq!(errors(&mut c, "ERR").await.as_deref(), Some("count=2"));
+        // A script's error that's its command's counts once, and fails the script.
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        c.call(&["EVAL", "return redis.call('select', 99)", "0"])
+            .await;
+        assert_eq!(counts(&mut c, "select").await, (1, 0, 1));
+        assert_eq!(counts(&mut c, "eval").await, (1, 0, 1));
+        assert_eq!(errors(&mut c, "ERR").await.as_deref(), Some("count=1"));
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        c.call(&["EVALSHA", "NotValidShaSUM", "0"]).await;
+        assert_eq!(counts(&mut c, "evalsha").await, (1, 0, 1));
+        assert_eq!(errors(&mut c, "NOSCRIPT").await.as_deref(), Some("count=1"));
+
+        // Out of memory: refused before it runs, as Redis has it.
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        c.call(&["CONFIG", "SET", "maxmemory", "1"]).await;
+        assert!(c.call(&["SET", "a", "b"]).await.starts_with("-OOM"));
+        c.call(&["CONFIG", "SET", "maxmemory", "0"]).await;
+        assert_eq!(counts(&mut c, "set").await, (0, 1, 0));
+        assert_eq!(errors(&mut c, "OOM").await.as_deref(), Some("count=1"));
+
+        // Blocked, then unblocked with an error.
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        let id = b.call(&["CLIENT", "ID"]).await;
+        let id = id[1..].trim().to_string();
+        b.send(&["BLPOP", "list", "0"]).await;
+        assert!(!b.has_reply().await);
+        c.call(&["CLIENT", "UNBLOCK", &id, "ERROR"]).await;
+        assert!(b.reply().await.starts_with("-UNBLOCKED"));
+        assert_eq!(counts(&mut c, "blpop").await, (1, 0, 1), "{mode:?}");
+        assert_eq!(
+            errors(&mut c, "UNBLOCKED").await.as_deref(),
+            Some("count=1")
+        );
+
+        // LATENCY HISTOGRAM (Redis' unit/latency-monitor).
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        let histogram = c.call(&["LATENCY", "HISTOGRAM"]).await;
+        assert!(
+            histogram.starts_with("*2\r\n$16\r\nconfig|resetstat\r\n*4\r\n$5\r\ncalls\r\n:1\r\n$14\r\nhistogram_usec\r\n*2\r\n:"),
+            "{histogram:?}"
+        );
+        c.call(&["SET", "a", "b"]).await;
+        c.call(&["SET", "c", "d"]).await;
+        let histogram = c.call(&["LATENCY", "HISTOGRAM", "set", "nothing"]).await;
+        assert!(
+            histogram.starts_with(
+                "*2\r\n$3\r\nset\r\n*4\r\n$5\r\ncalls\r\n:2\r\n$14\r\nhistogram_usec\r\n*"
+            ),
+            "{histogram:?}"
+        );
+        c.call(&["CLIENT", "ID"]).await;
+        c.call(&["CLIENT", "LIST"]).await;
+        let histogram = c.call(&["LATENCY", "HISTOGRAM", "client"]).await;
+        assert!(
+            histogram.starts_with("*4\r\n$9\r\nclient|id\r\n"),
+            "{histogram:?}"
+        );
+        assert!(
+            histogram.contains("$11\r\nclient|list\r\n"),
+            "{histogram:?}"
+        );
+        assert_eq!(c.call(&["LATENCY", "HISTOGRAM", "blabla"]).await, "*0\r\n");
+
+        // INFO latencystats, and what it's set by.
+        c.call(&["CONFIG", "RESETSTAT"]).await;
+        c.call(&["CONFIG", "SET", "latency-tracking", "no"]).await;
+        c.call(&["SET", "a", "b"]).await;
+        let latency = c.call(&["INFO", "latencystats"]).await;
+        assert!(
+            !latency.contains("latency_percentiles_usec_set:"),
+            "{latency}"
+        );
+        c.call(&["CONFIG", "SET", "latency-tracking", "yes"]).await;
+        c.call(&["SET", "a", "b"]).await;
+        let latency = c.call(&["INFO", "latencystats"]).await;
+        let set = info_field(&latency, "latency_percentiles_usec_set").expect("set's");
+        assert!(set.starts_with("p50=") && set.contains(",p99=") && set.contains(",p99.9="));
+        assert_eq!(
+            c.call(&[
+                "CONFIG",
+                "SET",
+                "latency-tracking-info-percentiles",
+                "0.0 50.0 100.0"
+            ])
+            .await,
+            "+OK\r\n"
+        );
+        assert_eq!(
+            c.call(&["CONFIG", "GET", "latency-tracking-info-percentiles"])
+                .await,
+            "*2\r\n$33\r\nlatency-tracking-info-percentiles\r\n$8\r\n0 50 100\r\n"
+        );
+        let latency = c.call(&["INFO", "latencystats"]).await;
+        let set = info_field(&latency, "latency_percentiles_usec_set").expect("set's");
+        assert!(set.starts_with("p0=") && set.contains(",p50=") && set.contains(",p100="));
+        assert_eq!(
+            c.call(&[
+                "CONFIG",
+                "SET",
+                "latency-tracking-info-percentiles",
+                "10.0 50.0 a"
+            ])
+            .await,
+            "-ERR CONFIG SET failed (possibly related to argument 'latency-tracking-info-percentiles') - Invalid latency-tracking-info-percentiles parameters\r\n"
+        );
+        assert_eq!(
+            c.call(&[
+                "CONFIG",
+                "SET",
+                "latency-tracking-info-percentiles",
+                "10.0 50.0 101.0"
+            ])
+            .await,
+            "-ERR CONFIG SET failed (possibly related to argument 'latency-tracking-info-percentiles') - latency-tracking-info-percentiles parameters should sit between [0.0,100.0]\r\n"
+        );
+    }
 }

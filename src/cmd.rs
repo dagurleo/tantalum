@@ -389,6 +389,9 @@ static COMMANDS: &[Command] = &[
 ];
 
 /// Runs one command and writes its reply to `out`. `args` must be non-empty.
+/// Inlined into its callers (`server::run`), so that the fast path needs no frame
+/// of its own and every other command makes only the one call it made before.
+#[inline(always)]
 pub fn execute(
     ctx: &Context,
     session: &mut Session,
@@ -396,23 +399,52 @@ pub fn execute(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    let name = args.get(0);
     session.commands += 1;
     // Most traffic: skip the table.
     if session.unrestricted {
+        let name = args.get(0);
         if args.len() == 2 && name.eq_ignore_ascii_case(b"GET") {
             return get(ctx, session, now, args, out);
         }
         if args.len() >= 3 && name.eq_ignore_ascii_case(b"SET") {
-            match ctx.aof() {
-                None => return set(ctx, session, now, args, out),
-                Some(aof) if !aof.failing() => {
-                    return logged(ctx, session, aof, set_command(), args, out);
-                }
-                Some(_) => {}
-            }
+            return match ctx.aof() {
+                None => set(ctx, session, now, args, out),
+                Some(_) => set_logged(ctx, session, now, args, out),
+            };
         }
-    } else if let Some(reply) = checked_first(ctx, session, now, args, out) {
+    }
+    execute_checked(ctx, session, now, args, out)
+}
+
+/// `SET` on the fast path, with the log on.
+#[inline(never)]
+fn set_logged(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    match ctx.aof() {
+        Some(aof) if !aof.failing() => logged(ctx, session, aof, set_command(), args, out),
+        _ => execute_checked(ctx, session, now, args, out),
+    }
+}
+
+/// [`execute`] past its fast path: out of line, so that `execute` stays small
+/// and its fast path saves no more registers than it uses.
+#[inline(never)]
+fn execute_checked(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    let name = args.get(0);
+    if !session.unrestricted
+        && let Some(reply) = checked_first(ctx, session, now, args, out)
+    {
         return reply;
     }
     // Checked in Redis' order: unknown command, arity, then authentication.
@@ -522,6 +554,10 @@ fn checked_first(
     {
         session.commands -= 1; // (counted as it runs)
         return Some(crate::tracking::execute(ctx, session, now, args, out));
+    }
+    if ctx.stats.is_on() && !crate::stats::counting() {
+        session.commands -= 1; // (counted as it runs)
+        return Some(crate::stats::execute(ctx, session, now, args, out));
     }
     if !matches!(session.reply, ReplyMode::On | ReplyMode::Passing) {
         return Some(silenced(ctx, session, now, args, out));
@@ -687,7 +723,7 @@ fn watched(
     let script = heard_first(ctx, session, command, args);
     let started = std::time::Instant::now();
     let reply = dispatch(ctx, session, now, command, args, out);
-    has_run(ctx, session, command, args, started, !script);
+    has_run(ctx, session, command, args, started, !script, None);
     reply
 }
 
@@ -716,8 +752,13 @@ fn watched_inside(
 ) -> Reply {
     let script = heard_first(ctx, session, command, args);
     let started = std::time::Instant::now();
+    let start = out.len();
     let reply = (command.run)(ctx, session, now, args, out);
-    has_run(ctx, session, command, args, started, !script);
+    let replied = match reply {
+        Reply::Bulk(_) => &[][..],
+        _ => &out[start..],
+    };
+    has_run(ctx, session, command, args, started, !script, Some(replied));
     reply
 }
 
@@ -729,8 +770,23 @@ fn has_run(
     args: &Args<'_>,
     started: std::time::Instant,
     tell_monitors: bool,
+    inner: Option<&[u8]>,
 ) {
-    let micros = started.elapsed().as_micros() as u64;
+    let nanos = started.elapsed().as_nanos() as u64;
+    let micros = nanos / 1000;
+    if ctx.stats.is_on()
+        && let Some(id) = stat_id(command, args)
+    {
+        let ran = crate::stats::Ran {
+            id,
+            nanos,
+            denyoom: command.flags.contains(&"denyoom"),
+            // Looked into only for an error (the caller's, for the command it runs).
+            turned_away: inner.is_some_and(|reply| reply.first() == Some(&b'-'))
+                && turned_away(command, args),
+        };
+        crate::stats::ran(ctx, ran, inner);
+    }
     if tell_monitors && ctx.monitoring() {
         let sub = (args.len() > 1).then(|| args.get(1));
         if !command_table::hidden(command.name, sub).from_monitor && !turned_away(command, args) {
@@ -953,6 +1009,42 @@ pub(crate) fn command_names() -> impl Iterator<Item = &'static str> {
     COMMANDS.iter().map(|command| command.name)
 }
 
+/// The id of the command `args` run, as `acl` numbers them (a subcommand's, for a
+/// container's), for command statistics: `None` if there's no such command.
+pub(crate) fn command_id(args: &Args<'_>) -> Option<u16> {
+    stat_id(find_command(args.get(0))?, args)
+}
+
+/// Whether Redis would have refused the command `args` run before running it, for
+/// its subcommand's arguments: for command statistics, which count it as rejected.
+pub(crate) fn turned_away_args(args: &Args<'_>) -> bool {
+    find_command(args.get(0)).is_some_and(|command| turned_away(command, args))
+}
+
+/// [`command_id`] for `command`, kept per command but for a container's subcommands.
+fn stat_id(command: &Command, args: &Args<'_>) -> Option<u16> {
+    const NONE: u16 = u16::MAX;
+    const CONTAINER: u16 = 1 << 15;
+    static IDS: OnceLock<Box<[u16]>> = OnceLock::new();
+    let ids = IDS.get_or_init(|| {
+        COMMANDS
+            .iter()
+            .map(|c| match crate::acl::base_id(c.name) {
+                Some((id, false)) => id,
+                Some((id, true)) => id | CONTAINER,
+                None => NONE,
+            })
+            .collect()
+    });
+    let at = (command as *const Command as usize).wrapping_sub(COMMANDS.as_ptr() as usize)
+        / std::mem::size_of::<Command>();
+    match ids.get(at).copied() {
+        Some(NONE) => None,
+        Some(id) if id & CONTAINER == 0 => Some(id),
+        _ => crate::acl::command_id(command.name, args),
+    }
+}
+
 /// The name of the write command called `name`, if it is one.
 pub(crate) fn find_write_command(name: &[u8]) -> Option<&'static str> {
     find_command(name)
@@ -970,24 +1062,60 @@ pub(crate) fn is_command(name: &[u8]) -> bool {
 
 /// The command called `name`, in any case. [`COMMANDS`] is split by name
 /// length and first letter, so this takes a comparison or two however many
-/// commands there are.
+/// commands there are: of a word holding the name's first 8 bytes, lowercased
+/// (and of the rest, for a longer name).
 fn find_command(name: &[u8]) -> Option<&'static Command> {
     const BUCKETS: usize = 32 * 32;
     // ASCII letters land in the same bucket in either case.
     let bucket =
         |name: &[u8]| name.len().min(31) * 32 + usize::from(name.first().map_or(0, |c| c & 31));
-    static INDEX: OnceLock<Vec<Vec<u16>>> = OnceLock::new();
+    static INDEX: OnceLock<Vec<Vec<(u64, u16)>>> = OnceLock::new();
     let index = INDEX.get_or_init(|| {
         let mut index = vec![Vec::new(); BUCKETS];
         for (i, c) in COMMANDS.iter().enumerate() {
-            index[bucket(c.name.as_bytes())].push(i as u16);
+            let name = c.name.as_bytes();
+            index[bucket(name)].push((name_word(name), i as u16));
         }
         index
     });
+    let word = name_word(name);
     index[bucket(name)]
         .iter()
-        .map(|&i| &COMMANDS[usize::from(i)])
-        .find(|c| name.eq_ignore_ascii_case(c.name.as_bytes()))
+        .filter(|&&(w, _)| w == word)
+        .map(|&(_, i)| &COMMANDS[usize::from(i)])
+        .find(|c| name.len() <= 8 || name[8..].eq_ignore_ascii_case(&c.name.as_bytes()[8..]))
+}
+
+/// A name's first 8 bytes in a word, as ASCII lowercase, zeros after a shorter
+/// one: for [`find_command`] to compare names a word at a time. (Bucketed by
+/// length, so names that differ only past 8 bytes, or in length, are told
+/// apart by the bytes after or the bucket.)
+#[inline]
+fn name_word(name: &[u8]) -> u64 {
+    let n = name.len();
+    // Overlapping loads cover every length without a loop or a copy.
+    let x = if n >= 8 {
+        u64::from_le_bytes(name[..8].try_into().expect("8 bytes"))
+    } else if n >= 4 {
+        let low = u64::from(u32::from_le_bytes(name[..4].try_into().expect("4 bytes")));
+        let high = u64::from(u32::from_le_bytes(
+            name[n - 4..].try_into().expect("4 bytes"),
+        ));
+        low | high << (8 * (n - 4))
+    } else if n >= 2 {
+        let low = u64::from(u16::from_le_bytes([name[0], name[1]]));
+        let high = u64::from(u16::from_le_bytes([name[n - 2], name[n - 1]]));
+        low | high << (8 * (n - 2))
+    } else {
+        name.first().map_or(0, |&b| u64::from(b))
+    };
+    // Adds 0x20 to each byte from 'A' to 'Z', eight at a time.
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let ascii = x & (0x7f * ONES);
+    let above_z = ascii + (0x7f - b'Z') as u64 * ONES;
+    let from_a = ascii + (0x80 - b'A') as u64 * ONES;
+    let upper = (from_a ^ above_z) & !x & (0x80 * ONES);
+    x | upper >> 2
 }
 
 /// [`Store::update_key`] for updates that need no memory, so can't fail.
@@ -2740,6 +2868,13 @@ fn info(
     // `commandstats` and `latencystats` only when asked for, as in Redis.
     let wants =
         |name: &str, default: bool| everything || (by_default && default) || named(name.as_bytes());
+    // Command statistics are counted once something asks for them.
+    let started =
+        (everything || named(b"commandstats") || named(b"errorstats") || named(b"latencystats"))
+            && ctx.stats.start(None);
+    if started {
+        ctx.update_special();
+    }
     let server = ctx.stats();
     let stats = ctx.store.stats();
     let peak = ctx.note_memory_peak().max(stats.used_memory);
@@ -2847,11 +2982,11 @@ fn info(
         let _ = write!(
             s,
             "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
-             rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
+             rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\nevicted_clients:0\r\n\
              keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
              pubsubshard_channels:{}\r\nmigrate_cached_sockets:{}\r\n\
              tracking_total_keys:{}\r\ntracking_total_items:{}\r\ntracking_total_prefixes:{}\r\n\
-             acl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
+             unexpected_error_replies:0\r\ntotal_error_replies:{}\r\nacl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
              acl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\nnative_scripts:{}\r\n\
              native_script_fallbacks:{}\r\n\r\n",
             server.total_connections,
@@ -2868,6 +3003,7 @@ fn info(
             tracked.0,
             tracked.1,
             tracked.2,
+            ctx.stats.total_errors(),
             denied[0],
             denied[1],
             denied[2],
@@ -2898,13 +3034,19 @@ fn info(
         s.push_str("# Modules\r\n\r\n");
     }
     if wants("commandstats", false) {
-        s.push_str("# Commandstats\r\n\r\n");
+        s.push_str("# Commandstats\r\n");
+        ctx.stats.commandstats(&mut s);
+        s.push_str("\r\n");
     }
     if wants("errorstats", true) {
-        s.push_str("# Errorstats\r\n\r\n");
+        s.push_str("# Errorstats\r\n");
+        ctx.stats.errorstats(&mut s);
+        s.push_str("\r\n");
     }
     if wants("latencystats", false) {
-        s.push_str("# Latencystats\r\n\r\n");
+        s.push_str("# Latencystats\r\n");
+        ctx.stats.latencystats(&mut s);
+        s.push_str("\r\n");
     }
     if wants("cluster", true) {
         s.push_str("# Cluster\r\ncluster_enabled:0\r\n\r\n");
@@ -2921,6 +3063,14 @@ fn info(
                 );
             }
         }
+    }
+    // It counts as having run, after its reply as in Redis.
+    if started && let Some(id) = command_id(args) {
+        ctx.stats.start_counted(id);
+    }
+    // Redis puts a blank line between sections, not after the last.
+    if s.ends_with("\r\n\r\n") {
+        s.truncate(s.len() - 2);
     }
     resp::write_verbatim_text(out, s.as_bytes(), session.resp3);
     Reply::Written
@@ -3048,6 +3198,85 @@ fn unknown_command(out: &mut Vec<u8>, args: &Args<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn statistics_ids_are_the_acl_tables() {
+        let args_of = |words: &[&str]| {
+            let mut buf = Vec::new();
+            let mut ranges = Vec::new();
+            for w in words {
+                ranges.push(buf.len()..buf.len() + w.len());
+                buf.extend_from_slice(w.as_bytes());
+            }
+            (buf, ranges)
+        };
+        let mut subcommands = 0;
+        for command in COMMANDS {
+            let (buf, ranges) = args_of(&[command.name]);
+            let args = Args::new(&buf, &ranges);
+            assert_eq!(
+                stat_id(command, &args),
+                crate::acl::command_id(command.name, &args)
+            );
+            let Some((id, true)) = crate::acl::base_id(command.name) else {
+                continue;
+            };
+            for &sub in crate::acl::subcommand_ids(id) {
+                let full = crate::acl::command_name(sub);
+                let (_, name) = full.split_once('|').unwrap();
+                let (buf, ranges) = args_of(&[command.name, &name.to_ascii_uppercase()]);
+                assert_eq!(
+                    stat_id(command, &Args::new(&buf, &ranges)),
+                    Some(sub),
+                    "{full}"
+                );
+                subcommands += 1;
+            }
+            let (buf, ranges) = args_of(&[command.name, "nope"]);
+            assert_eq!(stat_id(command, &Args::new(&buf, &ranges)), None);
+        }
+        assert!(subcommands > 100, "{subcommands}");
+    }
+
+    #[test]
+    fn every_command_is_found_in_any_case() {
+        for command in COMMANDS {
+            let name = command.name;
+            let found = |n: &str| find_command(n.as_bytes()).map(|c| c.name);
+            assert_eq!(found(name), Some(name));
+            assert_eq!(found(&name.to_ascii_uppercase()), Some(name));
+            let mixed: String = name
+                .chars()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i % 2 == 0 {
+                        c.to_ascii_uppercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            assert_eq!(found(&mixed), Some(name));
+            // A byte more or less, or a different last byte, is another name.
+            assert_ne!(found(&format!("{name}x")), Some(name));
+            assert_ne!(found(&name[..name.len() - 1]), Some(name));
+            let mut last = name.as_bytes().to_vec();
+            *last.last_mut().unwrap() ^= 1;
+            assert_ne!(find_command(&last).map(|c| c.name), Some(name));
+        }
+        for name in [
+            &b""[..],
+            b"g",
+            b"ge",
+            b"GE\xc5T",
+            b"get\0",
+            b"\xffget",
+            b"xreadgroupx",
+            b"georadius_rox",
+        ] {
+            assert!(find_command(name).is_none(), "{name:?}");
+        }
+    }
 
     #[test]
     fn cursors_parse_like_strtoul() {

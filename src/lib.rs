@@ -29,6 +29,7 @@ mod set;
 mod shard_lock;
 mod slowlog;
 pub mod snapshot;
+pub(crate) mod stats;
 pub mod store;
 mod stream;
 mod table;

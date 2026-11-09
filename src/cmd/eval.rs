@@ -230,19 +230,15 @@ fn refused_in_script(name: &str, flags: &[&str], args: &Args<'_>) -> bool {
     }
 }
 
-/// Runs one of a script's `redis.call`s (Redis' `scriptCall`) with its
-/// reply in `out`, returning whether it was a write command, or the error
-/// Lua raises instead.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn call_from_script(
+/// What refuses a script's `redis.call` before it runs, as Redis' `scriptCall`
+/// does: the error Lua raises, or the command.
+fn call_refused(
     ctx: &Context,
     session: &mut Session,
     caller: (u64, &str),
-    now: Millis,
     args: &Args<'_>,
     read_only: bool,
-    out: &mut Vec<u8>,
-) -> Result<bool, Cow<'static, str>> {
+) -> Result<&'static super::Command, Cow<'static, str>> {
     let Some(command) = find_command(args.get(0)) else {
         return Err("Unknown Redis command called from script".into());
     };
@@ -263,6 +259,28 @@ pub(crate) fn call_from_script(
     if read_only && (write || may_replicate) {
         return Err("Write commands are not allowed from read-only scripts.".into());
     }
+    Ok(command)
+}
+
+/// Runs one of a script's `redis.call`s (Redis' `scriptCall`) with its
+/// reply in `out`, returning whether it was a write command, or the error
+/// Lua raises instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn call_from_script(
+    ctx: &Context,
+    session: &mut Session,
+    caller: (u64, &str),
+    now: Millis,
+    args: &Args<'_>,
+    read_only: bool,
+    out: &mut Vec<u8>,
+) -> Result<bool, Cow<'static, str>> {
+    let refused = call_refused(ctx, session, caller, args, read_only);
+    if refused.is_err() && ctx.stats.is_on() {
+        crate::stats::refused_in_script(ctx, args);
+    }
+    let command = refused?;
+    let write = command.flags.contains(&"write");
     // The log can't be written: the write fails as a command's error would.
     if write && let Some(aof) = ctx.aof().filter(|aof| aof.failing()) {
         resp::write_error(out, aof.failure().as_bytes());

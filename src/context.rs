@@ -153,6 +153,8 @@ pub struct Context {
     pub(crate) migrate_sockets: crate::cmd::MigrateSockets,
     /// Clients caching what they read (`CLIENT TRACKING`).
     pub(crate) tracking: crate::tracking::Tracking,
+    /// Per-command statistics, once something's asked for them.
+    pub(crate) stats: crate::stats::Stats,
     /// Whether keys expire in the background, not only when read: `DEBUG
     /// SET-ACTIVE-EXPIRE` turns it off for tests.
     active_expire: AtomicBool,
@@ -176,6 +178,8 @@ pub struct Context {
     /// Who's running `MONITOR`.
     monitors: Mutex<Vec<Weak<Subscriber>>>,
     pause: Mutex<Option<Pause>>,
+    /// Whether `pause` holds one, so that the checked path's commands needn't lock it.
+    paused: AtomicBool,
     /// What `CONFIG SET` can change of [`Settings`].
     maxclients: AtomicUsize,
     /// In milliseconds, 0 for none.
@@ -213,6 +217,7 @@ impl Context {
             slowlog: SlowLog::default(),
             migrate_sockets: Default::default(),
             tracking: Default::default(),
+            stats: Default::default(),
             active_expire: AtomicBool::new(true),
             cron_paused: AtomicBool::new(false),
             latency: Latency::default(),
@@ -225,6 +230,7 @@ impl Context {
             monitoring: AtomicBool::new(false),
             monitors: Mutex::new(Vec::new()),
             pause: Mutex::new(None),
+            paused: AtomicBool::new(false),
             maxclients: AtomicUsize::new(settings.maxclients),
             timeout: AtomicU64::new(settings.timeout.map_or(0, |t| t.as_millis() as u64)),
             tcp_keepalive: AtomicU64::new(
@@ -402,7 +408,8 @@ impl Context {
         let on = !self.monitors.lock().is_empty()
             || self.pause.lock().is_some()
             || self.slowlog.needs_precise()
-            || self.latency.threshold() != 0;
+            || self.latency.threshold() != 0
+            || self.stats.is_on();
         if on {
             self.special.fetch_or(SPECIAL_ON, Relaxed);
         } else {
@@ -542,11 +549,14 @@ impl Context {
             until: Instant::now() + Duration::from_millis(millis),
             all,
         });
+        self.paused
+            .store(true, std::sync::atomic::Ordering::Release);
         self.update_special();
     }
 
     pub(crate) fn unpause_clients(&self) {
         *self.pause.lock() = None;
+        self.paused.store(false, Relaxed);
         self.update_special();
     }
 
@@ -572,12 +582,16 @@ impl Context {
     /// Whether clients are paused: `Some(true)` for every command, `Some(false)` for
     /// those that write. It's over by itself when the time's up.
     pub(crate) fn pause_mode(&self) -> Option<bool> {
+        if !self.paused.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
         let mut pause = self.pause.lock();
         let current = (*pause)?;
         if Instant::now() < current.until {
             return Some(current.all);
         }
         *pause = None;
+        self.paused.store(false, Relaxed);
         drop(pause);
         self.update_special();
         None
@@ -594,6 +608,7 @@ impl Context {
         self.rejected_connections.store(0, Relaxed);
         self.memory_peak.store(0, Relaxed);
         self.store.reset_stats();
+        self.stats.reset();
         // (Not the ACL counts, which Redis keeps too.)
     }
 
