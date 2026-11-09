@@ -2277,7 +2277,7 @@ fn watched_keys_change_when_they_expire_or_are_evicted() {
     assert_eq!(
         s.shards
             .iter()
-            .map(|sh| sh.inner.lock().watched.len())
+            .map(|sh| sh.inner.lock().watched.by_key.len())
             .sum::<usize>(),
         0
     );

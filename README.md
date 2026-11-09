@@ -144,10 +144,12 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `DEBUG POPULATE\|SLEEP\|ERROR\|OBJECT\|SET-ACTIVE-EXPIRE` | With `--enable-debug-command yes` or `local`, as in Redis |
 | `LOLWUT`, `MODULE LIST` | No modules |
 | `CLIENT PAUSE timeout [WRITE\|ALL]`, `CLIENT UNPAUSE` | Holds back what Redis holds back, for as long, and those it holds run after in order. Nothing expires by itself meanwhile |
-| `CLIENT UNBLOCK id [TIMEOUT\|ERROR]`, `CLIENT REPLY ON\|OFF\|SKIP`, `CLIENT NO-EVICT`, `CLIENT NO-TOUCH`, `CLIENT GETREDIR`, `CLIENT TRACKINGINFO` | `NO-EVICT` and `NO-TOUCH` are shown in the client list and do nothing else: clients aren't evicted, and keys hold no access times to protect |
+| `CLIENT UNBLOCK id [TIMEOUT\|ERROR]`, `CLIENT REPLY ON\|OFF\|SKIP`, `CLIENT NO-EVICT`, `CLIENT NO-TOUCH` | `NO-EVICT` and `NO-TOUCH` are shown in the client list and do nothing else: clients aren't evicted, and keys hold no access times to protect |
+| `CLIENT TRACKING ON\|OFF [REDIRECT id] [PREFIX prefix ...] [BCAST] [OPTIN] [OPTOUT] [NOLOOP]`, `CLIENT CACHING YES\|NO`, `CLIENT GETREDIR`, `CLIENT TRACKINGINFO` | Client-side caching, as Redis 7.2 has it: invalidations as RESP3 pushes, or as messages on `__redis__:invalidate` to the connection a RESP2 client redirects to; `BCAST` prefixes, `OPTIN`, `OPTOUT`, `NOLOOP`, a null after a flush, `tracking-table-max-keys`, and the `t`, `R` and `B` flags and `redir=` in the client list. The table is by database (see the design notes) |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
 | `BGREWRITEAOF` | With `--aof`: rewrites the log on another thread (a new base of the data as it is, and a new, empty log after it). Without `--aof` it's an error, where Redis would write a log anyway |
-| `INFO [section ...]`, `DBSIZE` | `INFO` gives the sections asked for, as Redis does, with the fields clients and monitoring tools read: `arch_bits`, `run_id`, `role`, `cluster_enabled`, `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line |
+| `INFO [section ...]`, `DBSIZE` | `INFO` gives the sections asked for, as Redis does, with the fields clients and monitoring tools read: `arch_bits`, `run_id`, `role`, `cluster_enabled`, `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `tracking_clients`,
+`tracking_total_keys`, `tracking_total_items`, `tracking_total_prefixes`, `evicted_keys`, `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line |
 | `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE channel\|pattern [...]`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `SUNSUBSCRIBE [...]` | Messages are pushes in RESP3. Subscribed in RESP2, a client may only run these, `PING`, `QUIT` and `RESET`, as in Redis. Shard channels are a namespace of their own (one server is one shard) |
 | `PUBLISH channel message`, `SPUBLISH` | Replies how many got it; a client subscribed both by channel and by pattern gets it twice. One publishing to its own channel gets the reply, then the message, as from Redis 7.2 |
 | `PUBSUB CHANNELS [pattern]\|NUMSUB [channel ...]\|NUMPAT\|SHARDCHANNELS\|SHARDNUMSUB\|HELP` | |
@@ -195,16 +197,16 @@ pass on Redis 7.2.4 and fail on Tantalum, by library (`bench/frameworks/results-
 
 | Suite | Pass on Redis | Lost on Tantalum |
 |---|---|---|
-| redis-py 7.4.0 | 2,357 | 3 |
+| redis-py 7.4.0 | 2,357 | 2 |
 | Predis 3.6.1 | 4,525 | 5 |
-| node-redis 6.3.1 | 1,486 | 27 |
+| node-redis 6.3.1 | 1,486 | 7 |
 | redis-rb 6.0.0 | 893 | 2 |
 | ioredis 5.11.0 | 566 | 0 |
-| phpredis 6.3.0 | 203 | 4 |
+| phpredis 6.3.0 | 203 | 3 |
 
-That's 41 of 10,530 (180 before users and ACLs came in 0.27.0, 99 before functions in 0.28.0,
-60 before `DUMP`, `RESTORE` and `MIGRATE` in 0.29.0), and 22 of them need something that isn't
-here: `CLIENT TRACKING`. The other 19 are listed under "Not there yet". `tools/admin-diff.py` compares the admin commands with
+That's 19 of 10,530 (180 before users and ACLs came in 0.27.0, 99 before functions in 0.28.0,
+60 before `DUMP`, `RESTORE` and `MIGRATE` in 0.29.0, 41 before client-side caching in 0.30.0),
+each listed under "Not there yet". `tools/admin-diff.py` compares the admin commands with
 Redis 7.2.4 directly: 3,373 commands and checks, every command's `COMMAND` entries and every
 setting among them, no differences.
 
@@ -598,6 +600,29 @@ setting among them, no differences.
   20 subscribers each got all of 4 publishers' 800 messages, every
   publisher's in order, in every I/O mode. Connections that never subscribe
   check one more flag per read; the speed guard saw no difference.
+- **Client-side caching** (`src/tracking.rs`): a tracking client's read leaves an entry
+  with the key, among the key's watchers in its shard, beside `WATCH`'s. A change, made
+  under the shard's lock, finds whom to tell as it finds `WATCH`'s watchers, so with nobody
+  tracking it costs a write nothing it didn't pay before: the one check for watchers
+  became one flag. The entry goes with the message, as in Redis, and the message goes to
+  the connection's outbox, pub/sub's (a connection has one outbox, for what it subscribes
+  to, `MONITOR` and tracking), so it follows the reply of the command that caused it, even
+  in a transaction or for a blocked command a writer serves. Redis remembers a command's
+  keys after it runs; here they're registered before, so that a change on another thread
+  between the read and the registration can't be missed, and a change the command makes
+  itself (a key that expires as it's read) doesn't count, as Redis wouldn't have registered
+  it yet. In `BCAST` mode every change is queued while some client broadcasts, and sent
+  after the command, a message a prefix, as Redis sends them once an event loop;
+  meanwhile every connection takes the checked path, whose commands look at that queue.
+  Tracking connections take it too, so `GET` and `SET`'s fast path is the same as ever.
+  `tools/tracking-diff.py` compares 563 replies with Redis 7.2.4 (Redis' own tracking
+  tests among them, as steps), no differences, and Redis' `unit/tracking` passes 57 of its
+  58 tests (the other evicts with `volatile-random`, which isn't here); `tests/tracking.rs`
+  replays the steps in every I/O mode and checks that a client caching reads while two
+  others write is never left with a stale value. Connections that don't track pay nothing:
+  their one outbox, which pub/sub and `MONITOR` use too, is now a single field to look at
+  where it was two (callgrind: 8 instructions fewer a batch in the epoll loop, 3 more in
+  `execute`; end to end within 0.3% of 0.29.0's instructions a command).
 - **Blocking commands** (`src/blocking.rs`): a `BLPOP` whose keys are all
   empty registers its client on each key, in the key's shard under its lock,
   and checks the keys once more, so a push in between isn't missed. A write
@@ -1315,9 +1340,8 @@ hit rates share the seeding flaw described above.
 
 ## Not there yet
 
-- **Missing, by how many client library tests need it** (see above; 41 of 10,530):
-  client-side caching with `CLIENT
-  TRACKING` (22), turning the log on with `CONFIG SET appendonly`
+- **Missing, by how many client library tests need it** (see above; 19 of 10,530):
+  turning the log on with `CONFIG SET appendonly`
   (5), `LATENCY HISTOGRAM` (5), `INFO commandstats` (3), `OBJECT IDLETIME` (2, one after `RESTORE`'s
   `IDLETIME`), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
@@ -1440,6 +1464,14 @@ hit rates share the seeding flaw described above.
   queueing when memory is over `maxmemory`; Tantalum queues it and the
   error is among `EXEC`'s replies. Queued commands aren't counted as client
   memory.
+- **Tracking gaps**: the table is by database, where Redis' is by key name only, so a
+  write to a key in one database doesn't tell clients that read a key of that name in
+  another (Redis does; their cached value wasn't stale). A connection that's redirected
+  to but has no outbox (it doesn't subscribe, track or monitor) hears once it next sends a
+  command: Redis' connections are all one thread's, and nothing here wakes an idle one
+  that's never had anything to hear. Which keys a full table (`tracking-table-max-keys`)
+  drops is a matter of chance in both, but not the same chance. A tracking client's BullMQ
+  scripts run in Lua, not natively, so that what they read is remembered.
 - **Pub/sub gaps**: no keyspace notifications, `CLIENT LIST` counts only
   the caller's subscriptions (it knows who is subscribed), and the output
   limit is fixed at Redis' defaults. The registry's

@@ -385,6 +385,29 @@ const WORDS: &[&[u8]] = &[
 
 /// A well-formed blocking command, or a write that may serve one, on a
 /// few keys: random arguments rarely line those up.
+/// Client-side caching on or off, in one of its modes, or what to cache next:
+/// the keys the other commands use are then tracked.
+fn tracking(rng: &mut Rng) -> Vec<Vec<u8>> {
+    const CHOICES: &[&[&[u8]]] = &[
+        &[b"CLIENT", b"TRACKING", b"on"],
+        &[b"CLIENT", b"TRACKING", b"on", b"NOLOOP"],
+        &[b"CLIENT", b"TRACKING", b"on", b"BCAST"],
+        &[b"CLIENT", b"TRACKING", b"on", b"BCAST", b"PREFIX", b"k"],
+        &[b"CLIENT", b"TRACKING", b"on", b"OPTIN"],
+        &[b"CLIENT", b"TRACKING", b"on", b"OPTOUT"],
+        &[b"CLIENT", b"TRACKING", b"off"],
+        &[b"CLIENT", b"CACHING", b"yes"],
+        &[b"CLIENT", b"CACHING", b"no"],
+        &[b"CLIENT", b"TRACKINGINFO"],
+        &[b"CONFIG", b"SET", b"tracking-table-max-keys", b"3"],
+        &[b"CONFIG", b"SET", b"tracking-table-max-keys", b"0"],
+        &[b"HELLO", b"3"],
+        &[b"HELLO", b"2"],
+    ];
+    let choice = CHOICES[rng.below(CHOICES.len())];
+    choice.iter().map(|arg| arg.to_vec()).collect()
+}
+
 fn blocking_or_serving(rng: &mut Rng) -> Vec<Vec<u8>> {
     const KEYS: &[&[u8]] = &[b"k", b"k1", b"k2"];
     let choice = rng.below(38);
@@ -541,7 +564,7 @@ fn count_replies(out: &[u8]) -> usize {
                 assert_eq!(&out[pos - 2..pos], b"\r\n", "bulk without CRLF");
             }
             b'$' => {}
-            b'*' | b'~' => pending += len().max(0) as usize,
+            b'*' | b'~' | b'>' => pending += len().max(0) as usize,
             b'%' => pending += 2 * len().max(0) as usize,
             other => panic!("bad reply type {:?}", other as char),
         }
@@ -612,6 +635,8 @@ fn random_commands_never_panic() {
                 ]
             } else if rng.below(20) == 0 {
                 vec![b"DUMP".to_vec(), random_arg(&mut rng)]
+            } else if rng.below(40) == 0 {
+                tracking(&mut rng)
             } else {
                 let mut args = vec![rng.pick(COMMANDS).to_vec()];
                 for _ in 0..rng.below(7) {

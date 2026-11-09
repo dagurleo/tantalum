@@ -73,11 +73,17 @@ const CLOCK_ASLEEP: u32 = 2;
 /// In [`Context::special`]: a script has run past `busy-reply-threshold`, so other
 /// connections' commands are refused with `-BUSY` but for a few, as in Redis.
 const SCRIPT_BUSY: u32 = 4;
+/// In [`Context::special`]: a client tracks in `BCAST` mode, so every connection takes
+/// the checked path, whose commands send it what they changed when they end.
+const BROADCASTING: u32 = 8;
 /// In [`Context::special`], counted in the bits above: users changed (`ACL SETUSER` and
-/// the like), so each connection takes up its user's new rules at its next batch.
-const USERS_CHANGED: u32 = 8;
+/// the like), or a connection was given an outbox, so each connection looks again at
+/// its user's rules and its outbox at its next batch.
+const USERS_CHANGED: u32 = 16;
 /// The flags in [`Context::special`] that put a connection on the watched path.
 const WATCHED: u32 = SPECIAL_ON | SCRIPT_BUSY;
+/// The flags that aren't a count.
+const FLAGS: u32 = USERS_CHANGED - 1;
 
 /// `--enable-debug-command`, as in Redis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,9 +151,12 @@ pub struct Context {
     pub(crate) latency: Latency,
     /// The connections `MIGRATE` keeps.
     pub(crate) migrate_sockets: crate::cmd::MigrateSockets,
+    /// Clients caching what they read (`CLIENT TRACKING`).
+    pub(crate) tracking: crate::tracking::Tracking,
     /// Whether keys expire in the background, not only when read: `DEBUG
     /// SET-ACTIVE-EXPIRE` turns it off for tests.
     active_expire: AtomicBool,
+    cron_paused: AtomicBool,
     /// `stream-node-max-entries` and `-bytes`, as streams read them.
     stream_node_entries: AtomicUsize,
     /// `hll-sparse-max-bytes`.
@@ -197,13 +206,15 @@ pub struct Context {
 impl Context {
     pub fn new(store: Arc<Store>, settings: Settings) -> Self {
         Context {
-            pubsub: Arc::new(PubSub::new(store.clone())),
+            pubsub: Arc::new(PubSub::new()),
             memory_peak: AtomicUsize::new(0),
             run_id: new_run_id(),
             config: ConfigTable::default(),
             slowlog: SlowLog::default(),
             migrate_sockets: Default::default(),
+            tracking: Default::default(),
             active_expire: AtomicBool::new(true),
+            cron_paused: AtomicBool::new(false),
             latency: Latency::default(),
             stream_node_entries: AtomicUsize::new(NodeLimits::default().entries),
             hll_sparse_max_bytes: AtomicUsize::new(3000),
@@ -270,15 +281,87 @@ impl Context {
             }
         }
         let state = state & !CLOCK_ASLEEP;
-        if state & !WATCHED != session.seen & !WATCHED {
+        if state & !FLAGS != session.seen & !FLAGS {
             self.take_up_user(session);
+            self.take_up_outbox(session);
         }
         session.seen = state;
         let special = state & WATCHED != 0;
         if special != session.special {
             session.special = special;
         }
+        session.broadcasting = state & BROADCASTING != 0;
         session.refresh();
+    }
+
+    /// Some client tracks in `BCAST` mode, or none does any more.
+    pub(crate) fn set_broadcasting(&self, on: bool) {
+        if on {
+            self.special.fetch_or(BROADCASTING, Relaxed);
+        } else {
+            self.special.fetch_and(!BROADCASTING, Relaxed);
+        }
+    }
+
+    /// The outbox another connection's tracking redirects to, if this one has
+    /// none yet, so that it hears what goes there.
+    fn take_up_outbox(&self, session: &mut Session) {
+        if session.handed.is_none()
+            && let Some(kept) = self
+                .clients
+                .lock()
+                .get(&session.id)
+                .and_then(|client| client.kept.clone())
+        {
+            kept.set_resp3(session.resp3);
+            session.handed = Some(kept);
+            session.refresh();
+        }
+    }
+
+    /// Whether connection `id` is open.
+    pub(crate) fn client_exists(&self, id: u64) -> bool {
+        self.clients.lock().contains_key(&id)
+    }
+
+    /// For tracking that redirects to connection `id`: its outbox, made if it
+    /// has none, and kept while it's connected. (Dead if it has gone.) A
+    /// connection given one takes it up at its next batch.
+    pub(crate) fn keep_outbox(&self, id: u64) -> Weak<Subscriber> {
+        let mut clients = self.clients.lock();
+        let Some(client) = clients.get_mut(&id) else {
+            return Weak::new();
+        };
+        if let Some(kept) = &client.kept {
+            return Arc::downgrade(kept);
+        }
+        let outbox = client.outbox.upgrade().unwrap_or_else(|| {
+            let outbox = Subscriber::alone(id, self.store.clone());
+            outbox.set_resp3(client.resp3);
+            client.outbox = Arc::downgrade(&outbox);
+            outbox
+        });
+        let weak = Arc::downgrade(&outbox);
+        client.kept = Some(outbox);
+        drop(clients);
+        // So that it takes it up.
+        self.special.fetch_add(USERS_CHANGED, Relaxed);
+        weak
+    }
+
+    /// A new outbox for connection `id`: the one kept for it, if there is one.
+    fn new_outbox(&self, id: u64, resp3: bool) -> Arc<Subscriber> {
+        let mut clients = self.clients.lock();
+        let client = clients.get_mut(&id);
+        let outbox = match client.as_ref().and_then(|c| c.kept.clone()) {
+            Some(kept) => kept,
+            None => Subscriber::alone(id, self.store.clone()),
+        };
+        outbox.set_resp3(resp3);
+        if let Some(client) = client {
+            client.outbox = Arc::downgrade(&outbox);
+        }
+        outbox
     }
 
     /// A script has run past `busy-reply-threshold` (or stopped, with `false`).
@@ -394,7 +477,7 @@ impl Context {
 
     /// Makes `session` a monitor.
     pub(crate) fn add_monitor(&self, session: &mut Session) {
-        let outbox = Subscriber::alone(session.id, self.store.clone());
+        let outbox = session.outbox(self);
         self.monitors.lock().push(Arc::downgrade(&outbox));
         session.monitor = Some(outbox);
         session.refresh();
@@ -474,6 +557,16 @@ impl Context {
 
     pub(crate) fn set_active_expire(&self, on: bool) {
         self.active_expire.store(on, Relaxed);
+    }
+
+    /// `DEBUG PAUSE-CRON`: whether what runs by itself (the background expiry)
+    /// is paused.
+    pub(crate) fn cron_paused(&self) -> bool {
+        self.cron_paused.load(Relaxed)
+    }
+
+    pub(crate) fn set_cron_paused(&self, paused: bool) {
+        self.cron_paused.store(paused, Relaxed);
     }
 
     /// Whether clients are paused: `Some(true)` for every command, `Some(false)` for
@@ -629,6 +722,9 @@ impl Context {
                     monitor: false,
                     last_command: None,
                     user: None,
+                    outbox: std::sync::Weak::new(),
+                    kept: None,
+                    tracker: None,
                 },
             );
         }
@@ -699,6 +795,7 @@ impl Context {
             .map(|(&id, _)| id)
             .collect();
         let me_too = picked.contains(&me);
+        let mut trackers = Vec::new();
         for id in &picked {
             if *id != me
                 && let Some(client) = clients.remove(id)
@@ -706,7 +803,13 @@ impl Context {
                 // SAFETY: as in `shutdown`.
                 unsafe { libc::shutdown(client.dup, libc::SHUT_RDWR) };
                 close(client.dup);
+                trackers.extend(client.tracker);
             }
+        }
+        drop(clients);
+        // They stop tracking at once, as in Redis.
+        for tracker in &trackers {
+            self.tracking.gone(self, tracker);
         }
         (picked.len(), me_too)
     }
@@ -969,6 +1072,11 @@ impl Client<'_> {
             misses: 0,
             socket: -1,
             seen: 0,
+            tracking: None,
+            reads_for: None,
+            handed: None,
+            broadcasting: false,
+            current_outbox: None,
         };
         session.refresh();
         session
@@ -993,8 +1101,12 @@ impl Client<'_> {
 impl Drop for Client<'_> {
     fn drop(&mut self) {
         self.report(0);
-        if let Some(client) = self.ctx.clients.lock().remove(&self.id) {
+        let gone = self.ctx.clients.lock().remove(&self.id);
+        if let Some(client) = gone {
             close(client.dup);
+            if let Some(tracker) = &client.tracker {
+                self.ctx.tracking.gone(self.ctx, tracker);
+            }
         }
         self.ctx.connected.fetch_sub(1, Relaxed);
     }
@@ -1021,6 +1133,13 @@ pub(crate) struct Registered {
     pub(crate) last_command: Option<&'static str>,
     /// The user it's authenticated as, if not `default`.
     pub(crate) user: Option<Box<[u8]>>,
+    /// Its outbox, if it has one (see [`Session::outbox`]).
+    outbox: Weak<Subscriber>,
+    /// The same, kept as long as it's connected, once another connection's
+    /// tracking redirects to it: what it hears goes there.
+    kept: Option<Arc<Subscriber>>,
+    /// Its tracking, once it has turned it on, for `CLIENT LIST`.
+    pub(crate) tracker: Option<Arc<crate::tracking::Tracker>>,
 }
 
 fn new_run_id() -> String {
@@ -1153,6 +1272,10 @@ fn client_line(
     if session.is_some_and(|s| s.multi.is_some()) || exec.is_some() {
         flags.push('x');
     }
+    let tracker = session
+        .and_then(|s| s.tracking.as_ref().map(|t| &t.tracker))
+        .or(client.tracker.as_ref());
+    let redir = tracker.map_or(-1, |t| t.list_flags(&mut flags));
     if session.is_some_and(|s| s.no_evict) {
         flags.push('e');
     }
@@ -1172,7 +1295,7 @@ fn client_line(
     let line = format!(
         "id={id} addr={} laddr={} fd={} name={} age={} idle=0 flags={flags} db={db} sub={} psub={} \
          ssub={} multi={multi} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 \
-         oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir=-1 resp={} lib-name={} \
+         oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir={redir} resp={} lib-name={} \
          lib-ver={}\n",
         peer,
         local,
@@ -1239,6 +1362,17 @@ pub struct Session {
     pub(crate) socket: RawFd,
     /// [`Context::special`] as it last saw it, but for the sleeping clock.
     pub(crate) seen: u32,
+    /// Its `CLIENT TRACKING`, once turned on.
+    pub(crate) tracking: Option<Box<crate::tracking::SessionTracking>>,
+    /// A script's: the tracking client its reads are remembered for.
+    pub(crate) reads_for: Option<Arc<crate::tracking::Tracker>>,
+    /// Its outbox, kept because another connection's tracking redirects to it.
+    pub(crate) handed: Option<Arc<Subscriber>>,
+    /// Some client tracks in `BCAST` mode (see [`BROADCASTING`]).
+    pub(crate) broadcasting: bool,
+    /// Its outbox while something uses it, of those above: what connections
+    /// look at once a batch (see [`Session::subscriber`]).
+    pub(crate) current_outbox: Option<Arc<Subscriber>>,
 }
 
 impl Session {
@@ -1278,6 +1412,11 @@ impl Session {
             misses: 0,
             socket: -1,
             seen: 0,
+            tracking: None,
+            reads_for: None,
+            handed: None,
+            broadcasting: false,
+            current_outbox: None,
         }
     }
 
@@ -1334,30 +1473,46 @@ impl Session {
         self.user.as_ref().map_or(b"default", |u| u.name())
     }
 
-    /// Recomputes `unrestricted` after what it depends on changed.
+    /// Recomputes `unrestricted` and the outbox after what they depend on changed.
     pub(crate) fn refresh(&mut self) {
+        self.update_outbox();
         self.unrestricted = self.authenticated
             && self.user.as_ref().is_none_or(|u| u.may_run_everything())
             && self.pubsub.is_none()
             && self.multi.is_none()
             && self.monitor.is_none()
             && !self.special
+            && !self.broadcasting
+            && !self.tracking.as_ref().is_some_and(|t| t.on)
             && matches!(self.reply, ReplyMode::On | ReplyMode::Passing);
     }
 
     pub(crate) fn set_resp3(&mut self, resp3: bool) {
         self.resp3 = resp3;
-        if let Some(subscriptions) = &self.pubsub {
-            subscriptions.set_resp3(resp3);
+        if let Some(outbox) = self.subscriber() {
+            outbox.set_resp3(resp3);
+        }
+    }
+
+    /// Its outbox: the one it has, or a new one. A connection has one at a
+    /// time, for what it subscribes to, `MONITOR` and `CLIENT TRACKING`, so
+    /// that what each sends goes out in order.
+    pub(crate) fn outbox(&self, ctx: &Context) -> Arc<Subscriber> {
+        match self.subscriber() {
+            Some(outbox) => outbox.clone(),
+            None => ctx.new_outbox(self.id, self.resp3),
         }
     }
 
     /// Its subscriptions, made on its first subscribe.
-    pub(crate) fn subscriptions(&mut self, pubsub: &Arc<PubSub>) -> &mut Subscriptions {
+    pub(crate) fn subscriptions(&mut self, ctx: &Context) -> &mut Subscriptions {
         self.unrestricted = false; // (as `refresh` would make it)
-        let (id, resp3) = (self.id, self.resp3);
-        self.pubsub
-            .get_or_insert_with(|| Box::new(Subscriptions::new(pubsub, id, resp3)))
+        if self.pubsub.is_none() {
+            let me = self.outbox(ctx);
+            self.pubsub = Some(Box::new(Subscriptions::new(&ctx.pubsub, me)));
+            self.update_outbox();
+        }
+        self.pubsub.as_deref_mut().expect("just made")
     }
 
     /// Leaves pub/sub once it's subscribed to nothing (or always, with
@@ -1380,10 +1535,20 @@ impl Session {
     }
 
     /// Its outbox while it's subscribed, for its connection to send.
+    #[inline]
     pub fn subscriber(&self) -> Option<&Arc<Subscriber>> {
-        self.pubsub
+        self.current_outbox.as_ref()
+    }
+
+    /// The outbox of what's using one (they share it): see [`Session::outbox`].
+    fn update_outbox(&mut self) {
+        self.current_outbox = self
+            .pubsub
             .as_deref()
             .map(Subscriptions::subscriber)
             .or(self.monitor.as_ref())
+            .or(self.tracking.as_ref().map(|t| &t.outbox))
+            .or(self.handed.as_ref())
+            .cloned();
     }
 }

@@ -259,6 +259,11 @@ impl Waiter {
             misses: 0,
             socket: -1,
             seen: 0,
+            tracking: None,
+            reads_for: None,
+            handed: None,
+            broadcasting: false,
+            current_outbox: None,
         };
         let args = Args::new(&self.buf, &self.ranges);
         (self.attempt)(ctx, &mut session, now, &args, out)
@@ -391,8 +396,9 @@ pub(crate) fn block(
         user: session.user.clone().filter(|u| !u.may_run_everything()),
         resp3: session.resp3,
         db: session.db,
-        // A subscriber's connection writes messages while it waits.
-        socket: if session.pubsub.is_none() {
+        // A connection with an outbox (a subscriber's, a tracking client's)
+        // writes messages while it waits, and its reply first.
+        socket: if session.subscriber().is_none() {
             session.socket
         } else {
             -1
@@ -494,6 +500,7 @@ pub(crate) fn unblock(ctx: &Context, id: u64, error: bool) -> bool {
 /// Serves the clients waiting on keys that got data. Commands call this
 /// after running when [`Store::has_ready`].
 pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
+    broadcast(ctx);
     while let Some((db, key)) = ctx.store.take_ready() {
         let store = ctx.store.db(db);
         let key = store.key(&key);
@@ -507,11 +514,17 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
             };
             let served = loop {
                 let mut out = Vec::new();
-                match claimed.waiter.run_again(ctx, now, &mut out) {
+                let client = claimed.waiter.client;
+                let (attempt, pushes) = crate::tracking::on_behalf_of(client, || {
+                    claimed.waiter.run_again(ctx, now, &mut out)
+                });
+                match attempt {
                     Attempt::Done => {
                         claimed.waiter.log(&out);
                         let rest = claimed.waiter.send_now(&out).to_vec();
                         claimed.serve(rest);
+                        // What it changed of what its client tracks, after its reply.
+                        crate::tracking::deliver(pushes);
                         break true;
                     }
                     // Another client took the data first.
@@ -530,6 +543,16 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
                 break; // the key is empty again
             }
         }
+    }
+    // What the served commands changed.
+    broadcast(ctx);
+}
+
+/// Sends the clients tracking in `BCAST` mode what changed.
+fn broadcast(ctx: &Context) {
+    let changed = ctx.store.take_broadcast();
+    if !changed.is_empty() {
+        ctx.tracking.broadcast(changed);
     }
 }
 
@@ -563,6 +586,12 @@ impl Blocked {
                 Poll::Pending
             }
         })
+    }
+
+    /// Whether it has been served: its reply goes before messages that came
+    /// meanwhile, which the command may have caused.
+    pub fn is_served(&self) -> bool {
+        self.waiter.state.load(Ordering::Acquire) == SERVED
     }
 
     /// Ends the wait, served or timed out: writes its reply.

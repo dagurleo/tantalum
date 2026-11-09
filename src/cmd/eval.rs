@@ -94,6 +94,8 @@ fn run(
         && ctx.settings.native_scripts
         && !watched
         && !checked
+        // A tracking client's reads are its script's calls: Lua makes them.
+        && !session.tracking.as_ref().is_some_and(|t| t.on)
         && !crate::shard_lock::in_transaction();
     if native
         && ctx
@@ -267,6 +269,9 @@ pub(crate) fn call_from_script(
         return Ok(false);
     }
     session.commands += 1;
+    if session.reads_for.is_some() {
+        crate::tracking::before(ctx, session, command.name, args, true);
+    }
     let start = out.len();
     let reply = if session.special {
         super::watched_inside(ctx, session, now, command, args, out)

@@ -131,6 +131,9 @@ pub(super) fn exec(
             {
                 continue;
             }
+            if session.tracking.as_ref().is_some_and(|t| t.on) {
+                crate::tracking::before(ctx, session, command.name, &args, true);
+            }
             let reply = if session.special {
                 super::watched_inside(ctx, session, now, command, &args, out)
             } else {

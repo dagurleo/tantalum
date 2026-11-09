@@ -412,17 +412,8 @@ pub fn execute(
                 Some(_) => {}
             }
         }
-    } else {
-        if !matches!(session.reply, ReplyMode::On | ReplyMode::Passing) {
-            return silenced(ctx, session, now, args, out);
-        }
-        if let Some(subscriber) = session.subscriber()
-            && !subscriber.take(out)
-        {
-            // Messages that came before this command go out first; this
-            // client is over its output limit.
-            return Reply::Close;
-        }
+    } else if let Some(reply) = checked_first(ctx, session, now, args, out) {
+        return reply;
     }
     // Checked in Redis' order: unknown command, arity, then authentication.
     let Some(command) = find_command(name) else {
@@ -503,11 +494,45 @@ pub fn execute(
             }
             return Reply::Written;
         }
+        if session.tracking.as_ref().is_some_and(|t| t.on) {
+            crate::tracking::before(ctx, session, command.name, args, false);
+        }
         if session.special {
             return watched(ctx, session, now, command, args, out);
         }
     }
     dispatch(ctx, session, now, command, args, out)
+}
+
+/// What the checked path sees to before a command: a tracking client's runs as
+/// one (`tracking::execute`), one with `CLIENT REPLY OFF` or `SKIP` is silenced,
+/// and messages that came before it go out first. `None` to go on. (Out of
+/// `execute`, which stays small for the fast path.)
+#[inline(never)]
+fn checked_first(
+    ctx: &Context,
+    session: &mut Session,
+    now: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Option<Reply> {
+    if let Some(tracking) = &session.tracking
+        && tracking.on
+        && !tracking.busy
+    {
+        session.commands -= 1; // (counted as it runs)
+        return Some(crate::tracking::execute(ctx, session, now, args, out));
+    }
+    if !matches!(session.reply, ReplyMode::On | ReplyMode::Passing) {
+        return Some(silenced(ctx, session, now, args, out));
+    }
+    if let Some(subscriber) = session.subscriber()
+        && !subscriber.take(out)
+    {
+        // This client is over its output limit.
+        return Some(Reply::Close);
+    }
+    None
 }
 
 /// What runs while a script has run too long (Redis' `allow_busy` flag).
@@ -815,7 +840,7 @@ pub fn spawn_expirer(
                 let Some(ctx) = ctx.upgrade() else { break };
                 let now = ctx.store.now();
                 // As in Redis, what's paused doesn't change by itself meanwhile.
-                if ctx.pause_mode().is_none() && ctx.active_expire() {
+                if ctx.pause_mode().is_none() && ctx.active_expire() && !ctx.cron_paused() {
                     for db in ctx.store.live() {
                         db.expire_cycle(now);
                     }
@@ -1700,6 +1725,7 @@ fn flush(
     } else {
         ctx.db(session).clear();
     }
+    ctx.tracking.flushed(ctx);
     out.extend_from_slice(resp::OK);
     Reply::Written
 }
@@ -2138,20 +2164,23 @@ fn client(
                 out.extend_from_slice(resp::OK);
             }
         }
+    } else if is(b"TRACKING") {
+        if args.len() < 3 {
+            wrong_arity(out, "client|tracking");
+        } else {
+            crate::tracking::client_tracking(ctx, session, args, out);
+        }
+    } else if is(b"CACHING") {
+        if arity(3, "caching", out) {
+            crate::tracking::client_caching(session, args, out);
+        }
     } else if is(b"GETREDIR") {
         if arity(2, "getredir", out) {
-            resp::write_integer(out, -1);
+            crate::tracking::client_getredir(session, out);
         }
     } else if is(b"TRACKINGINFO") {
         if arity(2, "trackinginfo", out) {
-            resp::write_map_header(out, 3, session.resp3);
-            resp::write_bulk(out, b"flags");
-            resp::write_set_header(out, 1, session.resp3);
-            resp::write_bulk(out, b"off");
-            resp::write_bulk(out, b"redirect");
-            resp::write_integer(out, -1);
-            resp::write_bulk(out, b"prefixes");
-            resp::write_array_header(out, 0);
+            crate::tracking::client_trackinginfo(session, out);
         }
     } else {
         unknown_subcommand(out, sub, "CLIENT");
@@ -2735,10 +2764,11 @@ fn info(
         let _ = write!(
             s,
             "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\n\
-             tracking_clients:0\r\n\r\n",
+             tracking_clients:{}\r\n\r\n",
             server.connected_clients,
             ctx.maxclients(),
             ctx.store.blocked_clients(),
+            ctx.tracking.clients(),
         );
     }
     if wants("memory", true) {
@@ -2813,12 +2843,14 @@ fn info(
     }
     if wants("stats", true) {
         let denied = ctx.acl.denied();
+        let tracked = ctx.tracking.totals();
         let _ = write!(
             s,
             "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
              rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\n\
              keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
              pubsubshard_channels:{}\r\nmigrate_cached_sockets:{}\r\n\
+             tracking_total_keys:{}\r\ntracking_total_items:{}\r\ntracking_total_prefixes:{}\r\n\
              acl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
              acl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\nnative_scripts:{}\r\n\
              native_script_fallbacks:{}\r\n\r\n",
@@ -2833,6 +2865,9 @@ fn info(
             ctx.pubsub.pattern_count(),
             ctx.pubsub.channel_count(true),
             ctx.migrate_sockets.count(),
+            tracked.0,
+            tracked.1,
+            tracked.2,
             denied[0],
             denied[1],
             denied[2],

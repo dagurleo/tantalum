@@ -629,6 +629,9 @@ async fn wait_blocked_uring(
             }
             () = messages_ready(subscriber, Some(mailbox)) => messages_came = true,
         }
+        if messages_came && blocked.is_served() {
+            return (Ok(true), rbuf); // its reply first
+        }
         if let (true, Some(subscriber)) = (messages_came, subscriber) {
             let mut messages = Vec::new();
             if !subscriber.take(&mut messages) {
@@ -1495,6 +1498,9 @@ async fn wait_blocked(
                 }
             }
             () = messages_ready(subscriber, None) => {
+                if blocked.is_served() {
+                    return Ok(true); // its reply first
+                }
                 if !subscriber.is_some_and(|s| s.take(&mut messages))
                     || !send_unless_closed(socket, &messages, subscriber).await?
                 {

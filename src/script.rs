@@ -289,6 +289,7 @@ impl Scripting {
                 db: caller.db,
                 special: caller.special,
                 user: caller.user.clone(),
+                reads_for: caller.tracking.as_ref().and_then(|t| t.for_script()),
                 ..Session::for_script()
             },
             caller: (caller.id, command),
@@ -561,6 +562,7 @@ impl Scripting {
                 db: caller.db,
                 special: caller.special,
                 user: caller.user.clone(),
+                reads_for: caller.tracking.as_ref().and_then(|t| t.for_script()),
                 ..Session::for_script()
             },
             caller: (caller.id, command),

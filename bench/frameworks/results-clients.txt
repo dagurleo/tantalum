@@ -1,4 +1,4 @@
-Client libraries' own test suites on Tantalum 0.29.0, 2026-11-09, against Redis 7.2.4 as the control.
+Client libraries' own test suites on Tantalum 0.30.0, 2026-11-09, against Redis 7.2.4 as the control.
 
 redis-py 7.4.0 (sync and asyncio; no cluster, modules, TLS, replicas or cloud), Predis 3.6.1 (phpunit's
 default groups), redis-rb 6.0.0 (redis and distributed), ioredis 5.11.0 (unit and functional), phpredis 6.3.0
@@ -8,9 +8,8 @@ and sentinels up first. A test counts as lost when it passes on Redis and fails 
 
 Lost tests by the feature they need, sorted by the name or error each one failed on, so roughly:
 
-suite totals: {'redis-py': (3, 2357), 'predis': (5, 4525), 'redis-rb': (2, 893), 'ioredis': (0, 566), 'phpredis': (4, 203), 'node-redis': (27, 1486)}
+suite totals: {'redis-py': (2, 2357), 'predis': (5, 4525), 'redis-rb': (2, 893), 'ioredis': (0, 566), 'phpredis': (3, 203), 'node-redis': (7, 1486)}
                                                       redis-py    predis  redis-rb   ioredis  phpredis node-redi    all
-Client-side caching (TRACKING)                               1                                       1        20     22
 CONFIG SET / RESETSTAT / more CONFIG GET                               5                             1                6
 LATENCY                                                                                                        5      5
 INFO commandstats and fields                                                     2                                    2
@@ -20,8 +19,7 @@ COMMAND GETKEYS, DOCS, full table                            1                  
 DUMP / RESTORE / MIGRATE                                                                             1                1
 OBJECT IDLETIME                                                                                      1                1
 
-That's 41 of 10,530, and 22 of them need the first: something that isn't here. Each of the other 19 was
-read: WAITAOF's (5) turn the log on with CONFIG SET appendonly, which needs --aof at the start here;
+That's 19 of 10,530, each read: WAITAOF's (5) turn the log on with CONFIG SET appendonly, which needs --aof at the start here;
 LATENCY HISTOGRAM (5) and INFO commandstats (3, counting phpredis' testConfig) need per-command statistics, which
 would cost every command, so they wait for a measurement; BGSAVE and BGREWRITEAOF (3) refuse without --snapshot or
 --aof, where Redis saves to its default; COMMAND LIST (1) expects over 300 commands, and there are 231;
@@ -38,6 +36,11 @@ Tantalum but for --requirepass and --enable-debug-command.
 Besides these suites, tools/admin-diff.py sends 3,373 commands and checks to Redis 7.2.4 and to Tantalum, with no
 differences: every command's COMMAND INFO and DOCS in both protocols, every setting's default, what each setting says
 to bad values, `~` trims with nodes of other sizes, the latency monitor, MONITOR's lines and SLOWLOG's entries.
+
+== Before: 0.29.0, 41 of 10,530 lost
+
+Client-side caching, CLIENT TRACKING (22: redis-py 1, phpredis 1, node-redis 20, its client-side cache and a pool
+test), was what's now gone; the rest is as above.
 
 == Before: 0.28.0, 60 of 10,530 lost
 

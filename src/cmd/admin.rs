@@ -395,6 +395,7 @@ fn apply(ctx: &Context, name: &str, value: &str) {
         "stream-node-max-entries" => ctx.set_stream_node_entries(number().max(0) as usize),
         "stream-node-max-bytes" => ctx.set_stream_node_bytes(number().max(0) as usize),
         "hll-sparse-max-bytes" => ctx.set_hll_sparse_max_bytes(number().max(0) as usize),
+        "tracking-table-max-keys" => ctx.tracking.set_max_keys(ctx, number().max(0) as u64),
         "acllog-max-len" => ctx.acl.set_log_max(number().max(0) as usize),
         "busy-reply-threshold" | "lua-time-limit" => {
             ctx.scripting.set_busy_threshold(number().max(0) as u64)
@@ -942,7 +943,7 @@ pub(super) fn debug(
             ),
             None => resp::write_error(out, b"ERR no such key"),
         }
-    } else if is(b"SET-ACTIVE-EXPIRE") && args.len() == 3 {
+    } else if (is(b"SET-ACTIVE-EXPIRE") || is(b"PAUSE-CRON")) && args.len() == 3 {
         // `atoi`, as Redis reads it: anything but a number is 0.
         let on = std::str::from_utf8(args.get(2))
             .ok()
@@ -955,7 +956,12 @@ pub(super) fn debug(
                 s[..end].parse::<i64>().ok()
             })
             .is_some_and(|n| n != 0);
-        ctx.set_active_expire(on);
+        if is(b"PAUSE-CRON") {
+            // What runs by itself here is the background expiry.
+            ctx.set_cron_paused(on);
+        } else {
+            ctx.set_active_expire(on);
+        }
         out.extend_from_slice(resp::OK);
     } else if is(b"HELP") && args.len() == 2 {
         help(
@@ -970,6 +976,8 @@ pub(super) fn debug(
                 "    Setting it to 0 disables expiring keys in background when they are not",
                 "    accessed (otherwise the Redis behavior). Setting it to 1 reenables back the",
                 "    default.",
+                "PAUSE-CRON <0|1>",
+                "    Stop periodic cron job processing.",
                 "SLEEP <seconds>",
                 "    Stop the server for <seconds>.",
                 "ERROR <string>",
