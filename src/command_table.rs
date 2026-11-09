@@ -785,7 +785,11 @@ impl KeySpecs {
                         return;
                     };
                     let first = first + first_key;
-                    (first, first + numkeys - 1, step)
+                    // A count past the arguments (even past an i64) means none.
+                    let Some(last) = first.checked_add(numkeys - 1) else {
+                        return;
+                    };
+                    (first, last, step)
                 }
                 Find::Unknown => return,
             };
