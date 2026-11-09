@@ -57,7 +57,6 @@ pub struct PubSub {
     patterns: RwLock<Registry>,
     /// How many patterns have subscribers, so `PUBLISH` can skip the lock.
     pattern_count: AtomicUsize,
-    store: Arc<Store>,
 }
 
 /// Channels and their subscribers, sharded by channel.
@@ -176,15 +175,20 @@ fn body(channel: &[u8], message: &[u8]) -> Vec<u8> {
     body
 }
 
-impl PubSub {
-    pub fn new(store: Arc<Store>) -> Self {
+impl Default for PubSub {
+    fn default() -> Self {
         PubSub {
             channels: Channels::new(),
             shard_channels: Channels::new(),
             patterns: RwLock::default(),
             pattern_count: AtomicUsize::new(0),
-            store,
         }
+    }
+}
+
+impl PubSub {
+    pub fn new() -> Self {
+        PubSub::default()
     }
 
     /// `PUBLISH`: sends `message` to the channel's subscribers and to those
@@ -290,6 +294,9 @@ pub struct Subscriber {
     id: u64,
     /// The protocol its messages are written in, which `HELLO` can change.
     resp3: AtomicBool,
+    /// Whether its connection is subscribed to something: then a RESP2
+    /// connection hears of tracked keys as messages (see `tracking.rs`).
+    subscribed: AtomicBool,
     outbox: Mutex<Outbox>,
     store: Arc<Store>,
 }
@@ -308,14 +315,39 @@ struct Outbox {
 }
 
 impl Subscriber {
-    /// An outbox with no subscriptions, for `MONITOR`.
+    /// An outbox with no subscriptions yet: a connection's one outbox, for
+    /// what it subscribes to, `MONITOR` and `CLIENT TRACKING`.
     pub(crate) fn alone(id: u64, store: Arc<Store>) -> Arc<Subscriber> {
         Arc::new(Subscriber {
             id,
             resp3: AtomicBool::new(false),
+            subscribed: AtomicBool::new(false),
             outbox: Mutex::default(),
             store,
         })
+    }
+
+    pub(crate) fn is_resp3(&self) -> bool {
+        self.resp3.load(Relaxed)
+    }
+
+    pub(crate) fn set_resp3(&self, resp3: bool) {
+        self.resp3.store(resp3, Relaxed);
+    }
+
+    pub(crate) fn is_subscribed(&self) -> bool {
+        self.subscribed.load(Relaxed)
+    }
+
+    /// Puts a message in the outbox: `header`, then `body`.
+    pub(crate) fn push(&self, header: &[u8], body: &[u8]) {
+        self.deliver(
+            &Kind {
+                resp2: header,
+                resp3: header,
+            },
+            body,
+        );
     }
 
     /// Puts bytes in the outbox as they are.
@@ -453,15 +485,12 @@ pub(crate) enum To {
 }
 
 impl Subscriptions {
-    pub(crate) fn new(pubsub: &Arc<PubSub>, id: u64, resp3: bool) -> Self {
+    /// Subscriptions whose messages go to `me`, the connection's outbox.
+    pub(crate) fn new(pubsub: &Arc<PubSub>, me: Arc<Subscriber>) -> Self {
+        me.subscribed.store(true, Relaxed);
         Subscriptions {
             pubsub: pubsub.clone(),
-            me: Arc::new(Subscriber {
-                id,
-                resp3: AtomicBool::new(resp3),
-                outbox: Mutex::default(),
-                store: pubsub.store.clone(),
-            }),
+            me,
             channels: HashSet::default(),
             patterns: HashSet::default(),
             shard_channels: HashSet::default(),
@@ -470,10 +499,6 @@ impl Subscriptions {
 
     pub fn subscriber(&self) -> &Arc<Subscriber> {
         &self.me
-    }
-
-    pub(crate) fn set_resp3(&self, resp3: bool) {
-        self.me.resp3.store(resp3, Relaxed);
     }
 
     fn set(&mut self, to: To) -> &mut HashSet<Box<[u8]>, Hasher> {
@@ -548,6 +573,7 @@ impl Drop for Subscriptions {
                 self.remove(to, &name);
             }
         }
+        self.me.subscribed.store(false, Relaxed);
     }
 }
 
@@ -555,9 +581,20 @@ impl Drop for Subscriptions {
 mod tests {
     use super::*;
 
+    fn subscriptions(
+        store: &Arc<Store>,
+        pubsub: &Arc<PubSub>,
+        id: u64,
+        resp3: bool,
+    ) -> Subscriptions {
+        let me = Subscriber::alone(id, store.clone());
+        me.set_resp3(resp3);
+        Subscriptions::new(pubsub, me)
+    }
+
     fn setup() -> (Arc<Store>, Arc<PubSub>) {
         let store = Arc::new(Store::new(4));
-        let pubsub = Arc::new(PubSub::new(store.clone()));
+        let pubsub = Arc::new(PubSub::new());
         (store, pubsub)
     }
 
@@ -569,9 +606,9 @@ mod tests {
 
     #[test]
     fn publishing_counts_and_reaches_the_right_subscribers() {
-        let (_, pubsub) = setup();
-        let mut a = Subscriptions::new(&pubsub, 1, false);
-        let mut b = Subscriptions::new(&pubsub, 2, true);
+        let (store, pubsub) = setup();
+        let mut a = subscriptions(&store, &pubsub, 1, false);
+        let mut b = subscriptions(&store, &pubsub, 2, true);
         a.add(To::Channels, b"news");
         a.add(To::Patterns, b"n*");
         b.add(To::ShardChannels, b"news");
@@ -619,7 +656,7 @@ mod tests {
     #[test]
     fn a_subscriber_over_its_limit_is_cut_off_and_its_memory_given_back() {
         let (store, pubsub) = setup();
-        let mut a = Subscriptions::new(&pubsub, 1, false);
+        let mut a = subscriptions(&store, &pubsub, 1, false);
         a.add(To::Channels, b"c");
         let big = vec![b'x'; 1 << 20];
         for _ in 0..4 {

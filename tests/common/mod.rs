@@ -164,7 +164,12 @@ pub const MODES: [Mode; 3] = [Mode::Shared, Mode::PerThread, Mode::Uring];
 
 /// A server in `mode` on two threads, and its context.
 pub async fn start(mode: Mode) -> (SocketAddr, Arc<Context>) {
-    let ctx = Arc::new(Context::new(Arc::new(Store::new(16)), Settings::default()));
+    start_with(mode, Settings::default()).await
+}
+
+/// [`start`], with these settings.
+pub async fn start_with(mode: Mode, settings: Settings) -> (SocketAddr, Arc<Context>) {
+    let ctx = Arc::new(Context::new(Arc::new(Store::new(16)), settings));
     let addr = match mode {
         Mode::Shared => {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -257,7 +262,7 @@ pub async fn read_reply(r: &mut BufReader<TcpStream>) -> Vec<u8> {
             .unwrap()
     };
     match line[0] {
-        b'$' if n() >= 0 => {
+        b'$' | b'=' | b'!' if n() >= 0 => {
             let mut body = vec![0; n() as usize + 2];
             r.read_exact(&mut body).await.unwrap();
             line.extend_from_slice(&body);
@@ -309,10 +314,40 @@ pub enum Step {
 pub struct Connections {
     addr: SocketAddr,
     open: HashMap<usize, BufReader<TcpStream>>,
+    /// Each connection's id, as its last `CLIENT ID` replied, for `{id:N}`.
+    ids: HashMap<usize, Vec<u8>>,
 }
 
 impl Connections {
+    /// Runs `args` on connection N and returns the reply. `READ` reads one
+    /// without sending anything, `SEND ...` sends without reading, and
+    /// `{id:N}` stands for connection N's id (see `tools/tracking-diff.py`).
     pub async fn call(&mut self, n: usize, args: &[&[u8]]) -> Vec<u8> {
+        let args: Vec<Vec<u8>> = args
+            .iter()
+            .map(|a| {
+                let id = a
+                    .strip_prefix(b"{id:")
+                    .and_then(|rest| rest.strip_suffix(b"}"))
+                    .and_then(|n| std::str::from_utf8(n).ok()?.parse::<usize>().ok());
+                match id {
+                    Some(id) => self.ids.get(&id).cloned().unwrap_or(b"?".to_vec()),
+                    None => a.to_vec(),
+                }
+            })
+            .collect();
+        let args: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+        let reply = self.call_as_is(n, &args).await;
+        let client_id = args.len() == 2
+            && args[0].eq_ignore_ascii_case(b"CLIENT")
+            && args[1].eq_ignore_ascii_case(b"ID");
+        if client_id && reply.starts_with(b":") {
+            self.ids.insert(n, reply[1..reply.len() - 2].to_vec());
+        }
+        reply
+    }
+
+    async fn call_as_is(&mut self, n: usize, args: &[&[u8]]) -> Vec<u8> {
         if !self.open.contains_key(&n) {
             // (A server may still be coming up.)
             let mut stream = None;
@@ -328,6 +363,10 @@ impl Connections {
             self.open.insert(n, BufReader::new(stream));
         }
         let conn = self.open.get_mut(&n).expect("open");
+        if args.first() == Some(&&b"SEND"[..]) {
+            conn.get_mut().write_all(&req(&args[1..])).await.unwrap();
+            return b"<sent>".to_vec();
+        }
         let read_only = args == [b"READ"];
         if !read_only && conn.get_mut().write_all(&req(args)).await.is_err() {
             self.open.remove(&n);
@@ -341,6 +380,7 @@ impl Connections {
         };
         if closed {
             self.open.remove(&n);
+            self.ids.remove(&n);
             return b"<closed>".to_vec();
         }
         read_reply(conn).await
@@ -348,6 +388,7 @@ impl Connections {
 
     pub async fn reset(&mut self, extra: &[&[&[u8]]]) {
         self.open.clear();
+        self.ids.clear();
         let users = self.call(0, &[b"ACL", b"USERS"]).await;
         let text = String::from_utf8(users).unwrap();
         for name in text
@@ -391,9 +432,29 @@ fn shown(bytes: &[u8]) -> String {
 /// commands a reset sends too.
 pub async fn replay_steps(steps: &[Step], extra: &[&[&[u8]]], mode: Mode) {
     let (addr, _ctx) = start(mode).await;
+    run_steps(addr, steps, extra, mode).await;
+}
+
+/// [`replay_steps`] on a server as `tantalum --enable-debug-command yes` is: keys
+/// expire in the background, and `DEBUG` runs.
+pub async fn replay_steps_expiring(steps: &[Step], extra: &[&[&[u8]]], mode: Mode) {
+    let settings = Settings {
+        debug_command: tantalum::context::DebugCommand::Yes,
+        ..Settings::default()
+    };
+    let (addr, ctx) = start_with(mode, settings).await;
+    std::mem::forget(tantalum::cmd::spawn_expirer(
+        &ctx,
+        Duration::from_millis(100),
+    ));
+    run_steps(addr, steps, extra, mode).await;
+}
+
+async fn run_steps(addr: SocketAddr, steps: &[Step], extra: &[&[&[u8]]], mode: Mode) {
     let mut conns = Connections {
         addr,
         open: HashMap::new(),
+        ids: HashMap::new(),
     };
     for (i, step) in steps.iter().enumerate() {
         match step {

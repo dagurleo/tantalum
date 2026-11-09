@@ -599,20 +599,159 @@ struct ShardInner {
     sweep_cursor: usize,
     /// Clients blocked on keys of this shard, by key, first come first.
     waiting: HashMap<Box<[u8]>, VecDeque<Arc<Waiter>>, foldhash::fast::RandomState>,
-    /// Clients watching keys of this shard (`WATCH`), by key.
-    watched: HashMap<Box<[u8]>, Vec<Watcher>, foldhash::fast::RandomState>,
+    /// What hears of this shard's keys changing.
+    watched: Notices,
 }
 
-/// A client watching a key: its flag is set when the key changes.
-struct Watcher {
-    flag: Arc<AtomicBool>,
-    /// The key had expired already when it was watched, so its removal
-    /// isn't a change (as in Redis).
-    expired: bool,
-    /// Not a client watching but one blocked in `XREADGROUP`, whose group
-    /// goes when the key does: a change queues the key for it, so that this
-    /// costs other commands only the check for watchers they already make.
-    waking: Option<Arc<Store>>,
+/// What hears of a shard's keys changing: clients watching them (`WATCH`),
+/// clients blocked in `XREADGROUP`, and clients caching them (`CLIENT
+/// TRACKING`). A change checks one flag, `any`, and costs nothing more while
+/// nothing listens.
+#[derive(Default)]
+struct Notices {
+    by_key: HashMap<Box<[u8]>, Vec<Watcher>, foldhash::fast::RandomState>,
+    /// While a client tracks in `BCAST` mode: database 0, which queues every
+    /// change for the prefixes to hear of after the command.
+    broadcast: Option<Arc<Store>>,
+    /// Whether either of those has anything.
+    any: bool,
+}
+
+/// What hears of one key changing.
+enum Watcher {
+    /// A client watching it: its flag is set when the key changes.
+    Watch {
+        flag: Arc<AtomicBool>,
+        /// The key had expired already when it was watched, so its removal
+        /// isn't a change (as in Redis).
+        expired: bool,
+        /// Not a client watching but one blocked in `XREADGROUP`, whose group
+        /// goes when the key does: a change queues the key for it, so that this
+        /// costs other commands only the check for watchers they already make.
+        waking: Option<Arc<Store>>,
+    },
+    /// A client that read it and may cache it: it hears of the next change
+    /// (and of no more, unless it reads the key again).
+    Track(crate::tracking::Tracked),
+}
+
+impl Notices {
+    fn update(&mut self) {
+        self.any = !self.by_key.is_empty() || self.broadcast.is_some();
+    }
+
+    /// After `key` changed (written, removed, expired or evicted): tells what
+    /// hears of it. An expiry isn't a change to watchers that found it expired
+    /// already.
+    #[inline]
+    fn changed(&mut self, key: &[u8], by_expiry: bool) {
+        if self.any {
+            self.mark(key, by_expiry);
+        }
+    }
+
+    #[cold]
+    fn mark(&mut self, key: &[u8], by_expiry: bool) {
+        if let Some(base) = &self.broadcast {
+            base.queue_broadcast(key, crate::tracking::modifier(by_expiry));
+        }
+        let Some(watchers) = self.by_key.get_mut(key) else {
+            return;
+        };
+        let counts = tracking_counts(watchers);
+        watchers.retain_mut(|watcher| match watcher {
+            Watcher::Watch {
+                flag,
+                expired,
+                waking,
+            } => {
+                if !(by_expiry && *expired) {
+                    flag.store(true, Relaxed);
+                    if let Some(store) = waking {
+                        store.queue_ready(key);
+                    }
+                }
+                true
+            }
+            Watcher::Track(entry) => entry.changed(key),
+        });
+        if let Some(counts) = counts
+            && !watchers.iter().any(Watcher::is_track)
+        {
+            counts.key_gone();
+        }
+        if watchers.is_empty() {
+            self.by_key.remove(key);
+            self.update();
+        }
+    }
+
+    /// For `SWAPDB` and `FLUSHDB`: sets the flags of the clients watching
+    /// `key`, as a change would, but tells no one else.
+    fn touch(&self, key: &[u8]) {
+        for watcher in self.by_key.get(key).into_iter().flatten() {
+            if let Watcher::Watch { flag, waking, .. } = watcher {
+                flag.store(true, Relaxed);
+                if let Some(store) = waking {
+                    store.queue_ready(key);
+                }
+            }
+        }
+    }
+
+    /// Stops the tracking of `key`, telling those that tracked it: for
+    /// `tracking-table-max-keys`. Whether it was tracked.
+    fn untrack(&mut self, key: &[u8]) -> bool {
+        let Some(watchers) = self.by_key.get_mut(key) else {
+            return false;
+        };
+        let Some(counts) = tracking_counts(watchers) else {
+            return false;
+        };
+        watchers.retain(|watcher| match watcher {
+            Watcher::Track(entry) => {
+                entry.evicted(key);
+                false
+            }
+            Watcher::Watch { .. } => true,
+        });
+        counts.key_gone();
+        if watchers.is_empty() {
+            self.by_key.remove(key);
+            self.update();
+        }
+        true
+    }
+
+    /// Drops every tracking entry, telling no one: after a flush, which tells
+    /// every tracking client at once.
+    fn forget_tracked(&mut self) {
+        self.by_key.retain(|_, watchers| {
+            if let Some(counts) = tracking_counts(watchers) {
+                watchers.retain(|watcher| !watcher.is_track());
+                counts.key_gone();
+            }
+            !watchers.is_empty()
+        });
+        if self.by_key.is_empty() {
+            self.by_key = HashMap::default();
+        }
+        self.update();
+    }
+}
+
+impl Watcher {
+    fn is_track(&self) -> bool {
+        matches!(self, Watcher::Track(_))
+    }
+}
+
+/// The tracking table's counts, if any of a key's watchers tracks it.
+fn tracking_counts(watchers: &[Watcher]) -> Option<Arc<crate::tracking::Counts>> {
+    watchers.iter().find_map(|watcher| match watcher {
+        Watcher::Track(entry) => Some(entry.counts().clone()),
+        Watcher::Watch { .. } => None,
+    })
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,28 +783,6 @@ impl ShardInner {
 
     fn segment_mut(&mut self, id: usize) -> &mut Segment {
         self.segments[id].as_mut().expect("live segment")
-    }
-
-    /// After `key` changed (written, removed, expired or evicted): marks
-    /// the clients watching it. An expiry isn't a change to those that found
-    /// it expired already.
-    #[inline]
-    fn changed(&self, key: &[u8], by_expiry: bool) {
-        if !self.watched.is_empty() {
-            self.mark_watchers(key, by_expiry);
-        }
-    }
-
-    #[cold]
-    fn mark_watchers(&self, key: &[u8], by_expiry: bool) {
-        for watcher in self.watched.get(key).into_iter().flatten() {
-            if !(by_expiry && watcher.expired) {
-                watcher.flag.store(true, Relaxed);
-                if let Some(store) = &watcher.waking {
-                    store.queue_ready(key);
-                }
-            }
-        }
     }
 
     /// Key bytes of the entry described by `header` in `buf`.
@@ -716,7 +833,7 @@ impl ShardInner {
         if let Some((loc, header)) = &existing
             && header.is_expired(now)
         {
-            self.changed(key, true);
+            self.watched.changed(key, true);
             self.unlink(hash, *loc);
             garbage.extend(self.kill(*loc));
             self.mem.expired += 1;
@@ -1150,7 +1267,7 @@ impl ShardInner {
                 // keys: it says which went.
                 crate::aof::evicted(key);
             }
-            self.changed(key, expired);
+            self.watched.changed(key, expired);
             let unlinked = self.unlink(hash, old);
             debug_assert!(unlinked, "live entry without a slot");
             if let Body::External(index) = header.body {
@@ -1297,7 +1414,7 @@ impl ShardInner {
                 }
                 if header.deadline <= now {
                     let key = Self::entry_key(&seg.buf, &header, &self.externals, &self.objects);
-                    self.changed(key, true);
+                    self.watched.changed(key, true);
                     due.push((offset, slot_hash(hasher, key)));
                 } else if next == NO_EXPIRY || header.deadline < next {
                     next = header.deadline;
@@ -1449,6 +1566,8 @@ pub struct Store {
     transactions: Mutex<()>,
     /// Which numbered database this is (`SELECT`).
     index: u32,
+    /// Whether some client tracks in `BCAST` mode (in database 0).
+    broadcasting: Mutex<bool>,
     /// Database 0, to any other. Each database is a store of its own but for
     /// the shard locks, which all use database 0's so that what holds a shard
     /// holds that shard of every one: `EXEC`, scripts and `MOVE` hold what
@@ -1465,10 +1584,19 @@ pub struct Store {
     functions: Mutex<(u64, Vec<Arc<[u8]>>)>,
 }
 
-fn new_shards(n: usize) -> Box<[Shard]> {
+/// `n` empty shards; changes in them are queued for `broadcast` (database 0) if
+/// some client tracks in `BCAST` mode.
+fn new_shards(n: usize, broadcast: Option<&Arc<Store>>) -> Box<[Shard]> {
     (0..n)
         .map(|_| Shard {
-            inner: ShardLock::new(ShardInner::default()),
+            inner: ShardLock::new(ShardInner {
+                watched: Notices {
+                    broadcast: broadcast.cloned(),
+                    any: broadcast.is_some(),
+                    ..Notices::default()
+                },
+                ..ShardInner::default()
+            }),
             footprint: AtomicUsize::new(0),
             with_ttl: AtomicUsize::new(0),
             table_base: AtomicUsize::new(0),
@@ -1533,12 +1661,22 @@ impl ScriptShards<'_> {
 #[repr(align(128))]
 struct Ready {
     pending: AtomicBool,
-    /// Each with its database.
-    keys: Mutex<Vec<(u32, Box<[u8]>)>>,
+    keys: Mutex<ReadyQueue>,
     /// Clients blocked right now.
     blocked: AtomicI64,
     /// And what each is blocked in, for `CLIENT UNBLOCK`.
     waiters: Mutex<HashMap<u64, Arc<Waiter>>>,
+}
+
+/// What commands see to when they end, under one lock so that `pending`
+/// can't be cleared while either has something.
+#[derive(Default)]
+struct ReadyQueue {
+    /// Keys created while clients were blocked on them, each with its database.
+    keys: Vec<(u32, Box<[u8]>)>,
+    /// Keys changed while some client tracks in `BCAST` mode, each with who
+    /// changed it (see `tracking::modifier`).
+    broadcast: Vec<(Box<[u8]>, u64)>,
 }
 
 impl Store {
@@ -1577,7 +1715,7 @@ impl Store {
             n => n,
         };
         Store {
-            shards: new_shards(n),
+            shards: new_shards(n, None),
             shard_mask: n - 1,
             hasher: if config.fixed_seed {
                 Hasher::fixed()
@@ -1606,6 +1744,7 @@ impl Store {
             transactions: Mutex::new(()),
             functions: Mutex::new((0, Vec::new())),
             index: 0,
+            broadcasting: Mutex::new(false),
             base: None,
             others: (1..databases).map(|_| OnceLock::new()).collect(),
         }
@@ -1681,9 +1820,15 @@ impl Store {
         if index == 0 {
             return self;
         }
+        if let Some(db) = self.others[index - 1].get() {
+            return db;
+        }
+        // Held until the new database is in `others`, so that `set_broadcast`
+        // either sees it or comes before it.
+        let broadcasting = self.broadcasting.lock();
         self.others[index - 1].get_or_init(|| {
             Arc::new(Store {
-                shards: new_shards(self.shards.len()),
+                shards: new_shards(self.shards.len(), (*broadcasting).then_some(self)),
                 shard_mask: self.shard_mask,
                 hasher: self.hasher.clone(),
                 epoch: self.epoch,
@@ -1699,6 +1844,7 @@ impl Store {
                 transactions: Mutex::new(()),
                 functions: Mutex::new((0, Vec::new())),
                 index: index as u32,
+                broadcasting: Mutex::new(false),
                 base: Some(self.clone()),
                 others: Box::default(),
             })
@@ -1788,10 +1934,10 @@ impl Store {
                 let mut b = other.lock(&other.shards[i]);
                 let (a, b) = (&mut *a, &mut *b);
                 for (one, another) in [(&*a, &*b), (&*b, &*a)] {
-                    for key in one.watched.keys() {
+                    for key in one.watched.by_key.keys() {
                         let hash = slot_hash(&self.hasher, key);
                         if one.lookup(hash, key).is_some() || another.lookup(hash, key).is_some() {
-                            one.mark_watchers(key, false);
+                            one.watched.touch(key);
                         }
                     }
                 }
@@ -1989,7 +2135,7 @@ impl Store {
                 inner.touch(loc, &header);
                 return f(Some(inner.value_ref(loc, &header)));
             }
-            inner.changed(key, true);
+            inner.watched.changed(key, true);
             inner.unlink(hash, loc);
             expired = inner.kill(loc);
             inner.mem.expired += 1;
@@ -2196,7 +2342,7 @@ impl Store {
                 inner.mem.expired += 1;
             }
             inner.mem.writes += 1;
-            inner.changed(key, false);
+            inner.watched.changed(key, false);
             inner.maybe_defrag(self.near_limit(), now, &self.hasher, &mut garbage);
             self.sync_usage(shard, inner, false);
             return Ok(SetOutcome {
@@ -2429,7 +2575,7 @@ impl Store {
             inner.touch(loc, &header);
             if changed {
                 inner.mem.writes += 1;
-                inner.changed(key, false);
+                inner.watched.changed(key, false);
             }
             Some(result)
         });
@@ -2491,7 +2637,7 @@ impl Store {
             inner.touch(loc, &header);
             if changed {
                 inner.mem.writes += 1;
-                inner.changed(key, false);
+                inner.watched.changed(key, false);
             }
             Some(result)
         });
@@ -2584,7 +2730,7 @@ impl Store {
                 // `with_entry` already counted its new size.
                 inner.touch(*loc, header);
                 inner.mem.writes += 1;
-                inner.changed(key, false);
+                inner.watched.changed(key, false);
                 return Ok(true);
             }
             (Update::ChangedUnseen, Some((loc, header))) => {
@@ -2596,7 +2742,7 @@ impl Store {
                 inner.unlink(hash, *loc);
                 garbage.extend(inner.kill(*loc));
                 inner.mem.writes += 1;
-                inner.changed(key, false);
+                inner.watched.changed(key, false);
                 return Ok(true);
             }
             (Update::Expire(expiry), Some((loc, header))) => {
@@ -2612,7 +2758,7 @@ impl Store {
                     inner.set_deadline(hash, key, *loc, header, deadline);
                 }
                 inner.mem.writes += 1;
-                inner.changed(key, false);
+                inner.watched.changed(key, false);
                 return Ok(true);
             }
         };
@@ -2633,7 +2779,7 @@ impl Store {
         };
         garbage.extend(inner.replace(hash, old, new));
         inner.mem.writes += 1;
-        inner.changed(key, false);
+        inner.watched.changed(key, false);
         Ok(true)
     }
 
@@ -2661,7 +2807,7 @@ impl Store {
             inner.segment_mut(split(*loc).0).buf[range.clone()].copy_from_slice(value);
             inner.touch(*loc, header);
             inner.mem.writes += 1;
-            inner.changed(key, false);
+            inner.watched.changed(key, false);
             return Ok(false);
         }
         let (old, deadline, usage) = match existing {
@@ -2721,7 +2867,7 @@ impl Store {
         };
         garbage.extend(inner.replace(hash, old, new));
         inner.mem.writes += 1;
-        inner.changed(key, false);
+        inner.watched.changed(key, false);
         Ok(true)
     }
 
@@ -2739,10 +2885,11 @@ impl Store {
                 empty.mem.evicted = inner.mem.evicted;
                 empty.mem.writes = inner.mem.writes + 1;
                 empty.waiting = std::mem::take(&mut inner.waiting);
-                // Watched keys that existed change.
-                for key in inner.watched.keys() {
+                // Watched keys that existed change. (Tracking clients hear of the
+                // flush on their own: see `Tracking::flushed`.)
+                for key in inner.watched.by_key.keys() {
                     if inner.lookup(slot_hash(&self.hasher, key), key).is_some() {
-                        inner.mark_watchers(key, false);
+                        inner.watched.touch(key);
                     }
                 }
                 empty.watched = std::mem::take(&mut inner.watched);
@@ -2766,14 +2913,127 @@ impl Store {
     /// Queues `key` for the clients blocked on it, once.
     fn queue_ready(&self, key: &[u8]) {
         let ready = &self.base().ready;
-        let mut keys = ready.keys.lock();
-        if !keys
+        let mut queue = ready.keys.lock();
+        if !queue
+            .keys
             .iter()
             .any(|(db, queued)| *db == self.index && **queued == *key)
         {
-            keys.push((self.index, key.into()));
+            queue.keys.push((self.index, key.into()));
         }
         ready.pending.store(true, Relaxed);
+    }
+
+    /// Queues a change to `key` for the clients tracking in `BCAST` mode, made
+    /// by `by`.
+    fn queue_broadcast(&self, key: &[u8], by: u64) {
+        let ready = &self.base().ready;
+        ready.keys.lock().broadcast.push((key.into(), by));
+        ready.pending.store(true, Relaxed);
+    }
+
+    /// The changes queued for the clients tracking in `BCAST` mode.
+    pub(crate) fn take_broadcast(&self) -> Vec<(Box<[u8]>, u64)> {
+        let ready = &self.base().ready;
+        let mut queue = ready.keys.lock();
+        if queue.keys.is_empty() {
+            ready.pending.store(false, Relaxed);
+        }
+        std::mem::take(&mut queue.broadcast)
+    }
+
+    /// Whether some client tracks in `BCAST` mode.
+    pub(crate) fn broadcasting(&self) -> bool {
+        *self.base().broadcasting.lock()
+    }
+
+    /// Some client tracks in `BCAST` mode, or none does any more: every
+    /// change in every database is queued for them meanwhile (one made in a
+    /// database made later too).
+    pub(crate) fn set_broadcast(self: &Arc<Self>, on: bool) {
+        let base = self.base_arc();
+        let mut broadcasting = base.broadcasting.lock();
+        *broadcasting = on;
+        for db in base.live() {
+            for shard in db.shards.iter() {
+                let mut inner = db.lock(shard);
+                inner.watched.broadcast = on.then(|| base.clone());
+                inner.watched.update();
+            }
+        }
+    }
+
+    /// Database 0, as an `Arc`.
+    fn base_arc(self: &Arc<Self>) -> Arc<Store> {
+        match &self.base {
+            None => self.clone(),
+            Some(base) => base.clone(),
+        }
+    }
+
+    /// `CLIENT TRACKING`: `tracker` hears of `key`'s next change, read by its
+    /// command `since`.
+    pub(crate) fn track(&self, key: &[u8], tracker: &Arc<crate::tracking::Tracker>, since: u64) {
+        let key = self.key(key);
+        let (_, index) = self.locate(key.hash);
+        let mut inner = self.lock(&self.shards[index]);
+        let watched = &mut inner.watched;
+        let watchers = match watched.by_key.get_mut(key.bytes) {
+            Some(watchers) => watchers,
+            None => watched.by_key.entry(key.bytes.into()).or_default(),
+        };
+        let mut tracked = false;
+        for watcher in watchers.iter_mut() {
+            if let Watcher::Track(entry) = watcher {
+                if entry.is_of(tracker) {
+                    entry.renew(since);
+                    return;
+                }
+                tracked = true;
+            }
+        }
+        let entry = crate::tracking::Tracked::new(tracker, since);
+        if !tracked {
+            entry.counts().key_added();
+        }
+        watchers.push(Watcher::Track(entry));
+        watched.update();
+    }
+
+    /// For `tracking-table-max-keys`: stops tracking keys, from shard `start`
+    /// on, until `done`. Whether it's done.
+    pub(crate) fn untrack_until(&self, start: usize, done: &dyn Fn() -> bool) -> bool {
+        let n = self.shards.len();
+        for i in 0..n {
+            let mut inner = self.lock(&self.shards[(start + i) % n]);
+            if !inner.watched.any {
+                continue;
+            }
+            let keys: Vec<Box<[u8]>> = inner
+                .watched
+                .by_key
+                .iter()
+                .filter(|(_, watchers)| watchers.iter().any(Watcher::is_track))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
+                if done() {
+                    return true;
+                }
+                inner.watched.untrack(&key);
+            }
+        }
+        done()
+    }
+
+    /// After a flush: tracks no key (see `Tracking::flushed`).
+    pub(crate) fn forget_tracked(&self) {
+        for shard in self.shards.iter() {
+            let mut inner = self.lock(shard);
+            if inner.watched.any {
+                inner.watched.forget_tracked();
+            }
+        }
     }
 
     /// After a write to `key` that may serve clients blocked on it without
@@ -2805,13 +3065,15 @@ impl Store {
         let mut inner = self.lock(&self.shards[index]);
         inner
             .watched
+            .by_key
             .entry(key.bytes.into())
             .or_default()
-            .push(Watcher {
+            .push(Watcher::Watch {
                 flag: flag.clone(),
                 expired: false,
                 waking: Some(self.clone()),
             });
+        inner.watched.update();
     }
 
     /// Deregisters `waiter` from `key`.
@@ -2841,9 +3103,9 @@ impl Store {
         if !self.has_ready() {
             return None;
         }
-        let mut keys = self.ready.keys.lock();
-        let key = keys.pop();
-        if keys.is_empty() {
+        let mut queue = self.ready.keys.lock();
+        let key = queue.keys.pop();
+        if queue.keys.is_empty() && queue.broadcast.is_empty() {
             self.ready.pending.store(false, Relaxed);
         }
         key.map(|(db, key)| (db as usize, key))
@@ -2886,26 +3148,31 @@ impl Store {
             .is_some_and(|(_, header)| header.is_expired(now));
         inner
             .watched
+            .by_key
             .entry(key.bytes.into())
             .or_default()
-            .push(Watcher {
+            .push(Watcher::Watch {
                 flag: flag.clone(),
                 expired,
                 waking: None,
             });
+        inner.watched.update();
         expired
     }
 
     pub(crate) fn unwatch(&self, key: Key<'_>, flag: &Arc<AtomicBool>) {
         let (_, index) = self.locate(key.hash);
         let mut inner = self.lock(&self.shards[index]);
-        if let Some(watchers) = inner.watched.get_mut(key.bytes) {
-            watchers.retain(|w| !Arc::ptr_eq(&w.flag, flag));
+        let watched = &mut inner.watched;
+        if let Some(watchers) = watched.by_key.get_mut(key.bytes) {
+            watchers
+                .retain(|w| !matches!(w, Watcher::Watch { flag: f, .. } if Arc::ptr_eq(f, flag)));
             if watchers.is_empty() {
-                inner.watched.remove(key.bytes);
-                if inner.watched.is_empty() {
-                    inner.watched = HashMap::default();
+                watched.by_key.remove(key.bytes);
+                if watched.by_key.is_empty() {
+                    watched.by_key = HashMap::default();
                 }
+                watched.update();
             }
         }
     }
@@ -3068,7 +3335,7 @@ impl Store {
                 return Ok(Renamed::NoSuchKey);
             };
             if header.is_expired(now) {
-                src.changed(from.bytes, true);
+                src.watched.changed(from.bytes, true);
                 src.unlink(from_hash, loc);
                 garbage.extend(src.kill(loc));
                 src.mem.expired += 1;
@@ -3154,7 +3421,7 @@ impl Store {
                 target.mem.expired += 1;
             }
             target.mem.writes += 1;
-            target.changed(to.bytes, false);
+            target.watched.changed(to.bytes, false);
             // Like Redis, as if deleted and added again: clients blocked on
             // the destination may be served.
             if !target.waiting.is_empty() {
@@ -3167,7 +3434,7 @@ impl Store {
                 garbage.extend(src.kill(loc));
             }
             src.mem.writes += 1;
-            src.changed(from.bytes, false);
+            src.watched.changed(from.bytes, false);
             let eager = self.near_limit();
             src.maybe_defrag(eager, now, &self.hasher, &mut garbage);
             self.sync_usage(&self.shards[a], src, false);

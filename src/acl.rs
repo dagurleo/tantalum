@@ -859,6 +859,11 @@ pub(crate) struct Target {
 }
 
 impl Target {
+    /// Its key specs, if it has keys.
+    pub(crate) fn keys(&self) -> Option<&'static KeySpecs> {
+        self.keys
+    }
+
     pub(crate) fn name(&self) -> &'static str {
         commands().names[self.id as usize]
     }

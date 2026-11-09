@@ -221,6 +221,10 @@ pub(crate) struct Hidden {
     pub(crate) from_monitor: bool,
     pub(crate) from_slowlog: bool,
     pub(crate) container: bool,
+    /// What `CLIENT TRACKING` goes by: it remembers the keys of `readonly`
+    /// commands that aren't `pubsub` ones.
+    pub(crate) readonly: bool,
+    pub(crate) pubsub: bool,
 }
 
 /// The flags of `name`, in lowercase, with the subcommand in `arg` if it has
@@ -239,6 +243,8 @@ pub(crate) fn hidden(name: &str, arg: Option<&[u8]>) -> Hidden {
                             || has(item, FLAGS, b"skip_monitor"),
                         from_slowlog: has(item, FLAGS, b"skip_slowlog"),
                         container: !item.list()[SUBCOMMANDS].list().is_empty(),
+                        readonly: has(item, FLAGS, b"readonly"),
+                        pubsub: has(item, FLAGS, b"pubsub"),
                     },
                 );
             };

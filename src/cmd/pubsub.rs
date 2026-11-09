@@ -90,7 +90,7 @@ fn subscribe_to(
             client.last_command = Some(last_command);
         });
     }
-    let subscriptions = session.subscriptions(&ctx.pubsub);
+    let subscriptions = session.subscriptions(ctx);
     for i in 1..args.len() {
         subscriptions.add(to, args.get(i));
         header(out, resp3);
@@ -323,6 +323,7 @@ pub(super) fn reset(
     out: &mut Vec<u8>,
 ) -> Reply {
     session.end_subscriptions(true);
+    crate::tracking::end(ctx, session);
     session.multi = None;
     session.select(ctx, 0);
     session.monitor = None;

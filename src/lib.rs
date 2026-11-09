@@ -32,6 +32,7 @@ pub mod snapshot;
 pub mod store;
 mod stream;
 mod table;
+mod tracking;
 mod transaction;
 mod wake;
 mod zset;
