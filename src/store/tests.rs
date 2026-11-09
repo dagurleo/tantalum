@@ -833,6 +833,184 @@ fn volatile_lru_only_evicts_keys_with_ttl() {
     s.check();
 }
 
+/// Fills a store at its limit under `policy`: keys with a TTL if `volatile`.
+fn fill_past_the_limit(policy: EvictionPolicy, volatile: bool) -> (Store, usize) {
+    let limit = 1_000_000;
+    let s = limited(limit, policy);
+    let mut peak = 0;
+    let expiry = if volatile {
+        Expiry::At(1_000_000)
+    } else {
+        Expiry::Never
+    };
+    for i in 0..100_000u32 {
+        s.set(
+            &i.to_le_bytes(),
+            &[0; 100],
+            Condition::Always,
+            expiry,
+            1,
+            false,
+        )
+        .expect("eviction makes room");
+        peak = peak.max(s.used_memory());
+    }
+    (s, peak)
+}
+
+#[test]
+fn every_policy_stays_under_the_limit() {
+    use EvictionPolicy::*;
+    for policy in [
+        AllKeysLru,
+        AllKeysLfu,
+        AllKeysRandom,
+        VolatileLru,
+        VolatileLfu,
+        VolatileRandom,
+        VolatileTtl,
+    ] {
+        let volatile = policy.name().starts_with("volatile");
+        let (s, peak) = fill_past_the_limit(policy, volatile);
+        assert!(
+            peak <= 1_000_000 + 1_000_000 / 16,
+            "{policy:?}: peak {peak}"
+        );
+        let stats = s.stats();
+        assert!(stats.evicted_keys > 90_000, "{policy:?}: {stats:?}");
+        assert!(stats.keys > 4_000, "{policy:?}: {stats:?}");
+        s.check();
+    }
+}
+
+#[test]
+fn volatile_policies_only_evict_keys_with_ttl() {
+    use EvictionPolicy::*;
+    for policy in [VolatileLru, VolatileLfu, VolatileRandom, VolatileTtl] {
+        let value = [0; 1000];
+        let s = limited(400_000, policy);
+        let mut i = 0u32;
+        while s.used_memory() < 200_000 {
+            s.set(
+                &i.to_le_bytes(),
+                &value,
+                Condition::Always,
+                Expiry::Never,
+                1,
+                false,
+            )
+            .unwrap();
+            i += 1;
+        }
+        let persistent = i;
+        for j in 0..10_000u32 {
+            let key = (1_000_000 + j).to_le_bytes();
+            let expiry = Expiry::At(1_000_000 + u64::from(j));
+            s.set(&key, &value, Condition::Always, expiry, 1, false)
+                .expect("TTL keys can be evicted to make room");
+        }
+        for k in 0..persistent {
+            let key = k.to_le_bytes();
+            assert!(
+                get(&s, &key, 1).is_some(),
+                "{policy:?}: persistent key {k} was evicted"
+            );
+        }
+        // Once only persistent keys are left to evict, writes fail.
+        let failed = (0..10_000u32).any(|j| {
+            let key = (2_000_000 + j).to_le_bytes();
+            s.set(&key, &value, Condition::Always, Expiry::Never, 1, false)
+                .is_err()
+        });
+        assert!(failed, "{policy:?}");
+        s.check();
+    }
+}
+
+#[test]
+fn volatile_ttl_evicts_the_soonest_first() {
+    let s = limited(1_000_000, EvictionPolicy::VolatileTtl);
+    // Every other key is due soon; the rest much later.
+    let soon = |i: u32| i.is_multiple_of(2);
+    for i in 0..100_000u32 {
+        let due = if soon(i) { 10_000_000 } else { 1_000_000_000 };
+        let expiry = Expiry::At(due + u64::from(i));
+        s.set(
+            &i.to_le_bytes(),
+            &[0; 100],
+            Condition::Always,
+            expiry,
+            1,
+            false,
+        )
+        .expect("eviction makes room");
+    }
+    let (mut early, mut late) = (0, 0);
+    for i in 0..100_000u32 {
+        if get(&s, &i.to_le_bytes(), 1).is_some() {
+            if soon(i) {
+                early += 1;
+            } else {
+                late += 1;
+            }
+        }
+    }
+    // Approximate: against half and half under a random policy.
+    assert!(
+        late > 4_000 && early * 2 < late,
+        "survivors: {early} due soon, {late} later"
+    );
+    s.check();
+}
+
+#[test]
+fn lfu_keeps_often_read_keys_and_random_doesnt() {
+    for (policy, kept) in [
+        (EvictionPolicy::AllKeysLfu, true),
+        (EvictionPolicy::AllKeysRandom, false),
+    ] {
+        let s = limited(2_000_000, policy);
+        let hot: Vec<u32> = (0..1_000).collect();
+        for i in 0..200_000u32 {
+            let key = 1_000_000 + i;
+            s.set(
+                &key.to_le_bytes(),
+                &[0; 100],
+                Condition::Always,
+                Expiry::Never,
+                1,
+                false,
+            )
+            .unwrap();
+            if i < 1_000 {
+                set(&s, &hot[i as usize].to_le_bytes(), &[1; 100], 1);
+            }
+            if i % 2_000 == 0 {
+                for k in &hot {
+                    get(&s, &k.to_le_bytes(), 1);
+                }
+            }
+        }
+        let survivors = hot
+            .iter()
+            .filter(|k| get(&s, &k.to_le_bytes(), 1).is_some())
+            .count();
+        if kept {
+            assert!(
+                survivors > 950,
+                "{policy:?}: only {survivors}/1000 hot keys survived"
+            );
+        } else {
+            // A tenth of the cold keys fit, and use doesn't help.
+            assert!(
+                survivors < 500,
+                "{policy:?}: {survivors}/1000 hot keys survived"
+            );
+        }
+        s.check();
+    }
+}
+
 #[test]
 fn big_value_evicts_across_shards() {
     let s = limited(1_000_000, EvictionPolicy::AllKeysLru);

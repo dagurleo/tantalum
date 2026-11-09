@@ -493,6 +493,10 @@ pub(crate) fn unblock(ctx: &Context, id: u64, error: bool) -> bool {
     } else {
         claimed.waiter.timed_out_reply().to_vec()
     };
+    if ctx.stats.is_on() {
+        let args = Args::new(&claimed.waiter.buf, &claimed.waiter.ranges);
+        crate::stats::blocked_ended(ctx, &args, &reply);
+    }
     claimed.serve(reply);
     true
 }
@@ -520,6 +524,11 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
                 });
                 match attempt {
                     Attempt::Done => {
+                        if ctx.stats.is_on() {
+                            let waiter = &claimed.waiter;
+                            let args = Args::new(&waiter.buf, &waiter.ranges);
+                            crate::stats::blocked_ended(ctx, &args, &out);
+                        }
                         claimed.waiter.log(&out);
                         let rest = claimed.waiter.send_now(&out).to_vec();
                         claimed.serve(rest);

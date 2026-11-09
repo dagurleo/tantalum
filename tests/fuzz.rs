@@ -386,7 +386,8 @@ const WORDS: &[&[u8]] = &[
 /// A well-formed blocking command, or a write that may serve one, on a
 /// few keys: random arguments rarely line those up.
 /// Client-side caching on or off, in one of its modes, or what to cache next:
-/// the keys the other commands use are then tracked.
+/// the keys the other commands use are then tracked. Or command statistics,
+/// which once asked for count every command after.
 fn tracking(rng: &mut Rng) -> Vec<Vec<u8>> {
     const CHOICES: &[&[&[u8]]] = &[
         &[b"CLIENT", b"TRACKING", b"on"],
@@ -403,6 +404,18 @@ fn tracking(rng: &mut Rng) -> Vec<Vec<u8>> {
         &[b"CONFIG", b"SET", b"tracking-table-max-keys", b"0"],
         &[b"HELLO", b"3"],
         &[b"HELLO", b"2"],
+        &[b"INFO", b"commandstats", b"errorstats", b"latencystats"],
+        &[b"CONFIG", b"RESETSTAT"],
+        &[b"LATENCY", b"HISTOGRAM"],
+        &[b"LATENCY", b"HISTOGRAM", b"set", b"client", b"nothing"],
+        &[b"CONFIG", b"SET", b"latency-tracking", b"no"],
+        &[b"CONFIG", b"SET", b"latency-tracking", b"yes"],
+        &[
+            b"CONFIG",
+            b"SET",
+            b"latency-tracking-info-percentiles",
+            b"0 99.99 100",
+        ],
     ];
     let choice = CHOICES[rng.below(CHOICES.len())];
     choice.iter().map(|arg| arg.to_vec()).collect()
