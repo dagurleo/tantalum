@@ -721,10 +721,33 @@ fn watched(
     out: &mut Vec<u8>,
 ) -> Reply {
     let script = heard_first(ctx, session, command, args);
+    let notes = ctx
+        .notifying()
+        .then(|| notify_before(ctx, session, now, command, args));
+    let start = out.len();
     let started = std::time::Instant::now();
     let reply = dispatch(ctx, session, now, command, args, out);
     has_run(ctx, session, command, args, started, !script, None);
+    if let Some(notes) = notes {
+        let replied = match reply {
+            Reply::Bulk(_) => &b"$"[..],
+            _ => &out[start.min(out.len())..],
+        };
+        crate::notify::after(ctx, session, now, command.name, args, replied, notes);
+    }
     reply
+}
+
+/// What keyspace notifications look at before a command runs.
+fn notify_before(
+    ctx: &Context,
+    session: &Session,
+    now: Millis,
+    command: &Command,
+    args: &Args<'_>,
+) -> crate::notify::Before {
+    let readonly = command.flags.contains(&"readonly");
+    crate::notify::before(ctx, session, now, command.name, readonly, args)
 }
 
 /// Monitors hear of a script before what it runs (even one that isn't found), and of the
@@ -751,6 +774,9 @@ fn watched_inside(
     out: &mut Vec<u8>,
 ) -> Reply {
     let script = heard_first(ctx, session, command, args);
+    let notes = ctx
+        .notifying()
+        .then(|| notify_before(ctx, session, now, command, args));
     let started = std::time::Instant::now();
     let start = out.len();
     let reply = (command.run)(ctx, session, now, args, out);
@@ -759,6 +785,14 @@ fn watched_inside(
         _ => &out[start..],
     };
     has_run(ctx, session, command, args, started, !script, Some(replied));
+    if let Some(notes) = notes {
+        let replied = if replied.is_empty() {
+            &b"$"[..]
+        } else {
+            replied
+        };
+        crate::notify::after(ctx, session, now, command.name, args, replied, notes);
+    }
     reply
 }
 
@@ -829,15 +863,32 @@ fn silenced(
     session.refresh();
     let start = out.len();
     let reply = execute(ctx, session, now, args, out);
+    // What (un)subscribing says isn't a reply but a push, which Redis sends anyway.
+    let pushed = matches!(
+        command_name(args.get(0)),
+        Some(
+            "subscribe"
+                | "psubscribe"
+                | "ssubscribe"
+                | "unsubscribe"
+                | "punsubscribe"
+                | "sunsubscribe"
+        )
+    ) && out.get(start).is_some_and(|&b| b != b'-');
+    let keep = |out: &mut Vec<u8>| {
+        if !pushed {
+            out.truncate(start);
+        }
+    };
     if matches!(session.reply, ReplyMode::Passing) {
-        out.truncate(start);
+        keep(out);
         session.reply = if matches!(mode, ReplyMode::Skip) {
             ReplyMode::On
         } else {
             mode
         };
     } else if !matches!(session.reply, ReplyMode::On) {
-        out.truncate(start);
+        keep(out);
     }
     session.refresh();
     match reply {
@@ -904,6 +955,9 @@ pub fn spawn_expirer(
                 ctx.note_memory_peak();
                 if ctx.store.has_ready() {
                     serve_ready(&ctx, now);
+                }
+                if ctx.notifying() {
+                    crate::notify::flush(&ctx);
                 }
             }
         })
@@ -1058,6 +1112,11 @@ pub(crate) use eval::call_from_script;
 /// Whether `name` is a command here, in any case.
 pub(crate) fn is_command(name: &[u8]) -> bool {
     find_command(name).is_some()
+}
+
+/// The name a command goes by here (lowercase), if there is one by `name`.
+pub(crate) fn command_name(name: &[u8]) -> Option<&'static str> {
+    find_command(name).map(|c| c.name)
 }
 
 /// The command called `name`, in any case. [`COMMANDS`] is split by name

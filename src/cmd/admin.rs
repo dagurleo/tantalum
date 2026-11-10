@@ -335,6 +335,14 @@ fn config_set(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
                     }
                 }
             }
+            // Applied as given: Redis shows `KEAn` as `AKE`, but keeps the `n`.
+            Kind::Text if name == "notify-keyspace-events" => {
+                if crate::notify::parse(text.as_bytes()).is_none() {
+                    failed(out, name, crate::notify::INVALID);
+                    return;
+                }
+                text
+            }
             Kind::Text => text,
         };
         if let Err(why) = can_set(ctx, name, &value) {
@@ -350,7 +358,12 @@ fn config_set(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
     }
     for (name, value) in changes {
         apply(ctx, name, &value);
-        ctx.config.set(name, &value);
+        if name == "notify-keyspace-events" {
+            let flags = crate::notify::parse(value.as_bytes()).unwrap_or(0);
+            ctx.config.set(name, &crate::notify::format(flags));
+        } else {
+            ctx.config.set(name, &value);
+        }
     }
     out.extend_from_slice(resp::OK);
 }
@@ -359,9 +372,6 @@ fn config_set(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
 /// being remembered and doing nothing.
 fn can_set(ctx: &Context, name: &str, value: &str) -> Result<(), &'static str> {
     match name {
-        "notify-keyspace-events" if !value.is_empty() => {
-            Err("keyspace notifications aren't there yet")
-        }
         "appendonly" if (value == "yes") != ctx.aof().is_some() => {
             Err("the append-only log is turned on or off by starting with --aof")
         }
@@ -393,6 +403,9 @@ fn apply(ctx: &Context, name: &str, value: &str) {
         }
         "maxclients" => ctx.set_maxclients(number().max(1) as usize),
         "latency-tracking" => ctx.stats.set_latency_tracking(value == "yes"),
+        "notify-keyspace-events" => {
+            ctx.set_keyspace_events(crate::notify::parse(value.as_bytes()).unwrap_or(0))
+        }
         "latency-tracking-info-percentiles" => {
             if let Ok((_, percentiles)) = crate::stats::parse_percentiles(value) {
                 ctx.stats.set_percentiles(percentiles);

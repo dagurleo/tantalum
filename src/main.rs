@@ -102,7 +102,13 @@ Options:
   --maxmemory <SIZE>
                     Memory limit, e.g. 100mb or 2gb; 0 is unlimited [default: 0]
   --maxmemory-policy <POLICY>
-                    noeviction, allkeys-lru or volatile-lru [default: noeviction]
+                    Which keys go at the limit, as Redis' policies: noeviction,
+                    allkeys-lru, volatile-lru, allkeys-lfu, volatile-lfu,
+                    allkeys-random, volatile-random or volatile-ttl
+                    [default: noeviction]
+  --notify-keyspace-events <CLASSES>
+                    Keyspace notifications, as Redis' setting: e.g. KEA for
+                    all, Egx for expiries and generic commands [default: none]
   --requirepass <PASSWORD>
                     Clients must AUTH with this password first. The
                     TANTALUM_REQUIREPASS environment variable sets it too and
@@ -163,6 +169,7 @@ struct Config {
     tls_port: Option<u16>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    notify_keyspace_events: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,6 +254,7 @@ fn parse_args() -> Result<Config, String> {
         tls_port: None,
         tls_cert: None,
         tls_key: None,
+        notify_keyspace_events: None,
     };
     let mut aof_options = aof::Options {
         dir: PathBuf::new(),
@@ -298,6 +306,7 @@ fn parse_args() -> Result<Config, String> {
                 config.settings.password = Some(value.into_bytes()).filter(|p| !p.is_empty())
             }
             "--aclfile" => config.settings.aclfile = Some(PathBuf::from(value)),
+            "--notify-keyspace-events" => config.notify_keyspace_events = Some(value),
             "--maxclients" => {
                 config.settings.maxclients = value.parse().map_err(|_| bad(()))?;
             }
@@ -406,6 +415,13 @@ fn main() -> std::io::Result<()> {
     }
     // The function libraries whose code a snapshot or the log brought back.
     ctx.load_functions();
+    // Once loading is over: what it ran again isn't news to anyone.
+    if let Some(classes) = &config.notify_keyspace_events
+        && let Err(why) = ctx.set_notify_keyspace_events(classes)
+    {
+        eprintln!("error: --notify-keyspace-events: {why}\n\n{USAGE}");
+        std::process::exit(1);
+    }
     let ctx = Arc::new(ctx);
     // After the log's commands ran again: they may still use keys that have
     // expired since.

@@ -709,8 +709,23 @@ struct Notices {
     /// While a client tracks in `BCAST` mode: database 0, which queues every
     /// change for the prefixes to hear of after the command.
     broadcast: Option<Arc<Store>>,
-    /// Whether either of those has anything.
+    /// While keyspace notifications are on: this shard's database, whose
+    /// changes go into the thread's log for them (see `notify.rs`).
+    events: Option<u16>,
+    /// Whether any of those has anything.
     any: bool,
+}
+
+/// How a key changed, for keyspace notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Change {
+    /// Written over, or changed in place.
+    Written,
+    /// Made: there was no key.
+    Created,
+    Removed,
+    Expired,
+    Evicted,
 }
 
 /// What hears of one key changing.
@@ -733,21 +748,25 @@ enum Watcher {
 
 impl Notices {
     fn update(&mut self) {
-        self.any = !self.by_key.is_empty() || self.broadcast.is_some();
+        self.any = !self.by_key.is_empty() || self.broadcast.is_some() || self.events.is_some();
     }
 
     /// After `key` changed (written, removed, expired or evicted): tells what
     /// hears of it. An expiry isn't a change to watchers that found it expired
     /// already.
     #[inline]
-    fn changed(&mut self, key: &[u8], by_expiry: bool) {
+    fn changed(&mut self, key: &[u8], how: Change) {
         if self.any {
-            self.mark(key, by_expiry);
+            self.mark(key, how);
         }
     }
 
     #[cold]
-    fn mark(&mut self, key: &[u8], by_expiry: bool) {
+    fn mark(&mut self, key: &[u8], how: Change) {
+        if let Some(db) = self.events {
+            crate::notify::log(db, key, how);
+        }
+        let by_expiry = how == Change::Expired;
         if let Some(base) = &self.broadcast {
             base.queue_broadcast(key, crate::tracking::modifier(by_expiry));
         }
@@ -929,7 +948,7 @@ impl ShardInner {
         if let Some((loc, header)) = &existing
             && header.is_expired(now)
         {
-            self.watched.changed(key, true);
+            self.watched.changed(key, Change::Expired);
             self.unlink(hash, *loc);
             garbage.extend(self.kill(*loc));
             self.mem.expired += 1;
@@ -1373,7 +1392,14 @@ impl ShardInner {
                 // keys: it says which went.
                 crate::aof::evicted(key);
             }
-            self.watched.changed(key, expired);
+            self.watched.changed(
+                key,
+                if expired {
+                    Change::Expired
+                } else {
+                    Change::Evicted
+                },
+            );
             let unlinked = self.unlink(hash, old);
             debug_assert!(unlinked, "live entry without a slot");
             if let Body::External(index) = header.body {
@@ -1606,7 +1632,7 @@ impl ShardInner {
                 }
                 if header.deadline <= now {
                     let key = Self::entry_key(&seg.buf, &header, &self.externals, &self.objects);
-                    self.watched.changed(key, true);
+                    self.watched.changed(key, Change::Expired);
                     due.push((offset, slot_hash(hasher, key)));
                 } else if next == NO_EXPIRY || header.deadline < next {
                     next = header.deadline;
@@ -1770,6 +1796,9 @@ pub struct Store {
     base: Option<Arc<Store>>,
     /// The other databases, to database 0, made when first used.
     others: Box<[OnceLock<Arc<Store>>]>,
+    /// In database 0: keyspace notifications are on, so every change is
+    /// logged for them (see `set_notifying`).
+    notifying: AtomicBool,
     /// Function libraries' code (`FUNCTION LOAD`), in database 0, kept with the
     /// data for snapshots and the log, with a version that goes up as it
     /// changes. `FLUSHALL` leaves it, as Redis does.
@@ -1777,14 +1806,16 @@ pub struct Store {
 }
 
 /// `n` empty shards; changes in them are queued for `broadcast` (database 0) if
-/// some client tracks in `BCAST` mode.
-fn new_shards(n: usize, broadcast: Option<&Arc<Store>>) -> Box<[Shard]> {
+/// some client tracks in `BCAST` mode, and logged as database `events`'s
+/// while keyspace notifications are on.
+fn new_shards(n: usize, broadcast: Option<&Arc<Store>>, events: Option<u16>) -> Box<[Shard]> {
     (0..n)
         .map(|_| Shard {
             inner: ShardLock::new(ShardInner {
                 watched: Notices {
                     broadcast: broadcast.cloned(),
-                    any: broadcast.is_some(),
+                    events,
+                    any: broadcast.is_some() || events.is_some(),
                     ..Notices::default()
                 },
                 ..ShardInner::default()
@@ -1907,7 +1938,7 @@ impl Store {
             n => n,
         };
         Store {
-            shards: new_shards(n, None),
+            shards: new_shards(n, None, None),
             shard_mask: n - 1,
             hasher: if config.fixed_seed {
                 Hasher::fixed()
@@ -1939,6 +1970,7 @@ impl Store {
             broadcasting: Mutex::new(false),
             base: None,
             others: (1..databases).map(|_| OnceLock::new()).collect(),
+            notifying: AtomicBool::new(false),
         }
     }
 
@@ -2016,11 +2048,12 @@ impl Store {
             return db;
         }
         // Held until the new database is in `others`, so that `set_broadcast`
-        // either sees it or comes before it.
+        // and `set_notifying` either see it or come before it.
         let broadcasting = self.broadcasting.lock();
+        let events = self.notifying.load(Relaxed).then_some(index as u16);
         self.others[index - 1].get_or_init(|| {
             Arc::new(Store {
-                shards: new_shards(self.shards.len(), (*broadcasting).then_some(self)),
+                shards: new_shards(self.shards.len(), (*broadcasting).then_some(self), events),
                 shard_mask: self.shard_mask,
                 hasher: self.hasher.clone(),
                 epoch: self.epoch,
@@ -2039,6 +2072,7 @@ impl Store {
                 broadcasting: Mutex::new(false),
                 base: Some(self.clone()),
                 others: Box::default(),
+                notifying: AtomicBool::new(false),
             })
         })
     }
@@ -2327,7 +2361,7 @@ impl Store {
                 inner.touch(loc, &header);
                 return f(Some(inner.value_ref(loc, &header)));
             }
-            inner.watched.changed(key, true);
+            inner.watched.changed(key, Change::Expired);
             inner.unlink(hash, loc);
             expired = inner.kill(loc);
             inner.mem.expired += 1;
@@ -2451,6 +2485,17 @@ impl Store {
             if (cond == Condition::IfAbsent && live.is_some())
                 || (cond == Condition::IfPresent && live.is_none())
             {
+                // An expired key goes as the write looks at it, as in Redis.
+                let mut garbage = Vec::new();
+                if live.is_none()
+                    && let Some((loc, _)) = existing
+                {
+                    inner.watched.changed(key, Change::Expired);
+                    inner.unlink(hash, loc);
+                    garbage.extend(inner.kill(loc));
+                    inner.mem.expired += 1;
+                    self.sync_usage(shard, inner, false);
+                }
                 let previous = live.and_then(|(loc, header)| {
                     inner.touch(loc, &header);
                     want_previous.then(|| inner.value_ref(loc, &header).share())
@@ -2459,7 +2504,7 @@ impl Store {
                     applied: false,
                     previous,
                     wrong_type: false,
-                    _garbage: Vec::new(),
+                    _garbage: garbage,
                 });
             }
             let deadline = match expiry {
@@ -2532,9 +2577,17 @@ impl Store {
             }
             if existing.is_some() && live.is_none() {
                 inner.mem.expired += 1;
+                inner.watched.changed(key, Change::Expired);
             }
             inner.mem.writes += 1;
-            inner.watched.changed(key, false);
+            inner.watched.changed(
+                key,
+                if live.is_some() {
+                    Change::Written
+                } else {
+                    Change::Created
+                },
+            );
             inner.maybe_defrag(self.near_limit(), now, &self.hasher, &mut garbage);
             self.sync_usage(shard, inner, false);
             return Ok(SetOutcome {
@@ -2768,7 +2821,7 @@ impl Store {
             inner.touch(loc, &header);
             if changed {
                 inner.mem.writes += 1;
-                inner.watched.changed(key, false);
+                inner.watched.changed(key, Change::Written);
             }
             Some(result)
         });
@@ -2830,7 +2883,7 @@ impl Store {
             inner.touch(loc, &header);
             if changed {
                 inner.mem.writes += 1;
-                inner.watched.changed(key, false);
+                inner.watched.changed(key, Change::Written);
             }
             Some(result)
         });
@@ -2923,7 +2976,7 @@ impl Store {
                 // `with_entry` already counted its new size.
                 inner.touch(*loc, header);
                 inner.mem.writes += 1;
-                inner.watched.changed(key, false);
+                inner.watched.changed(key, Change::Written);
                 return Ok(true);
             }
             (Update::ChangedUnseen, Some((loc, header))) => {
@@ -2935,7 +2988,7 @@ impl Store {
                 inner.unlink(hash, *loc);
                 garbage.extend(inner.kill(*loc));
                 inner.mem.writes += 1;
-                inner.watched.changed(key, false);
+                inner.watched.changed(key, Change::Removed);
                 return Ok(true);
             }
             (Update::Expire(expiry), Some((loc, header))) => {
@@ -2944,14 +2997,16 @@ impl Store {
                     Expiry::Never => NO_EXPIRY,
                     Expiry::At(deadline) => deadline,
                 };
-                if deadline != NO_EXPIRY && deadline <= now {
+                let how = if deadline != NO_EXPIRY && deadline <= now {
                     inner.unlink(hash, *loc);
                     garbage.extend(inner.kill(*loc));
+                    Change::Removed
                 } else {
                     inner.set_deadline(hash, key, *loc, header, deadline);
-                }
+                    Change::Written
+                };
                 inner.mem.writes += 1;
-                inner.watched.changed(key, false);
+                inner.watched.changed(key, how);
                 return Ok(true);
             }
         };
@@ -2964,6 +3019,11 @@ impl Store {
             ),
             None => (None, NO_EXPIRY, 0),
         };
+        let how = if existing.is_some() {
+            Change::Written
+        } else {
+            Change::Created
+        };
         let kind = collection.kind();
         let index = inner.store_object(key, collection);
         let Some(new) = inner.append(kind, usage, &Payload::External(index), deadline) else {
@@ -2972,7 +3032,7 @@ impl Store {
         };
         garbage.extend(inner.replace(hash, old, new));
         inner.mem.writes += 1;
-        inner.watched.changed(key, false);
+        inner.watched.changed(key, how);
         Ok(true)
     }
 
@@ -3000,7 +3060,7 @@ impl Store {
             inner.segment_mut(split(*loc).0).buf[range.clone()].copy_from_slice(value);
             inner.touch(*loc, header);
             inner.mem.writes += 1;
-            inner.watched.changed(key, false);
+            inner.watched.changed(key, Change::Written);
             return Ok(false);
         }
         let (old, deadline, usage) = match existing {
@@ -3058,9 +3118,14 @@ impl Store {
             }
             return Err(Retry::OutOfIds);
         };
+        let how = if old.is_some() {
+            Change::Written
+        } else {
+            Change::Created
+        };
         garbage.extend(inner.replace(hash, old, new));
         inner.mem.writes += 1;
-        inner.watched.changed(key, false);
+        inner.watched.changed(key, how);
         Ok(true)
     }
 
@@ -3151,6 +3216,22 @@ impl Store {
             for shard in db.shards.iter() {
                 let mut inner = db.lock(shard);
                 inner.watched.broadcast = on.then(|| base.clone());
+                inner.watched.update();
+            }
+        }
+    }
+
+    /// Keyspace notifications came on or went off: while on, every change in
+    /// every database goes into its thread's log for them (`notify::log`).
+    pub(crate) fn set_notifying(&self, on: bool) {
+        let base = self.base();
+        let _creating = base.broadcasting.lock();
+        base.notifying.store(on, Relaxed);
+        for db in base.live() {
+            let events = on.then_some(db.index() as u16);
+            for shard in db.shards.iter() {
+                let mut inner = db.lock(shard);
+                inner.watched.events = events;
                 inner.watched.update();
             }
         }
@@ -3528,7 +3609,7 @@ impl Store {
                 return Ok(Renamed::NoSuchKey);
             };
             if header.is_expired(now) {
-                src.watched.changed(from.bytes, true);
+                src.watched.changed(from.bytes, Change::Expired);
                 src.unlink(from_hash, loc);
                 garbage.extend(src.kill(loc));
                 src.mem.expired += 1;
@@ -3612,9 +3693,17 @@ impl Store {
             garbage.extend(target.replace(to_hash, old, new));
             if expired {
                 target.mem.expired += 1;
+                target.watched.changed(to.bytes, Change::Expired);
             }
             target.mem.writes += 1;
-            target.watched.changed(to.bytes, false);
+            target.watched.changed(
+                to.bytes,
+                if live.is_some() {
+                    Change::Written
+                } else {
+                    Change::Created
+                },
+            );
             // Like Redis, as if deleted and added again: clients blocked on
             // the destination may be served.
             if !target.waiting.is_empty() {
@@ -3627,7 +3716,7 @@ impl Store {
                 garbage.extend(src.kill(loc));
             }
             src.mem.writes += 1;
-            src.watched.changed(from.bytes, false);
+            src.watched.changed(from.bytes, Change::Removed);
             let eager = self.near_limit();
             src.maybe_defrag(eager, now, &self.hasher, &mut garbage);
             self.sync_usage(&self.shards[a], src, false);

@@ -28,6 +28,7 @@ cargo run --release -- --maxclients 2000 --timeout 300 --tcp-keepalive 60
 cargo run --release -- --snapshot data/tantalum.snapshot   # keep data across restarts
 cargo run --release -- --aof data/aof   # log every write too: a crash loses about a second
 cargo run --release -- --tls-port 6380 --tls-cert-file cert.pem --tls-key-file key.pem
+cargo run --release -- --notify-keyspace-events Egx   # keyspace notifications, as Redis' setting
 redis-cli SET greeting hello EX 60
 redis-cli GET greeting
 ```
@@ -134,7 +135,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, database, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and how many subscriptions) reads as 0, `N` or `NULL` |
 | `CLIENT KILL addr:port`, `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port] [LADDR addr:port] [SKIPME yes\|no]` | Closes other connections at once, and the caller's own after its reply |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS\|GETKEYS\|GETKEYSANDFLAGS]` | Each entry is Redis 7.2.4's own, ACL categories, key specifications, tips and documentation included (`tools/command-table.py`). `COUNT` and `LIST` say what's here, not what Redis has |
-| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `acllog-max-len`, `acl-pubsub-default`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `latency-tracking`, `latency-tracking-info-percentiles`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`). The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started, `save` with `--snapshot` and `notify-keyspace-events`. `CONFIG REWRITE` says there's no config file |
+| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `acllog-max-len`, `acl-pubsub-default`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `latency-tracking`, `latency-tracking-info-percentiles`, `notify-keyspace-events`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`). The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started and `save` with `--snapshot`. `CONFIG REWRITE` says there's no config file |
 | `MONITOR` | Every command run, as Redis' lines show them: what's secret `(redacted)`, a script's own commands as `lua`, admin commands left out. It costs commands nothing until someone runs it (see Design) |
 | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` | As Redis', with what's secret `(redacted)`, and the commands inside `EXEC` and scripts too. At its default of 10 ms and above, durations are in 5 ms ticks, and commands Redis flags `fast` aren't timed (see Design); below that, a real clock as in Redis |
 | `LATENCY LATEST\|HISTORY\|RESET\|GRAPH\|DOCTOR\|HELP`, `LATENCY HISTOGRAM [command ...]` | With `latency-monitor-threshold`, spikes in `command` and `fast-command`, as Redis keeps them. `HISTOGRAM` is each command's latencies, in Redis' steps, counted from the first time something asks for command statistics (see "Command statistics") |
@@ -210,6 +211,28 @@ That's 11 of 10,530 (180 before users and ACLs came in 0.27.0, 99 before functio
 `tools/admin-diff.py` compares the admin commands with Redis 7.2.4 directly: 3,412 commands
 and checks, every command's `COMMAND` entries and every
 setting among them, no differences.
+
+Redis' own test suite (its `tests/`, all 80 files but cluster mode's, run by its tcl
+harness) is the strictest of all, as it also checks internals: encodings, replication, log
+and snapshot files, logs. `bench/redis-tests/` runs it on Tantalum and on Redis 7.2.4 both
+ways the harness can: against one server per file (as Redis' CI runs external servers),
+where Tantalum 0.31.0 passed 1,651 of the 1,991 tests Redis passed (83%); and starting its
+own servers from config files (through `redis-server-wrap.py`), 1,911 of 2,777 (69%). What
+was lost, by what it needs (`results.txt` has the details), against one server:
+
+| What it needs | Lost |
+|---|---|
+| `OBJECT ENCODING` as Redis reports it, and the `*-max-listpack-*` settings acting (50 of these are `SORT` tests that never ran: their file stops at an encoding check outside any test) | 101 |
+| `unit/scripting`'s tests after its busy-script ones, which didn't run | 42 |
+| Replication (most read what a command propagates, connected as a replica) | 35 |
+| `CONFIG SET appendonly` at runtime | 29 |
+| RDB files: `SAVE` without `--snapshot`, `DEBUG RELOAD` | 22 |
+| Keyspace notifications (14 pass since 0.32.0, which also sends what subscribing says to a client with `CLIENT REPLY OFF`, as Redis does) | 15 |
+| `MULTI` refusing a write when out of memory, and the transaction an earlier failure leaves open | 11 |
+| Read-only scripts killed past `busy-reply-threshold`, which hang | 10 |
+| `CLIENT PAUSE`d clients counted as blocked, as the tests wait for | 10 |
+| `DEBUG DIGEST`, `DIGEST-VALUE`, `PROTOCOL`, `REPLYBUFFER` | 7 |
+| Inline commands with unbalanced quotes, `WATCH` of expired keys, and small `INFO`, `CLIENT LIST` and `COMMAND LIST` fields | 58 |
 
 ## Design
 
@@ -650,6 +673,41 @@ setting among them, no differences.
   commands inside. Redis' `unit/info` passes 17 of its 20 tests (the other 3 read
   event-loop fields that aren't here) and `unit/latency-monitor` 14 of 15 (expiry isn't
   a latency event here).
+- **Keyspace notifications** (`src/notify.rs`): `notify-keyspace-events` as Redis 7.2
+  has it, every class and both channels (`__keyspace@DB__:key` and
+  `__keyevent@DB__:event`), set by `CONFIG SET` or `--notify-keyspace-events`. Redis
+  calls its notifier at each of the ninety-odd places a command changes a key; here no
+  command changes for it. The store already tells `WATCH` and tracking of every key that
+  changes, through a flag that's off while nobody listens. While notifications are on,
+  that flag is set in every shard, each change (written, made, removed, expired,
+  evicted) goes into the thread's log, and every connection takes the checked path,
+  where a command's name, arguments and reply, with what the log says it did, give
+  Redis' events in Redis' order. A few commands look before they run, only then:
+  `XADD` with a limit (did it trim?), `XREADGROUP`, `XCLAIM` and `XAUTOCLAIM` (did they
+  make a consumer?), and for `keymiss` the keys a command reads. A command's events go
+  out when the command that ran it ends (`EXEC` and scripts included), then those of
+  the blocked clients it served; keys that expire in the background are sent from the
+  expiry thread. With notifications off, nothing is logged and commands run the same
+  code: against 0.31.0 on the Agent37 VM, a `GET` takes 0.04% fewer user-space
+  instructions and a `SET` at pipeline 16 0.02% fewer. With them on, every command takes
+  the checked path, and each change is copied and each event formatted and published:
+  a `GET` without pipelining takes 34% more user-space instructions (3% more cycles with
+  the kernel's), at pipeline 16 84% more (32% more cycles); a `SET` at pipeline 16 2.7
+  times the instructions with nobody subscribed (83% more cycles), and 3.7 times with a
+  client subscribed to every event (2.4 times the cycles). `tools/notify-diff.py` runs the same commands on both with a client
+  subscribed to everything and compares what it hears: for each of `KEA`, `KEAn` and
+  `Em`, 217 scripted cases and 10,600 random commands (transactions, scripts, a blocked
+  client and keys expiring as they're read among them) hear what they hear on Redis
+  7.2.4, and reply the same (but for `keymiss` from `XREADGROUP` on a missing stream,
+  fixed after that run). Redis' own `unit/pubsub` passes 33 of its 34 tests (18 on
+  0.31.0). Approximate: `keymiss`
+  goes by the keys of read-only commands and of the writes Redis reads (`GETDEL`,
+  `BITOP`'s sources, `SUNIONSTORE`'s and the like), looked at before the command; and
+  of a command's keys that expire as it runs, those it has events for hear `expired`
+  just before them, the rest first. Redis' own test of `evicted` sets `maxmemory 1`
+  with one key, which here refuses the next write without evicting (a write bigger than
+  the whole limit is refused up front, and lowering the limit evicts nothing until a
+  write needs room); with a fuller store, every evicted key is heard.
 - **Blocking commands** (`src/blocking.rs`): a `BLPOP` whose keys are all
   empty registers its client on each key, in the key's shard under its lock,
   and checks the keys once more, so a push in between isn't missed. A write
@@ -1520,7 +1578,7 @@ hit rates share the seeding flaw described above.
   that's never had anything to hear. Which keys a full table (`tracking-table-max-keys`)
   drops is a matter of chance in both, but not the same chance. A tracking client's BullMQ
   scripts run in Lua, not natively, so that what they read is remembered.
-- **Pub/sub gaps**: no keyspace notifications, `CLIENT LIST` counts only
+- **Pub/sub gaps**: `CLIENT LIST` counts only
   the caller's subscriptions (it knows who is subscribed), and the output
   limit is fixed at Redis' defaults. The registry's
   own memory (channel names and their subscriber tables) isn't in

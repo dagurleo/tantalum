@@ -18,6 +18,7 @@ mod hll;
 mod id_map;
 mod latency;
 mod list;
+mod notify;
 mod pages;
 pub mod pubsub;
 mod rdb;
