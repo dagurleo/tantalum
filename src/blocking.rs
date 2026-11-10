@@ -519,9 +519,15 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
             let served = loop {
                 let mut out = Vec::new();
                 let client = claimed.waiter.client;
+                let mark = ctx.notifying().then(crate::notify::mark);
                 let (attempt, pushes) = crate::tracking::on_behalf_of(client, || {
                     claimed.waiter.run_again(ctx, now, &mut out)
                 });
+                if let Some(mark) = mark {
+                    let waiter = &claimed.waiter;
+                    let args = Args::new(&waiter.buf, &waiter.ranges);
+                    crate::notify::served(ctx, db, now, &args, &out, mark);
+                }
                 match attempt {
                     Attempt::Done => {
                         if ctx.stats.is_on() {
@@ -555,6 +561,9 @@ pub(crate) fn serve_ready(ctx: &Context, now: Millis) {
     }
     // What the served commands changed.
     broadcast(ctx);
+    if ctx.notifying() {
+        crate::notify::flush(ctx);
+    }
 }
 
 /// Sends the clients tracking in `BCAST` mode what changed.

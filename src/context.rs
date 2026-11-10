@@ -180,6 +180,8 @@ pub struct Context {
     pause: Mutex<Option<Pause>>,
     /// Whether `pause` holds one, so that the checked path's commands needn't lock it.
     paused: AtomicBool,
+    /// `notify-keyspace-events`, as flags (see `notify.rs`).
+    keyspace_events: AtomicU32,
     /// What `CONFIG SET` can change of [`Settings`].
     maxclients: AtomicUsize,
     /// In milliseconds, 0 for none.
@@ -231,6 +233,7 @@ impl Context {
             monitors: Mutex::new(Vec::new()),
             pause: Mutex::new(None),
             paused: AtomicBool::new(false),
+            keyspace_events: AtomicU32::new(0),
             maxclients: AtomicUsize::new(settings.maxclients),
             timeout: AtomicU64::new(settings.timeout.map_or(0, |t| t.as_millis() as u64)),
             tcp_keepalive: AtomicU64::new(
@@ -409,7 +412,8 @@ impl Context {
             || self.pause.lock().is_some()
             || self.slowlog.needs_precise()
             || self.latency.threshold() != 0
-            || self.stats.is_on();
+            || self.stats.is_on()
+            || self.notifying();
         if on {
             self.special.fetch_or(SPECIAL_ON, Relaxed);
         } else {
@@ -577,6 +581,37 @@ impl Context {
 
     pub(crate) fn set_cron_paused(&self, paused: bool) {
         self.cron_paused.store(paused, Relaxed);
+    }
+
+    /// `notify-keyspace-events`, as flags.
+    pub(crate) fn keyspace_events(&self) -> u32 {
+        self.keyspace_events.load(Relaxed)
+    }
+
+    /// Whether keyspace notifications send anything (and so every command is
+    /// watched, and every change logged).
+    pub(crate) fn notifying(&self) -> bool {
+        crate::notify::sends(self.keyspace_events())
+    }
+
+    /// `--notify-keyspace-events`: as `CONFIG SET` would.
+    pub fn set_notify_keyspace_events(&self, classes: &str) -> Result<(), &'static str> {
+        let flags = crate::notify::parse(classes.as_bytes()).ok_or(crate::notify::INVALID)?;
+        self.config
+            .set("notify-keyspace-events", &crate::notify::format(flags));
+        self.set_keyspace_events(flags);
+        Ok(())
+    }
+
+    /// `notify-keyspace-events` changed.
+    pub(crate) fn set_keyspace_events(&self, flags: u32) {
+        let was = self.notifying();
+        self.keyspace_events.store(flags, Relaxed);
+        let on = self.notifying();
+        if on != was {
+            self.store.set_notifying(on);
+            self.update_special();
+        }
     }
 
     /// Whether clients are paused: `Some(true)` for every command, `Some(false)` for

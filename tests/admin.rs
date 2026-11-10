@@ -604,9 +604,19 @@ async fn config_reads_and_sets() {
             .contains("must be one of the following: volatile-lru")
     );
     assert!(
-        c.call(&["CONFIG", "SET", "notify-keyspace-events", "KEA"])
+        c.call(&["CONFIG", "SET", "notify-keyspace-events", "KEw"])
             .await
-            .contains("keyspace notifications")
+            .contains("Invalid event class character. Use 'Ag$lshzxeKEtmdn'.")
+    );
+    // Keyspace notifications act (tests/notify.rs), and read back as Redis says them.
+    assert_eq!(
+        c.call(&["CONFIG", "SET", "notify-keyspace-events", "KEA"])
+            .await,
+        "+OK\r\n"
+    );
+    assert_eq!(
+        c.call(&["CONFIG", "GET", "notify-keyspace-events"]).await,
+        "*2\r\n$22\r\nnotify-keyspace-events\r\n$3\r\nAKE\r\n"
     );
     assert_eq!(
         c.call(&["CONFIG", "SET", "notify-keyspace-events", ""])

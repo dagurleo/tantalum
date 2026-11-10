@@ -1,0 +1,67 @@
+Redis 7.2.4's own test suite (tests/, 80 files: all of test_helper.tcl's but cluster
+mode's), on Tantalum 0.31.0 and on Redis 7.2.4, Agent37 VMs, 2026-11-10 (run.sh, two
+files at a time per server). A test is lost when it passed on Redis and didn't on
+Tantalum: it failed, hung (3 minutes without progress), or never ran because its file
+stopped first. Keyspace notifications came after this run (0.32.0): its unit/pubsub
+results are below.
+
+external (one server per file, which the harness talks to, as Redis' CI "external
+server" job does; tests tagged external:skip don't run on either):
+  Redis passed 1991, Tantalum 1651 of those (83%), lost 340 (127 never ran).
+  Tantalum alone passed 6.
+
+spawn (the harness starts its servers from a config file, as Redis' own CI does:
+redis-server-wrap.py starts Tantalum with those settings, the ones it has as flags
+and the rest by CONFIG SET):
+  Redis passed 2777, Tantalum 1911 of those (69%), lost 866 (318 never ran).
+
+Lost, by what they need (categorize.py; external, spawn):
+
+  OBJECT ENCODING and encoding settings       101  101
+      Reported encodings differ (listpack, quicklist, skiplist, hashtable, intset,
+      int/raw) and the *-max-listpack-* settings are remembered but don't act. 50 of
+      these are unit/sort, which stops at an encoding check outside any test, so
+      its sorting tests never run; 14 more need DEBUG QUICKLIST-PACKED-THRESHOLD.
+  scripting: rest of the file never ran       42    78
+      External: the tests after the busy-script ones (RESP2/RESP3 conversions in
+      scripts, time frozen during a script); spawn: a replica block fails to start.
+  replication: SYNC, REPLICAOF, WAIT, PSYNC   35   245
+      Mostly tests that read what a command propagates (they connect as a replica
+      with SYNC), and in spawn the replication files themselves.
+  CONFIG SET appendonly at runtime, AOF files 29    91
+      unit/type/stream stops at one (25 never run); spawn: aof, aof-multi-part,
+      aofrw read Redis' multi-part AOF files.
+  RDB files: SAVE/BGSAVE, DEBUG RELOAD        22   115
+      SAVE without --snapshot, DEBUG RELOAD; spawn: 71 of corrupt-dump and rdb's
+      tests start a server on an .rdb file.
+  keyspace notifications                      15    15   (0.32.0)
+  busy scripts: SCRIPT/FUNCTION KILL          10    10
+      Read-only timed-out scripts killed with SCRIPT KILL, MULTI with a script
+      timeout: these hang.
+  CLIENT PAUSE: paused clients as blocked     10    12
+      The tests wait for blocked_clients to count paused ones, as Redis' does.
+  MULTI: OOM refused when queued, then        11    12
+      a transaction left open by that failure (7)
+  WATCH with expired keys                      5     5
+  DEBUG DIGEST, DIGEST-VALUE, PROTOCOL,        7    13
+      REPLYBUFFER
+  protocol: inline quotes, big argument        6     6
+      counts
+  small fields and replies                    47    22
+      INFO fields (rejected_calls, number_of_cached_scripts, dirty counts,
+      keys=), CLIENT LIST qbuf, COMMAND LIST subcommands, CLIENT HELP, OBJECT
+      IDLETIME and RESTORE's IDLETIME/FREQ, lazyfree counters, querybuf, slowlog
+      of blocked commands, the expire-cycle latency event, EXPIRE overflow error,
+      GETEX PXAT rounding, CONFIG SET of several values, CLUSTER in scripts
+  spawn only:
+      logs, crash reports, startup/shutdown          36
+      client eviction, output buffer limits          29
+      maxmemory, memefficiency, lazyfree             20
+      ACL file and startup users                     18
+      other                                          38
+
+Keyspace notifications, 0.32.0: unit/pubsub (external) passes 33 of its 34 tests,
+against 18 on 0.31.0. The one left, "evicted events", sets maxmemory 1 with one key:
+here a write bigger than the whole limit is refused up front, and lowering the limit
+evicts nothing until a write needs room. "PubSub messages with CLIENT REPLY OFF"
+passes too: what subscribing says is a push, sent with replies off, as in Redis.
