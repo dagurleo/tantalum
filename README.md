@@ -953,7 +953,11 @@ was lost, by what it needs (`results.txt` has the details), against one server:
     says it can (`capa eof`, as Redis' and Tantalum's do), the file is streamed as it's
     written, between a mark it ends with, and the stream starts once the replica has
     acked; to one that can't, it's written to memory first, to send with its length.
-    A replica holds the file in memory until it's loaded.
+    A replica loads the file as it comes (Redis' `repl-diskless-load`), a record at a
+    time, so it never holds the file: emptied first, `LOADING` until it's done, and
+    emptied again if the connection drops partway, for the next sync. A replica of
+    Redis 7.2.4 with 1M keys and a 118 MB file peaked at 166-184 MB, where it
+    peaked at 283-290 MB holding the file whole.
   - *A replica runs what its master sends as its master ran it*: on a thread of its own,
     in a write's turn (so its own replicas get the same bytes, at the same offsets, and
     a full sync of one is consistent), past `maxmemory`, and with no key expiring by its
@@ -1607,9 +1611,11 @@ hit rates share the seeding flaw described above.
 - **Replication gaps**: no writable replicas (`replica-read-only no` is refused), no
   `FAILOVER` and no Sentinel, and no cluster. A replica over TLS checks its master's
   certificate against `--tls-ca-cert-file` only (no `tls-ca-cert-dir`, no client
-  certificate of its own). A replica holds its master's
-  file in memory until it has loaded it (Redis' `repl-diskless-load disabled` writes it
-  to disk first), and a full sync copies the data, shard by shard, as writes come (memory
+  certificate of its own). A replica loads its master's file
+  as it comes, whatever `repl-diskless-load` says, so it serves `LOADING`, not its old
+  data, while a full sync's file comes (Redis' default, `disabled`, writes the file to
+  disk first and serves the old data meanwhile; `swapdb` keeps it loaded beside the new).
+  A full sync copies the master's data, shard by shard, as writes come (memory
   up to about the data's size again, at worst, as with Redis' fork).
   `repl-diskless-sync` and its delay are accepted and do nothing: a master streams the
   file at once. `repl-diskless-load` and `replica-lazy-flush` take anything and do

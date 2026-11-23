@@ -19,6 +19,7 @@ use crate::rdb::{self, Reader};
 use std::sync::Arc;
 
 use crate::store::{CopySlot, Expiry, Millis, NO_EXPIRY, Store};
+use crate::stream::NodeLimits;
 
 /// What Redis 7.2 writes; anything up to it loads.
 const VERSION: u16 = 11;
@@ -233,32 +234,202 @@ pub(crate) struct Loaded {
     pub repl_stream_db: Option<i64>,
 }
 
-/// Loads a whole RDB file into `ctx`'s databases, over what's there (the
-/// caller flushes first, functions included: libraries named again are an
-/// error). Writes aren't held to `maxmemory` meanwhile. On an error, what
-/// came before it stays loaded.
-pub(crate) fn load(ctx: &Context, data: &[u8]) -> Result<Loaded, String> {
+/// Loads an RDB file into `ctx`'s databases, over what's there (the caller
+/// flushes first, functions included: libraries named again are an error),
+/// as it's read from `src`: a record at a time, so what's held is the record
+/// being read, not the file. Writes aren't held to `maxmemory` meanwhile. On
+/// an error, what came before it stays loaded. Reads `src` no further than
+/// the checksum.
+pub(crate) fn load(ctx: &Context, src: impl io::Read) -> Result<Loaded, String> {
     ctx.store.set_loading(true);
-    let loaded = load_keys(ctx, data);
+    let loaded = load_keys(ctx, &mut Input::new(src));
     ctx.store.set_loading(false);
     loaded
 }
 
-fn load_keys(ctx: &Context, data: &[u8]) -> Result<Loaded, String> {
-    let short = || "Short read or OOM loading DB. Unrecoverable error, aborting now.".to_string();
-    if data.len() < 9 || &data[..5] != b"REDIS" {
-        return Err("Wrong signature trying to load DB from file".into());
+/// The first read, and the least a read asks for.
+const CHUNK: usize = 64 * 1024;
+
+/// The file as it's read: the bytes read and not yet loaded, and a CRC-64 of
+/// those loaded.
+struct Input<R> {
+    src: R,
+    buf: Vec<u8>,
+    pos: usize,
+    /// `src` has nothing more.
+    ended: bool,
+    crc: u64,
+}
+
+impl<R: io::Read> Input<R> {
+    fn new(src: R) -> Self {
+        Input {
+            src,
+            buf: Vec::new(),
+            pos: 0,
+            ended: false,
+            crc: 0,
+        }
     }
-    let version = std::str::from_utf8(&data[5..9])
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
-        .filter(|v| (1..=VERSION).contains(v))
-        .ok_or_else(|| {
-            format!(
-                "Can't handle RDB format version {}",
-                String::from_utf8_lossy(&data[5..9])
-            )
-        })?;
+
+    /// Reads until at least `want` bytes not yet loaded are held, or `src`
+    /// ends.
+    fn fill(&mut self, want: usize) -> Result<(), String> {
+        if self.pos > 0 {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+        let mut have = self.buf.len();
+        if have >= want || self.ended {
+            return Ok(());
+        }
+        self.buf.resize(want, 0);
+        while have < want {
+            match self.src.read(&mut self.buf[have..]) {
+                Ok(0) => {
+                    self.ended = true;
+                    break;
+                }
+                Ok(n) => have += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.buf.truncate(have);
+                    return Err(format!("reading the file: {e}"));
+                }
+            }
+        }
+        self.buf.truncate(have);
+        Ok(())
+    }
+
+    /// Reads one record with `f`, from what's held, reading more while it
+    /// stops short (as much again each time, so a big record is read over a
+    /// few times, not once per read). An error that isn't [`Stop::More`]
+    /// stops it at once; one that is, once there's no more to read.
+    fn next<T>(&mut self, f: impl Fn(&mut Reader<'_>) -> Result<T, Stop>) -> Result<T, String> {
+        loop {
+            let held = &self.buf[self.pos..];
+            let mut reader = Reader::new(held);
+            match f(&mut reader) {
+                Ok(t) => {
+                    let used = held.len() - reader.remaining();
+                    self.crc = rdb::crc64(self.crc, &held[..used]);
+                    self.pos += used;
+                    return Ok(t);
+                }
+                Err(Stop::Fatal(e)) => return Err(e),
+                Err(Stop::More(e)) => {
+                    if self.ended {
+                        return Err(e);
+                    }
+                    let held = self.buf.len() - self.pos;
+                    self.fill(held.saturating_mul(2).max(CHUNK))?;
+                }
+            }
+        }
+    }
+}
+
+/// Why a record didn't read.
+enum Stop {
+    /// It may be that the file has more of it: the error if it hasn't.
+    More(String),
+    /// It can't load whatever comes.
+    Fatal(String),
+}
+
+fn short() -> Stop {
+    Stop::More("Short read or OOM loading DB. Unrecoverable error, aborting now.".into())
+}
+
+/// A record of the file.
+enum Record {
+    /// The next key's expiry time (Unix ms).
+    Expiry(i64),
+    Skip,
+    Eof,
+    Select(u64),
+    Aux(Vec<u8>, Vec<u8>),
+    Function(Vec<u8>),
+    Key(Vec<u8>, rdb::Object),
+}
+
+fn record(reader: &mut Reader<'_>, limits: NodeLimits) -> Result<Record, Stop> {
+    let kind = reader.byte().ok_or_else(short)?;
+    Ok(match kind {
+        OPCODE_EXPIRETIME => {
+            let s = reader.take(4).ok_or_else(short)?;
+            let s = i32::from_le_bytes(s.try_into().expect("4 bytes"));
+            Record::Expiry(i64::from(s) * 1000)
+        }
+        OPCODE_EXPIRETIME_MS => {
+            let ms = reader.take(8).ok_or_else(short)?;
+            Record::Expiry(i64::from_le_bytes(ms.try_into().expect("8 bytes")))
+        }
+        OPCODE_FREQ => {
+            reader.byte().ok_or_else(short)?;
+            Record::Skip
+        }
+        OPCODE_IDLE => {
+            reader.len().ok_or_else(short)?;
+            Record::Skip
+        }
+        OPCODE_EOF => Record::Eof,
+        OPCODE_SELECTDB => Record::Select(reader.len().ok_or_else(short)?),
+        OPCODE_RESIZEDB => {
+            reader.len().ok_or_else(short)?;
+            reader.len().ok_or_else(short)?;
+            Record::Skip
+        }
+        OPCODE_AUX => {
+            let name = reader.string().ok_or_else(short)?;
+            let value = reader.string().ok_or_else(short)?;
+            Record::Aux(name, value)
+        }
+        OPCODE_MODULE_AUX => {
+            return Err(Stop::Fatal(
+                "The RDB file contains AUX module data I can't load: no matching module".into(),
+            ));
+        }
+        rdb::OPCODE_FUNCTION_PRE_GA => {
+            return Err(Stop::Fatal("Pre-GA function format not supported".into()));
+        }
+        rdb::OPCODE_FUNCTION2 => Record::Function(reader.string().ok_or_else(short)?),
+        TYPE_MODULE_PRE_GA | TYPE_MODULE_2 => {
+            return Err(Stop::Fatal(
+                "The RDB file contains module data I can't load: no matching module".into(),
+            ));
+        }
+        _ => {
+            let key = reader.string().ok_or_else(short)?;
+            let object = rdb::load_object(kind, reader, limits)
+                .ok_or_else(|| Stop::More(format!("Bad data format (type {kind})")))?;
+            Record::Key(key, object)
+        }
+    })
+}
+
+fn load_keys(ctx: &Context, input: &mut Input<impl io::Read>) -> Result<Loaded, String> {
+    let version = input.next(|reader| {
+        let head = reader
+            .take(9)
+            .ok_or_else(|| Stop::More("Wrong signature trying to load DB from file".into()))?;
+        if &head[..5] != b"REDIS" {
+            return Err(Stop::Fatal(
+                "Wrong signature trying to load DB from file".into(),
+            ));
+        }
+        std::str::from_utf8(&head[5..9])
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|v| (1..=VERSION).contains(v))
+            .ok_or_else(|| {
+                Stop::Fatal(format!(
+                    "Can't handle RDB format version {}",
+                    String::from_utf8_lossy(&head[5..9])
+                ))
+            })
+    })?;
     let mut loaded = Loaded {
         version,
         ..Loaded::default()
@@ -266,35 +437,15 @@ fn load_keys(ctx: &Context, data: &[u8]) -> Result<Loaded, String> {
     let store = &ctx.store;
     let now = store.now();
     let limits = ctx.stream_limits();
-    let mut reader = Reader::new(&data[9..]);
     let mut db = store;
     let mut expiry: Option<i64> = None;
     let mut functions = Vec::new();
     loop {
-        let kind = reader.byte().ok_or_else(short)?;
-        match kind {
-            OPCODE_EXPIRETIME => {
-                let s = reader.take(4).ok_or_else(short)?;
-                let s = i32::from_le_bytes(s.try_into().expect("4 bytes"));
-                expiry = Some(i64::from(s) * 1000);
-                continue;
-            }
-            OPCODE_EXPIRETIME_MS => {
-                let ms = reader.take(8).ok_or_else(short)?;
-                expiry = Some(i64::from_le_bytes(ms.try_into().expect("8 bytes")));
-                continue;
-            }
-            OPCODE_FREQ => {
-                reader.byte().ok_or_else(short)?;
-                continue;
-            }
-            OPCODE_IDLE => {
-                reader.len().ok_or_else(short)?;
-                continue;
-            }
-            OPCODE_EOF => break,
-            OPCODE_SELECTDB => {
-                let index = reader.len().ok_or_else(short)?;
+        match input.next(|reader| record(reader, limits))? {
+            Record::Expiry(at) => expiry = Some(at),
+            Record::Skip => {}
+            Record::Eof => break,
+            Record::Select(index) => {
                 if index >= store.databases() as u64 {
                     return Err(format!(
                         "FATAL: Data file was created with a Redis server configured to \
@@ -303,16 +454,8 @@ fn load_keys(ctx: &Context, data: &[u8]) -> Result<Loaded, String> {
                     ));
                 }
                 db = store.db(index as usize);
-                continue;
             }
-            OPCODE_RESIZEDB => {
-                reader.len().ok_or_else(short)?;
-                reader.len().ok_or_else(short)?;
-                continue;
-            }
-            OPCODE_AUX => {
-                let name = reader.string().ok_or_else(short)?;
-                let value = reader.string().ok_or_else(short)?;
+            Record::Aux(name, value) => {
                 let int = || std::str::from_utf8(&value).ok()?.parse::<i64>().ok();
                 match &name[..] {
                     b"repl-id" => loaded.repl_id = Some(String::from_utf8_lossy(&value).into()),
@@ -320,64 +463,49 @@ fn load_keys(ctx: &Context, data: &[u8]) -> Result<Loaded, String> {
                     b"repl-stream-db" => loaded.repl_stream_db = int(),
                     _ => {}
                 }
-                continue;
             }
-            OPCODE_MODULE_AUX => {
-                return Err(
-                    "The RDB file contains AUX module data I can't load: no matching module".into(),
-                );
-            }
-            rdb::OPCODE_FUNCTION_PRE_GA => {
-                return Err("Pre-GA function format not supported".into());
-            }
-            rdb::OPCODE_FUNCTION2 => {
-                let code = reader.string().ok_or_else(short)?;
+            Record::Function(code) => {
                 functions.push(rdb::OPCODE_FUNCTION2);
                 rdb::put_string(&mut functions, &code);
                 loaded.functions += 1;
-                continue;
             }
-            TYPE_MODULE_PRE_GA | TYPE_MODULE_2 => {
-                return Err(
-                    "The RDB file contains module data I can't load: no matching module".into(),
-                );
-            }
-            _ => {}
-        }
-        let key = reader.string().ok_or_else(short)?;
-        let object = rdb::load_object(kind, &mut reader, limits)
-            .ok_or_else(|| format!("Bad data format (type {kind})"))?;
-        let at = expiry.take();
-        // Redis skips the empty collections an older version could leave.
-        let empty = match &object {
-            rdb::Object::List(v) | rdb::Object::Set(v) => v.is_empty(),
-            rdb::Object::ZSet(v) => v.is_empty(),
-            rdb::Object::Hash(v) => v.is_empty(),
-            rdb::Object::String(_) | rdb::Object::Stream(_) => false,
-        };
-        if empty {
-            continue;
-        }
-        let expiry = match at {
-            None => Expiry::Never,
-            Some(at) => {
-                if at <= db.deadline_to_unix_ms(now, now) {
-                    loaded.expired += 1;
+            Record::Key(key, object) => {
+                let at = expiry.take();
+                // Redis skips the empty collections an older version could leave.
+                let empty = match &object {
+                    rdb::Object::List(v) | rdb::Object::Set(v) => v.is_empty(),
+                    rdb::Object::ZSet(v) => v.is_empty(),
+                    rdb::Object::Hash(v) => v.is_empty(),
+                    rdb::Object::String(_) | rdb::Object::Stream(_) => false,
+                };
+                if empty {
+                    continue;
                 }
-                Expiry::At(db.deadline_from_unix_ms(now, at))
+                let expiry = match at {
+                    None => Expiry::Never,
+                    Some(at) => {
+                        if at <= db.deadline_to_unix_ms(now, now) {
+                            loaded.expired += 1;
+                        }
+                        Expiry::At(db.deadline_from_unix_ms(now, at))
+                    }
+                };
+                let (kind, value) = dump::packed(object);
+                db.restore(&key, kind, &value, expiry, now).map_err(
+                    |_| "Short read or OOM loading DB. Unrecoverable error, aborting now.",
+                )?;
+                loaded.keys += 1;
             }
-        };
-        let (kind, value) = dump::packed(object);
-        db.restore(&key, kind, &value, expiry, now)
-            .map_err(|_| short())?;
-        loaded.keys += 1;
+        }
     }
     // The checksum, of everything before it, from version 5 (0: not made).
     if version >= 5 {
-        let end = data.len() - reader.remaining();
-        let stored = reader.take(8).ok_or_else(short)?;
-        let stored = u64::from_le_bytes(stored.try_into().expect("8 bytes"));
-        if stored != 0 && stored != rdb::crc64(0, &data[..end]) {
+        let summed = input.crc;
+        let stored = input.next(|reader| {
+            let stored = reader.take(8).ok_or_else(short)?;
+            Ok(u64::from_le_bytes(stored.try_into().expect("8 bytes")))
+        })?;
+        if stored != 0 && stored != summed {
             return Err("Wrong RDB checksum. Aborting now.".into());
         }
     }
@@ -512,7 +640,7 @@ mod tests {
         let keys = write(&ctx.store, ctx.store.now(), &aux, &mut file).unwrap();
         assert_eq!(keys, 18);
         let copy = context();
-        let loaded = load(&copy, &file).unwrap();
+        let loaded = load(&copy, &file[..]).unwrap();
         assert_eq!(loaded.keys, 18);
         assert_eq!(loaded.functions, 1);
         assert_eq!(loaded.repl_id.as_deref(), Some(&*aux.repl_id));
@@ -528,6 +656,45 @@ mod tests {
         assert_eq!(again.len(), file.len());
     }
 
+    /// A source that gives at most `n` bytes a read, as a socket may.
+    struct Trickle<'a>(&'a [u8], usize);
+
+    impl io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.1.min(buf.len()).min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn loads_as_it_reads() {
+        let ctx = context();
+        fill(&ctx);
+        // A value bigger than a read, and than the first few.
+        let client = ctx.connect(-1).unwrap();
+        let mut s = client.session();
+        let big = vec![b'v'; 300 * 1024];
+        run(&ctx, &mut s, &[b"SET", b"big", &big]);
+        let mut file = Vec::new();
+        write(&ctx.store, ctx.store.now(), &Aux::default(), &mut file).unwrap();
+        file.extend_from_slice(b"after");
+        for n in [1, 7, 4096, CHUNK, usize::MAX] {
+            let copy = context();
+            let mut src = Trickle(&file, n);
+            let loaded = load(&copy, &mut src).unwrap();
+            assert_eq!(loaded.keys, 19, "{n}");
+            assert_eq!(contents(&ctx), contents(&copy), "{n}");
+            // Read no further than the checksum, give or take a read.
+            assert!(src.0.len() <= 5, "{n}");
+        }
+        // Cut anywhere, it's an error, not a hang.
+        for cut in [3, 9, 100, file.len() / 2, file.len() - 6] {
+            assert!(load(&context(), &mut Trickle(&file[..cut], 1000)).is_err());
+        }
+    }
+
     #[test]
     fn damage_and_strangers_are_refused() {
         let ctx = context();
@@ -537,14 +704,14 @@ mod tests {
         let mut bad = file.clone();
         let at = bad.len() / 2;
         bad[at] ^= 0xff;
-        assert!(load(&context(), &bad).is_err());
-        assert!(load(&context(), b"REDIS0012\xff").is_err());
-        assert!(load(&context(), b"NOTREDIS").is_err());
+        assert!(load(&context(), &bad[..]).is_err());
+        assert!(load(&context(), &b"REDIS0012\xff"[..]).is_err());
+        assert!(load(&context(), &b"NOTREDIS"[..]).is_err());
         // No checksum (Redis' `rdbchecksum no`) loads.
         let mut unsummed = file.clone();
         let n = unsummed.len();
         unsummed[n - 8..].fill(0);
-        assert!(load(&context(), &unsummed).is_ok());
+        assert!(load(&context(), &unsummed[..]).is_ok());
     }
 
     #[test]
@@ -563,7 +730,7 @@ mod tests {
         file.push(OPCODE_EOF);
         let crc = rdb::crc64(0, &file);
         file.extend_from_slice(&crc.to_le_bytes());
-        let loaded = load(&ctx, &file).unwrap();
+        let loaded = load(&ctx, &file[..]).unwrap();
         assert_eq!((loaded.keys, loaded.expired), (2, 1));
         assert_eq!(ctx.store.len(), 2);
         let client = ctx.connect(-1).unwrap();
@@ -580,7 +747,7 @@ mod tests {
         ))
         .unwrap();
         let ctx = context();
-        let loaded = load(&ctx, &file).unwrap();
+        let loaded = load(&ctx, &file[..]).unwrap();
         assert_eq!(loaded.version, 11);
         assert_eq!(loaded.functions, 1);
         let client = ctx.connect(-1).unwrap();

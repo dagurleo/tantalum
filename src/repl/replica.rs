@@ -255,9 +255,7 @@ fn run(
             .filter(|&n| n >= 0)
             .ok_or_else(|| error("PSYNC", &reply))? as u64;
         link.state.store(SYNC, Relaxed);
-        let rdb = read_rdb(&mut reader, link)?;
-        load(ctx, &rdb)?;
-        drop(rdb);
+        load(ctx, &mut reader, link)?;
         ctx.repl.set_ids(super::Ids {
             id: id.clone(),
             previous: super::NO_ID.to_string(),
@@ -294,11 +292,15 @@ fn run(
     apply(ctx, link, master, reader, cached)
 }
 
-/// The RDB file after `+FULLRESYNC`: `$len` and that many bytes, or (from a
-/// master that streams it, for a replica that said `capa eof`) `$EOF:mark`,
-/// the file, and the mark. Newlines before it are the master saying it's
-/// still working on it.
-fn read_rdb(reader: &mut BufReader<Conn>, link: &Link) -> std::io::Result<Vec<u8>> {
+/// Replaces the data with the master's file after `+FULLRESYNC`, loaded as
+/// it comes (as Redis' `repl-diskless-load` loads it), so it's never held
+/// whole: every database emptied, then the file, with no write running
+/// meanwhile, and the server `LOADING` from the start. The file is `$len` and
+/// that many bytes, or (from a master that streams it, for a replica that
+/// said `capa eof`) `$EOF:mark`, the file, and the mark. Newlines before it
+/// are the master saying it's still working on it. If it fails partway, the
+/// databases are emptied again (as Redis empties them), for the next sync.
+fn load(ctx: &Context, reader: &mut BufReader<Conn>, link: &Link) -> std::io::Result<()> {
     let header = loop {
         let line = line(reader)?;
         *link.last_io.lock() = Instant::now();
@@ -306,65 +308,149 @@ fn read_rdb(reader: &mut BufReader<Conn>, link: &Link) -> std::io::Result<Vec<u8
             break line;
         }
     };
-    if !header.starts_with(b"$") {
-        return Err(error("the RDB file", &header));
-    }
-    if let Some(mark) = header.strip_prefix(b"$EOF:") {
-        let mark = mark.to_vec();
-        let mut data = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            let n = reader.read(&mut chunk)?;
-            if n == 0 {
-                return Err(std::io::ErrorKind::UnexpectedEof.into());
-            }
-            data.extend_from_slice(&chunk[..n]);
-            link.sync_read.store(data.len() as u64, Relaxed);
-            *link.last_io.lock() = Instant::now();
-            if data.ends_with(&mark) {
-                data.truncate(data.len() - mark.len());
-                return Ok(data);
-            }
-        }
-    }
-    let len = crate::resp::parse_int(&header[1..])
-        .and_then(|n| usize::try_from(n).ok())
-        .ok_or_else(|| error("the RDB file", &header))?;
-    link.sync_size.store(len as u64, Relaxed);
-    let mut data = vec![0u8; len];
-    let mut got = 0;
-    while got < len {
-        let n = reader.read(&mut data[got..])?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        got += n;
-        link.sync_read.store(got as u64, Relaxed);
-        *link.last_io.lock() = Instant::now();
-    }
-    Ok(data)
-}
-
-/// Replaces the data with the master's: every database emptied, then the
-/// file loaded, with no write running meanwhile.
-fn load(ctx: &Context, rdb: &[u8]) -> std::io::Result<()> {
+    let mark = header.strip_prefix(b"$EOF:");
+    let len = match mark {
+        Some(_) => None,
+        None => Some(
+            header
+                .strip_prefix(b"$")
+                .and_then(crate::resp::parse_int)
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| error("the RDB file", &header))?,
+        ),
+    };
     let log = ctx.log().expect("replicas take turns");
-    ctx.set_loading(true);
-    let loaded = log.exclusive(|| {
+    let empty = || {
         for db in ctx.store.live() {
             db.clear();
         }
-        {
-            let mut functions = ctx.scripting.functions.lock();
-            functions.flush(&ctx.store);
-            ctx.scripting.count_functions(&functions);
+        let mut functions = ctx.scripting.functions.lock();
+        functions.flush(&ctx.store);
+        ctx.scripting.count_functions(&functions);
+    };
+    ctx.set_loading(true);
+    let loaded = log.exclusive(|| {
+        empty();
+        let loaded = if let Some(mark) = mark {
+            let mut src = Marked::new(Progress::new(&mut *reader, link), mark);
+            crate::rdb_file::load(ctx, &mut src).and_then(|loaded| {
+                // What's left of the stream to the mark.
+                std::io::copy(&mut src, &mut std::io::sink())
+                    .map_err(|e| format!("reading the file: {e}"))?;
+                Ok(loaded)
+            })
+        } else {
+            let len = len.expect("a length or a mark");
+            link.sync_size.store(len, Relaxed);
+            let mut src = Progress::new(&mut *reader, link).take(len);
+            crate::rdb_file::load(ctx, &mut src).and_then(|loaded| {
+                std::io::copy(&mut src, &mut std::io::sink())
+                    .map_err(|e| format!("reading the file: {e}"))?;
+                if src.limit() > 0 {
+                    return Err(format!(
+                        "the connection closed {} bytes before the file's end",
+                        src.limit()
+                    ));
+                }
+                Ok(loaded)
+            })
+        };
+        if loaded.is_err() {
+            empty();
         }
-        crate::rdb_file::load(ctx, rdb)
+        loaded
     });
     ctx.set_loading(false);
     loaded
         .map(drop)
         .map_err(|e| std::io::Error::other(format!("loading the master's RDB: {e}")))
+}
+
+/// The master's connection as the file's read from it: what's come counted,
+/// for `INFO`, and when, for the link's timeout.
+struct Progress<'a, R> {
+    inner: R,
+    link: &'a Link,
+    read: u64,
+}
+
+impl<'a, R> Progress<'a, R> {
+    fn new(inner: R, link: &'a Link) -> Self {
+        link.sync_read.store(0, Relaxed);
+        Progress {
+            inner,
+            link,
+            read: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for Progress<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        self.link.sync_read.store(self.read, Relaxed);
+        *self.link.last_io.lock() = Instant::now();
+        Ok(n)
+    }
+}
+
+/// A streamed file, which ends with its mark: the bytes before it. The last
+/// `mark.len()` bytes read are held back until more come, and when what's
+/// been read ends with the mark, the file has ended (as Redis tells: a file
+/// that ends with the 40 random bytes before its end isn't one to expect),
+/// so nothing past it is read.
+struct Marked<R> {
+    inner: R,
+    mark: Vec<u8>,
+    held: Vec<u8>,
+    ended: bool,
+}
+
+impl<R: Read> Marked<R> {
+    fn new(inner: R, mark: &[u8]) -> Self {
+        Marked {
+            inner,
+            mark: mark.to_vec(),
+            held: Vec::new(),
+            ended: false,
+        }
+    }
+}
+
+impl<R: Read> Read for Marked<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let free = if self.ended {
+                self.held.len()
+            } else {
+                self.held.len().saturating_sub(self.mark.len())
+            };
+            if free > 0 || self.ended {
+                let n = free.min(buf.len());
+                buf[..n].copy_from_slice(&self.held[..n]);
+                self.held.drain(..n);
+                return Ok(n);
+            }
+            let have = self.held.len();
+            self.held.resize(have + buf.len().max(64 * 1024), 0);
+            let n = match self.inner.read(&mut self.held[have..]) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.held.truncate(have);
+                    return Err(e);
+                }
+            };
+            self.held.truncate(have + n);
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            if self.held.ends_with(&self.mark) {
+                self.held.truncate(self.held.len() - self.mark.len());
+                self.ended = true;
+            }
+        }
+    }
 }
 
 /// Runs what the master sends until the connection drops or the link stops.
@@ -657,4 +743,48 @@ pub(crate) fn tls_config(ca_file: &std::path::Path) -> std::io::Result<Arc<rustl
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gives what it holds `n` bytes a read, then fails (as a connection
+    /// with nothing more would hang).
+    struct Trickle(Vec<u8>, usize);
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let n = self.1.min(buf.len()).min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_marked_file_ends_at_its_mark_and_reads_nothing_past_it() {
+        // As a master makes one: 40 random hex digits (which don't overlap
+        // themselves, as 40 of one byte would).
+        let mark = *b"3f1c9a07e25b8d64c0f7a2e19b53d8604ae7c21f";
+        // The file has a mark's start in it, and ends with part of one.
+        let mut file = b"REDIS0011".to_vec();
+        file.extend_from_slice(&mark[..39]);
+        file.extend_from_slice(b"xyz");
+        file.extend_from_slice(&mark[..20]);
+        for n in [1, 3, 39, 40, 41, 1000] {
+            let mut stream = file.clone();
+            stream.extend_from_slice(&mark);
+            let mut marked = Marked::new(Trickle(stream, n), &mark);
+            let mut out = Vec::new();
+            marked.read_to_end(&mut out).unwrap();
+            assert_eq!(out, file, "{n}");
+        }
+        // A connection that closes before the mark is an error.
+        let mut marked = Marked::new(&file[..], &mark);
+        assert!(marked.read_to_end(&mut Vec::new()).is_err());
+    }
 }
