@@ -84,23 +84,23 @@ pub(crate) fn write(
 
 /// The data as it is, copied to be written later ([`copy`]).
 pub(crate) struct Copied {
-    now: Millis,
+    pub(crate) now: Millis,
     /// The store clock's Unix time at 0: deadlines are this much after it.
-    unix_base: i64,
+    pub(crate) unix_base: i64,
     used_memory: usize,
-    functions: Vec<std::sync::Arc<[u8]>>,
-    dbs: Vec<CopiedDb>,
+    pub(crate) functions: Vec<std::sync::Arc<[u8]>>,
+    pub(crate) dbs: Vec<CopiedDb>,
 }
 
 /// A database as [`copy`] found it.
-struct CopiedDb {
-    index: usize,
+pub(crate) struct CopiedDb {
+    pub(crate) index: usize,
     /// How many keys, and how many with a TTL (for `RESIZEDB`).
-    keys: usize,
+    pub(crate) keys: usize,
     with_ttl: usize,
-    db: Arc<Store>,
+    pub(crate) db: Arc<Store>,
     /// Its shards' copies, owed.
-    slots: Vec<Arc<CopySlot>>,
+    pub(crate) slots: Vec<Arc<CopySlot>>,
 }
 
 /// The data as it is now, to be written as an RDB file later

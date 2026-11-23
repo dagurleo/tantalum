@@ -4212,6 +4212,20 @@ pub(crate) struct ShardCopy {
 }
 
 impl ShardCopy {
+    /// Calls `f` with each live entry's key, kind, value (collections in
+    /// their compact form) and deadline, as [`Store::for_each_live`] does with
+    /// the shard (skipping what had expired at `now`, unless it's 0).
+    pub(crate) fn for_each_live(&self, now: Millis, mut f: impl FnMut(&[u8], Kind, &[u8], Millis)) {
+        self.for_each_live_ref(now, |key, value, deadline| {
+            let ValueRef(value, kind) = value;
+            match value {
+                Borrowed::Inline(bytes) => f(key, kind, bytes, deadline),
+                Borrowed::External(kv) => f(key, kind, kv.value(), deadline),
+                Borrowed::Object(object) => f(key, kind, &object.to_compact(), deadline),
+            }
+        });
+    }
+
     /// Calls `f` with each live entry's key, value and deadline, as
     /// [`Store::for_each_live_ref`] does with the shard (skipping what had
     /// expired at `now`, unless it's 0).

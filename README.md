@@ -853,10 +853,15 @@ was lost, by what it needs (`results.txt` has the details), against one server:
   (with their chunks as they are, so `~` trims the same after a restart), 5
   streams' consumer groups, kept after their chunks, 6 numbered databases, 7
   function libraries' code, and 8 where the data is in a replication stream (its ID and
-  offset): saved by a replica (whose master's commands wait while it saves; reads go on)
-  and by a master as it shuts down, so that a replica restarted from its snapshot, or a
-  restarted master's replicas, continue where they were instead of syncing in full. A
-  master's place lapses if anything is written before its first replica asks. A
+  offset), saved once the server is in one (a master's replicas, or a replica's master),
+  so that a replica restarted from its snapshot, a restarted master's replicas, or a
+  master that comes back as a replica of the one that took over, continue where they
+  were instead of syncing in full. Such a save marks every shard as owing a copy of
+  itself while no write runs, as a full sync does, and writes from the copies, so
+  writes wait only while they're marked, and the file is the data at one point; the
+  copies cost as much memory again as the shards written to meanwhile (as Redis' fork
+  does). As it shuts down, it writes the data as it is. A master's place lapses if
+  anything is written before its first replica asks. A
   save writes the lowest version that holds its data (without hashes still
   1, which builds from before hashes, 0.7, can read), and every build reads
   all versions up to its own (`tests/data/v1.snapshot` was written by 0.7.0). Each shard is copied out
@@ -1619,8 +1624,7 @@ hit rates share the seeding flaw described above.
   up to about the data's size again, at worst, as with Redis' fork).
   `repl-diskless-sync` and its delay are accepted and do nothing: a master streams the
   file at once. `repl-diskless-load` and `replica-lazy-flush` take anything and do
-  nothing. A master's periodic snapshots don't say where in the stream they are (that
-  would hold writes while they're written), only the one it saves at shutdown.
+  nothing.
 - **`DUMP` in Redis' order but for hash tables**: a big hash or set (past 128 members)
   comes out in Tantalum's order, a list made otherwise than by appending (`LPUSH`,
   `LINSERT`, ...) with its nodes split where an appended one's would be, and a stream

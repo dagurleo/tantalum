@@ -1126,3 +1126,68 @@ fn a_full_sync_while_writes_go_on() {
     synced(master.addr, replica.addr);
     assert_same(master.addr, replica.addr);
 }
+
+#[test]
+fn a_master_back_from_its_snapshot_continues_from_the_replica_that_took_over() {
+    let dir = std::env::temp_dir().join(format!("tantalum-repl-back-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("master.snapshot");
+    let a = start_with_snapshot(&path);
+    let b = start();
+    let mut ca = Client::new(a.addr);
+    for i in 0..2000 {
+        ca.cmd(&format!("SET s{i} {i}"));
+        if i % 10 == 0 {
+            ca.cmd(&format!("RPUSH l{} {i}", i % 7));
+            ca.cmd(&format!("HSET h{} f{i} {i}", i % 5));
+        }
+    }
+    follow(&b, a.addr);
+    synced(a.addr, b.addr);
+    // Saved while writes go on: the file is the data at the place it says.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (addr, stop) = (a.addr, stop.clone());
+        std::thread::spawn(move || {
+            let mut c = Client::new(addr);
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                c.cmd(&format!("INCR c{}", i % 300));
+                c.cmd(&format!("RPUSH l{} w{i}", i % 7));
+                c.cmd(&format!("HINCRBY h{} n {i}", i % 5));
+                i += 1;
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    let mut saver = Client::new(a.addr);
+    assert_eq!(
+        saver.cmd("BGSAVE"),
+        Value::Simple("Background saving started".into())
+    );
+    wait_until("the save", || saver.info("rdb_bgsave_in_progress") == "0");
+    std::thread::sleep(Duration::from_millis(100));
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap();
+    ca.cmd("SET after the save");
+    synced(a.addr, b.addr);
+    // A stops (as a crash would: no save at shutdown); B takes over and is
+    // written to; A comes back from its snapshot and follows B.
+    let mut cb = Client::new(b.addr);
+    assert_eq!(cb.cmd("REPLICAOF NO ONE"), Value::Simple("OK".into()));
+    cb.cmd("SET on b 1");
+    drop(ca);
+    let again = start_with_snapshot(&path);
+    follow(&again, b.addr);
+    synced(b.addr, again.addr);
+    assert_same(b.addr, again.addr);
+    assert_eq!(
+        cb.info("sync_partial_ok"),
+        "1",
+        "it continued from its snapshot"
+    );
+    assert_eq!(cb.info("sync_full"), "0");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
