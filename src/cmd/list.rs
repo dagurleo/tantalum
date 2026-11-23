@@ -484,10 +484,13 @@ pub(super) fn ltrim(
     let trimmed = change(store, args.key(store), now, false, args, |list, _| {
         if let Some(list) = list {
             let range = range(start, stop, list.len());
-            // A change even if nothing goes, as in Redis (WATCH can tell).
+            // A change even if nothing goes, as in Redis (WATCH can tell),
+            // though not one it propagates.
             let edit = list.edit();
             if range.len() != edit.len() {
                 edit.trim(range.start, range.end);
+            } else {
+                crate::repl::propagate::not_dirty();
             }
         }
         Ok(())

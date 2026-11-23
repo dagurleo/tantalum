@@ -145,6 +145,16 @@ Options:
   --native-scripts <yes|no>
                     Run BullMQ's hottest scripts natively, with the same
                     results as their Lua [default: yes]
+  --replicaof <HOST:PORT>
+                    Follow this master (Redis or Tantalum), as REPLICAOF does
+                    (\"HOST PORT\" works too) [default: none, a master]
+  --masterauth <PASSWORD>
+  --masteruser <USER>
+                    What to AUTH to the master with. The TANTALUM_MASTERAUTH
+                    environment variable sets the password too [default: none]
+  --repl-backlog-size <SIZE>
+                    How much of the replication stream to keep for replicas
+                    that reconnect to continue [default: 1mb]
   -h, --help        Print this help
 
 On SIGTERM or SIGINT, Tantalum stops accepting, lets each connection finish
@@ -170,6 +180,10 @@ struct Config {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     notify_keyspace_events: Option<String>,
+    replicaof: Option<(String, u16)>,
+    masterauth: Option<Vec<u8>>,
+    masteruser: Option<Vec<u8>>,
+    repl_backlog_size: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -255,6 +269,10 @@ fn parse_args() -> Result<Config, String> {
         tls_cert: None,
         tls_key: None,
         notify_keyspace_events: None,
+        replicaof: None,
+        masterauth: None,
+        masteruser: None,
+        repl_backlog_size: None,
     };
     let mut aof_options = aof::Options {
         dir: PathBuf::new(),
@@ -334,6 +352,23 @@ fn parse_args() -> Result<Config, String> {
             }
             "--aof-rewrite-min-size" => {
                 aof_options.rewrite_min_size = parse_size(&value).ok_or_else(|| bad(()))? as u64;
+            }
+            "--replicaof" | "--slaveof" => {
+                let (host, port) = value
+                    .rsplit_once(' ')
+                    .or_else(|| value.rsplit_once(':'))
+                    .ok_or_else(|| bad(()))?;
+                let port = port.trim().parse().map_err(|_| bad(()))?;
+                config.replicaof = Some((host.trim().to_string(), port));
+            }
+            "--masterauth" => {
+                config.masterauth = Some(value.into_bytes()).filter(|p| !p.is_empty())
+            }
+            "--masteruser" => {
+                config.masteruser = Some(value.into_bytes()).filter(|u| !u.is_empty())
+            }
+            "--repl-backlog-size" => {
+                config.repl_backlog_size = Some(parse_size(&value).ok_or_else(|| bad(()))?);
             }
             "--native-scripts" => {
                 config.settings.native_scripts = match value.as_str() {
@@ -422,7 +457,23 @@ fn main() -> std::io::Result<()> {
         eprintln!("error: --notify-keyspace-events: {why}\n\n{USAGE}");
         std::process::exit(1);
     }
+    let masterauth = config.masterauth.clone().or_else(|| {
+        std::env::var("TANTALUM_MASTERAUTH")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(String::into_bytes)
+    });
+    tantalum::repl::configure(
+        &ctx,
+        masterauth,
+        config.masteruser.clone(),
+        config.repl_backlog_size,
+    );
     let ctx = Arc::new(ctx);
+    ctx.adopt();
+    if let Some((host, port)) = &config.replicaof {
+        tantalum::repl::follow(&ctx, host.clone(), *port);
+    }
     // After the log's commands ran again: they may still use keys that have
     // expired since.
     let _expirer = cmd::spawn_expirer(&ctx, Duration::from_millis(100));

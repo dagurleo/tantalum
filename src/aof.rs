@@ -389,16 +389,68 @@ fn new_log(dir: &Path, name: &str) -> io::Result<File> {
     Ok(file)
 }
 
-impl Aof {
+/// What writes are logged to: the append-only log, replicas (the replication
+/// stream and its backlog, `repl`), or both. While there's one, every write
+/// takes a turn ([`Log::turn`]), so both see writes in the order they ran.
+/// Made once and never freed (`Context::log` hands it out by reference), and
+/// replaced by a new one when replication starts.
+pub(crate) struct Log {
+    pub(crate) aof: Option<Arc<Aof>>,
+    pub(crate) repl: Option<Arc<crate::repl::Master>>,
+    /// The turn when there's no log to take it with.
+    plain: Mutex<()>,
+}
+
+/// A write's turn held: by the log's lock, or [`Log`]'s own without one.
+enum Held<'a> {
+    Aof(MutexGuard<'a, Pending>),
+    Plain(#[allow(dead_code)] MutexGuard<'a, ()>),
+}
+
+impl Log {
+    pub(crate) fn new(aof: Option<Arc<Aof>>, repl: Option<Arc<crate::repl::Master>>) -> Self {
+        Log {
+            aof,
+            repl,
+            plain: Mutex::new(()),
+        }
+    }
+
+    fn hold(&self) -> Held<'_> {
+        match &self.aof {
+            Some(aof) => Held::Aof(aof.pending.lock()),
+            None => Held::Plain(self.plain.lock()),
+        }
+    }
+
+    /// Runs `f` with no write running meanwhile (reads go on), outside any
+    /// turn: for a replica's full sync, which copies the data out at one
+    /// point of the stream.
+    pub(crate) fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _held = self.hold();
+        f()
+    }
+
+    /// Whether the append-only log can't be written: write commands are
+    /// refused until it can.
+    pub(crate) fn failing(&self) -> bool {
+        self.aof.as_ref().is_some_and(|aof| aof.failing())
+    }
+
     /// A write command's turn: until it drops, other writes wait, and what
     /// this one does (and what its scripts' or transaction's commands do,
     /// with `grouped`) is logged at store-clock time `now`, which must be
-    /// taken once the turn has come (see the module docs).
-    pub(crate) fn turn(&self, grouped: bool, db: u32) -> Turn<'_> {
-        let mut pending = self.pending.lock();
-        let now = self.store.now();
+    /// taken once the turn has come (see the module docs), and propagated to
+    /// replicas.
+    pub(crate) fn turn(&self, store: &Store, grouped: bool, db: u32) -> Turn<'_> {
+        let mut held = self.hold();
+        let now = store.now();
+        let pending = match &mut held {
+            Held::Aof(pending) => &mut **pending as *mut Pending,
+            Held::Plain(_) => std::ptr::null_mut(),
+        };
         let active = Active {
-            pending: &mut *pending as *mut Pending,
+            pending,
             now,
             grouped,
             open: false,
@@ -406,12 +458,18 @@ impl Aof {
         };
         let previous = ACTIVE.replace(Some(active));
         debug_assert!(previous.is_none(), "a write turn inside another");
+        if let Some(repl) = &self.repl {
+            crate::repl::propagate::begin(repl, store, now, db);
+        }
         Turn {
             now,
-            _pending: pending,
+            repl: self.repl.is_some(),
+            _held: held,
         }
     }
+}
 
+impl Aof {
     fn write_loop(self: Arc<Self>) {
         loop {
             std::thread::sleep(WRITE_EVERY);
@@ -618,16 +676,19 @@ impl Aof {
     }
 }
 
-/// A write command's turn ([`Aof::turn`]).
+/// A write command's turn ([`Log::turn`]).
 pub(crate) struct Turn<'a> {
     /// The time to run it at.
     pub(crate) now: Millis,
-    _pending: MutexGuard<'a, Pending>,
+    /// Replicas follow: what it does is propagated when it ends.
+    repl: bool,
+    _held: Held<'a>,
 }
 
 impl Turn<'_> {
     /// Closes a script's or transaction's group: what's logged after
-    /// (blocked clients it served) is logged on its own.
+    /// (blocked clients it served) is logged on its own, and propagated
+    /// apart from it.
     pub(crate) fn end_group(&mut self) {
         with_active(|pending, active| {
             if active.open {
@@ -636,12 +697,18 @@ impl Turn<'_> {
             active.open = false;
             active.grouped = false;
         });
+        if self.repl {
+            crate::repl::propagate::end_unit();
+        }
     }
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
         self.end_group();
+        if self.repl {
+            crate::repl::propagate::end();
+        }
         ACTIVE.set(None);
     }
 }
@@ -649,6 +716,7 @@ impl Drop for Turn<'_> {
 /// The turn this thread is taking, if any.
 #[derive(Clone, Copy)]
 struct Active {
+    /// The log's, if there's one (null if only replicas follow).
     pending: *mut Pending,
     now: Millis,
     /// Several commands that come back together: `MULTI` before the first.
@@ -663,8 +731,12 @@ thread_local! {
     static ACTIVE: Cell<Option<Active>> = const { Cell::new(None) };
 }
 
+/// Runs `f` with the log's pending writes, if this thread is taking a turn
+/// and the log is on.
 fn with_active(f: impl FnOnce(&mut Pending, &mut Active)) {
-    if let Some(mut active) = ACTIVE.get() {
+    if let Some(mut active) = ACTIVE.get()
+        && !active.pending.is_null()
+    {
         // SAFETY: the turn's guard holds the lock, and lives until it
         // clears ACTIVE; this thread is the only one using it.
         let pending = unsafe { &mut *active.pending };
@@ -709,17 +781,38 @@ fn push<'a>(args: impl ExactSizeIterator<Item = &'a [u8]>) {
 /// database `db`.
 pub(crate) fn select(db: usize) {
     with_active(|_, active| active.db = db as u32);
+    crate::repl::propagate::select(db as u32);
 }
 
-/// Whether this thread is taking a write turn (the log is on).
+/// Whether this thread is taking a write turn (the log is on, or replicas
+/// follow).
 pub(crate) fn logging() -> bool {
     ACTIVE.get().is_some()
 }
 
+/// The time of the write turn this thread is taking, if any.
+pub(crate) fn turn_now() -> Option<Millis> {
+    ACTIVE.get().map(|active| active.now)
+}
+
+/// Whether this thread is taking a write turn and the append-only log is on.
+fn logging_to_file() -> bool {
+    ACTIVE.get().is_some_and(|active| !active.pending.is_null())
+}
+
 /// Logs write command `name` (its table name) with `args`, which replied
-/// `reply` (an error isn't logged: it changed nothing).
+/// `reply` (an error isn't logged: it changed nothing), and propagates it to
+/// replicas as Redis would.
 pub(crate) fn record(name: &str, args: &Args<'_>, reply: &[u8]) {
-    if !logging() || reply.first() == Some(&b'-') {
+    if !logging() {
+        return;
+    }
+    crate::repl::propagate::record(name, args, reply);
+    if !logging_to_file() || reply.first() == Some(&b'-') {
+        return;
+    }
+    // Replicas hear these; the log's replay doesn't need them.
+    if matches!(name, "publish" | "spublish" | "pfcount") {
         return;
     }
     // What it deleted here was logged as `DEL`s; the rest happened elsewhere.
@@ -779,14 +872,16 @@ pub(crate) fn record(name: &str, args: &Args<'_>, reply: &[u8]) {
 }
 
 /// A write a command made, as the command `parts` that makes just it: for
-/// one logged piece by piece (`MSET`'s pairs).
-pub(crate) fn record_parts<'a>(parts: impl ExactSizeIterator<Item = &'a [u8]>) {
+/// one logged piece by piece (`MSET`'s pairs). Replicas hear it too.
+pub(crate) fn record_parts<'a>(parts: impl ExactSizeIterator<Item = &'a [u8]> + Clone) {
     if logging() {
+        crate::repl::propagate::op(parts.clone());
         push(parts);
     }
 }
 
-/// An eviction, if it happened in a write turn: as a `DEL`.
+/// An eviction, if it happened in a write turn: as a `DEL`. (Replicas hear
+/// of it from the store: see `repl::propagate::changed`.)
 pub(crate) fn evicted(key: &[u8]) {
     if logging() {
         push([&b"DEL"[..], key].into_iter());

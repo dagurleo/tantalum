@@ -869,10 +869,10 @@ async fn the_small_ones() {
         assert_eq!(c.call(command).await, reply, "{command:?}");
     }
     assert!(c.call(&["LOLWUT"]).await.contains("Redis ver. 7.2.4"));
-    assert!(
-        c.call(&["REPLICAOF", "127.0.0.1", "6379"])
-            .await
-            .starts_with("-ERR")
+    // (Following a master: tests/replication.rs.)
+    assert_eq!(
+        c.call(&["REPLICAOF", "127.0.0.1", "nope"]).await,
+        "-ERR Invalid master port\r\n"
     );
     c.call(&["SET", "k", "v"]).await;
     let size: i64 = c.call(&["MEMORY", "USAGE", "k"]).await[1..]

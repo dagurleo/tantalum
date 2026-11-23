@@ -27,11 +27,19 @@ use crate::zset::{self, BigZSet};
 /// checksum.
 pub(crate) fn payload_of(value: &ValueRef<'_>) -> Vec<u8> {
     let mut out = Vec::new();
+    value_body(&mut out, value);
+    rdb::finish_payload(&mut out);
+    out
+}
+
+/// A value as `DUMP` payloads and RDB files have it: its RDB type, then the
+/// value, without a payload's footer.
+pub(crate) fn value_body(out: &mut Vec<u8>, value: &ValueRef<'_>) {
     match value.kind() {
-        Kind::String => rdb::dump_string(&mut out, value.as_bytes()),
+        Kind::String => rdb::dump_string(out, value.as_bytes()),
         Kind::List => match value.view() {
-            View::Bytes(bytes) => rdb::dump_list(&mut out, list::Packed::new(bytes).iter()),
-            View::Object(Collection::List(big)) => rdb::dump_list(&mut out, big.iter()),
+            View::Bytes(bytes) => rdb::dump_list(out, list::Packed::new(bytes).iter()),
+            View::Object(Collection::List(big)) => rdb::dump_list(out, big.iter()),
             View::Object(_) => unreachable!("a list's object is a list"),
         },
         Kind::Set => {
@@ -53,7 +61,7 @@ pub(crate) fn payload_of(value: &ValueRef<'_>) -> Vec<u8> {
                 _ => SetEncoding::Hashtable,
             };
             let len = members.len();
-            rdb::dump_set(&mut out, members.iter().map(Vec::as_slice), len, encoding);
+            rdb::dump_set(out, members.iter().map(Vec::as_slice), len, encoding);
         }
         Kind::ZSet => {
             let mut members: Vec<(f64, Vec<u8>)> = Vec::new();
@@ -73,19 +81,17 @@ pub(crate) fn payload_of(value: &ValueRef<'_>) -> Vec<u8> {
             let listpack = super::keys::encoding(value) == "listpack";
             let borrowed: Vec<(f64, &[u8])> =
                 members.iter().map(|(s, m)| (*s, m.as_slice())).collect();
-            rdb::dump_zset(&mut out, &borrowed, listpack);
+            rdb::dump_zset(out, &borrowed, listpack);
         }
         Kind::Hash => {
             let view = super::hash::view(value.view());
-            rdb::dump_hash(&mut out, view.iter(), view.len(), view.fits_listpack());
+            rdb::dump_hash(out, view.iter(), view.len(), view.fits_listpack());
         }
         Kind::Stream => match value.view() {
-            View::Object(Collection::Stream(stream)) => rdb::dump_stream(&mut out, stream),
+            View::Object(Collection::Stream(stream)) => rdb::dump_stream(out, stream),
             _ => unreachable!("a stream is an object"),
         },
     }
-    rdb::finish_payload(&mut out);
-    out
 }
 
 /// `DUMP key`.
@@ -108,7 +114,7 @@ pub(super) fn dump(
 
 /// A value read from a payload, in the packed format of its kind, for
 /// `Store::restore`.
-fn packed(object: Object) -> (Kind, Vec<u8>) {
+pub(crate) fn packed(object: Object) -> (Kind, Vec<u8>) {
     match object {
         Object::String(value) => (Kind::String, value),
         Object::List(elements) => {
@@ -268,7 +274,10 @@ pub(super) fn restore(
             unix_now.checked_add(ttl)
         };
         match at {
-            Some(at) if at > unix_now => Expiry::At(store.deadline_from_unix_ms(now, at)),
+            // (On a replica, the master's word: it's made, and goes when it says.)
+            Some(at) if at > unix_now || crate::segment::expiry_suspended() => {
+                Expiry::At(store.deadline_from_unix_ms(now, at))
+            }
             _ => {
                 out.extend_from_slice(resp::OK);
                 return Reply::Written;

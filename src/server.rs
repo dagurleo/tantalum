@@ -43,7 +43,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub use tokio_rustls::TlsAcceptor;
 
 use crate::cmd::{self, Args, Blocked, Reply};
-use crate::context::{Context, Session};
+use crate::context::{Context, IoThread, Session};
 use crate::pubsub::Subscriber;
 use crate::resp;
 use crate::store::{KeyHash, Millis, Store};
@@ -205,6 +205,15 @@ pub async fn serve_with(
     ctx: Arc<Context>,
     tls: Option<TlsAcceptor>,
 ) -> io::Result<()> {
+    ctx.adopt();
+    let handle = tokio::runtime::Handle::current();
+    ctx.register_io_thread(match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::CurrentThread => IoThread::Tokio(handle),
+        _ => {
+            let workers = handle.metrics().num_workers();
+            IoThread::Shared(handle, workers)
+        }
+    });
     loop {
         let socket = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -255,6 +264,7 @@ pub fn serve_per_thread_with(
     threads: usize,
 ) -> io::Result<()> {
     type Incoming = (std::net::TcpStream, Option<TlsAcceptor>);
+    ctx.adopt();
     let mut workers = Vec::with_capacity(threads);
     for i in 0..threads.max(1) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Incoming>();
@@ -262,6 +272,7 @@ pub fn serve_per_thread_with(
             .enable_all()
             .event_interval(EVENT_INTERVAL)
             .build()?;
+        ctx.register_io_thread(IoThread::Tokio(runtime.handle().clone()));
         let ctx = ctx.clone();
         std::thread::Builder::new()
             .name(format!("tantalum-io-{i}"))
@@ -360,6 +371,7 @@ pub fn serve_uring(
     ctx: Arc<Context>,
     threads: usize,
 ) -> io::Result<()> {
+    ctx.adopt();
     let mut handles = (0..threads.max(1))
         .map(|i| {
             let ctx = ctx.clone();
@@ -388,6 +400,7 @@ pub fn serve_uring(
                         .build();
                     let mut runtime = runtime?;
                     let (mailbox, bell) = Mailbox::new()?;
+                    ctx.register_io_thread(IoThread::Monoio(mailbox.clone()));
                     runtime.block_on(async move {
                         monoio::spawn(deliver_mail(
                             mailbox.clone(),
@@ -842,6 +855,7 @@ async fn handle_uring(
             }
         }
         ctx.publish(&mut session);
+        crate::repl::propagate::after_batch(ctx);
         rbuf.drain(..pos);
         // Messages that came meanwhile go with the replies.
         let subscriber = session.subscriber().cloned();
@@ -1421,6 +1435,7 @@ async fn serve_stream(
             }
         }
         ctx.publish(&mut session);
+        crate::repl::propagate::after_batch(ctx);
         rbuf.drain(..pos);
         if defer_replies && !wbuf.is_empty() && ran <= HELD_BATCH {
             // (A connection closing waits to see its reply out.)

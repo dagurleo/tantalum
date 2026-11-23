@@ -22,6 +22,8 @@ mod notify;
 mod pages;
 pub mod pubsub;
 mod rdb;
+mod rdb_file;
+pub mod repl;
 pub mod resp;
 mod script;
 mod segment;

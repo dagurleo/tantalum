@@ -132,6 +132,17 @@ thread_local! {
 }
 
 /// Server-wide state that connections and commands use besides the store.
+/// A thread that runs connections ([`Context::register_io_thread`]).
+#[derive(Clone)]
+pub(crate) enum IoThread {
+    /// A single-threaded tokio runtime's.
+    Tokio(tokio::runtime::Handle),
+    /// A monoio thread's, woken through its mailbox.
+    Monoio(Arc<crate::wake::Mailbox>),
+    /// A multi-threaded tokio runtime, with its number of workers.
+    Shared(tokio::runtime::Handle, usize),
+}
+
 pub struct Context {
     pub store: Arc<Store>,
     pub settings: Settings,
@@ -139,6 +150,23 @@ pub struct Context {
     pub snapshots: Option<Arc<Snapshots>>,
     /// The append-only log (`--aof`), once it's taking writes.
     aof: std::sync::OnceLock<Arc<crate::aof::Aof>>,
+    /// What writes are logged to, while there's anything (the log, replicas):
+    /// a leaked `Log`, replaced when replication starts, read with one load
+    /// by every write. Null while there's nothing.
+    log: std::sync::atomic::AtomicPtr<crate::aof::Log>,
+    /// Replication: this server's IDs, the stream replicas follow, the master
+    /// it follows.
+    pub(crate) repl: crate::repl::Replication,
+    /// This context, for threads that outlive a command (replicas'): set by
+    /// the server's loops (`Context::adopt`).
+    me: OnceLock<Weak<Context>>,
+    /// The threads that run connections, to wait for until each has finished
+    /// what it was running (`Context::wait_for_io_threads`).
+    io_threads: Mutex<Vec<IoThread>>,
+    /// Held while active expiry runs, for that wait too.
+    pub(crate) expiring: Mutex<()>,
+    /// A replica is loading its master's data: commands get `-LOADING`.
+    loading: AtomicBool,
     /// Who is subscribed to what.
     pub pubsub: Arc<PubSub>,
     /// The most memory seen in use, as `INFO` reports it.
@@ -246,6 +274,12 @@ impl Context {
             settings,
             snapshots: None,
             aof: std::sync::OnceLock::new(),
+            log: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            repl: crate::repl::Replication::default(),
+            me: OnceLock::new(),
+            io_threads: Mutex::new(Vec::new()),
+            expiring: Mutex::new(()),
+            loading: AtomicBool::new(false),
             started: Instant::now(),
             next_client_id: AtomicU64::new(1),
             clients: Mutex::new(HashMap::new()),
@@ -409,6 +443,9 @@ impl Context {
     /// After what `special` goes by changed.
     pub(crate) fn update_special(&self) {
         let on = !self.monitors.lock().is_empty()
+            || self.repl.following()
+            || self.loading()
+            || self.repl.settings.min_replicas_to_write.load(Relaxed) > 0
             || self.pause.lock().is_some()
             || self.slowlog.needs_precise()
             || self.latency.threshold() != 0
@@ -721,6 +758,116 @@ impl Context {
     /// Logs writes to `aof` from now on (see `aof::start`).
     pub fn set_aof(&self, aof: Arc<crate::aof::Aof>) {
         let _ = self.aof.set(aof);
+        let repl = self.log().and_then(|log| log.repl.clone());
+        self.publish_log(crate::aof::Log::new(self.aof.get().cloned(), repl));
+    }
+
+    /// What writes are logged to, if anything: every write takes a turn then.
+    #[inline]
+    pub(crate) fn log(&self) -> Option<&crate::aof::Log> {
+        let log = self.log.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: a published log is leaked: it lives as long as the process.
+        unsafe { log.as_ref() }
+    }
+
+    /// From now on, writes go to replicas through `master` too.
+    pub(crate) fn log_to_replicas(&self, master: Arc<crate::repl::Master>) {
+        self.publish_log(crate::aof::Log::new(self.aof.get().cloned(), Some(master)));
+    }
+
+    fn publish_log(&self, log: crate::aof::Log) {
+        // Leaked: commands hold it by reference without counting.
+        let log = Box::into_raw(Box::new(log));
+        self.log.store(log, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Lets threads that outlive a command have this context: called by the
+    /// server's loops, which hold it in an `Arc`.
+    pub fn adopt(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
+    }
+
+    /// This context, if a server's loop runs it (see [`Context::adopt`]).
+    pub(crate) fn arc(&self) -> Option<Arc<Context>> {
+        self.me.get().and_then(Weak::upgrade)
+    }
+
+    /// A thread that runs connections, so that [`Context::wait_for_io_threads`]
+    /// waits for it.
+    pub(crate) fn register_io_thread(&self, thread: IoThread) {
+        self.io_threads.lock().push(thread);
+    }
+
+    /// Returns once every thread that runs connections, and active expiry,
+    /// has finished what it was running when this was called: once a write
+    /// that started then has ended. For a change every write must see (writes
+    /// taking turns), made just before. Not from such a thread.
+    pub(crate) fn wait_for_io_threads(&self) {
+        let threads: Vec<IoThread> = self.io_threads.lock().clone();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut expected = 0;
+        for thread in &threads {
+            match thread {
+                IoThread::Tokio(handle) => {
+                    let tx = tx.clone();
+                    handle.spawn(async move {
+                        let _ = tx.send(());
+                    });
+                    expected += 1;
+                }
+                IoThread::Monoio(mailbox) => {
+                    mailbox.call_back(tx.clone());
+                    expected += 1;
+                }
+                IoThread::Shared(handle, workers) => {
+                    // Each worker holds one of these until all have one: then
+                    // none is running anything else.
+                    let gate = Arc::new((
+                        std::sync::Mutex::new((0usize, false)),
+                        std::sync::Condvar::new(),
+                    ));
+                    for _ in 0..*workers {
+                        let (gate, tx) = (gate.clone(), tx.clone());
+                        handle.spawn(async move {
+                            let (lock, cvar) = &*gate;
+                            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            state.0 += 1;
+                            cvar.notify_all();
+                            let _ =
+                                cvar.wait_timeout_while(state, Duration::from_secs(2), |s| !s.1);
+                            let _ = tx.send(());
+                        });
+                    }
+                    let (lock, cvar) = &*gate;
+                    let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut state = cvar
+                        .wait_timeout_while(state, Duration::from_secs(2), |s| s.0 < *workers)
+                        .map_or_else(|e| e.into_inner().0, |r| r.0);
+                    state.1 = true;
+                    cvar.notify_all();
+                    expected += *workers;
+                }
+            }
+        }
+        drop(tx);
+        for _ in 0..expected {
+            if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                break;
+            }
+        }
+        drop(self.expiring.lock());
+    }
+
+    /// A replica is loading its master's data (`true`), or done.
+    pub(crate) fn set_loading(&self, loading: bool) {
+        self.loading.store(loading, Relaxed);
+        self.update_special();
+    }
+
+    /// Whether commands get `-LOADING`.
+    #[inline]
+    pub(crate) fn loading(&self) -> bool {
+        self.loading.load(Relaxed)
     }
 
     /// The append-only log, if it's on.

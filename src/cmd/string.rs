@@ -365,7 +365,7 @@ pub(super) fn msetnx(
         .step_by(2)
         .map(|i| args.key_at(store, i))
         .collect();
-    let logged = ctx.aof().is_some();
+    let logged = crate::aof::logging();
     store.exclusive(|| {
         let exists = |key: Key<'_>| {
             store

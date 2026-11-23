@@ -1,6 +1,7 @@
 //! What operators and tools ask a server: `MONITOR`, `SLOWLOG`, `CONFIG`, `MEMORY`,
 //! `COMMAND GETKEYS`, `WAIT`, `ROLE`, `DEBUG` and the like. Replies are Redis 7.2.4's.
 
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use super::{Args, NOT_AN_INTEGER, Reply, SYNTAX_ERROR, unknown_subcommand, wrong_arity};
@@ -378,6 +379,9 @@ fn can_set(ctx: &Context, name: &str, value: &str) -> Result<(), &'static str> {
         "save" if ctx.snapshots.is_some() => {
             Err("snapshots are set by starting with --snapshot and --snapshot-interval")
         }
+        "replica-read-only" | "slave-read-only" if value == "no" => {
+            Err("replicas here are read-only: writable replicas aren't supported")
+        }
         // Where `~` trims depends on it, and the log's commands run again with the default.
         "stream-node-max-entries" | "stream-node-max-bytes"
             if ctx.aof().is_some() && config::default_of(name) != Some(value) =>
@@ -436,6 +440,56 @@ fn apply(ctx: &Context, name: &str, value: &str) {
         "acl-pubsub-default" => ctx
             .acl
             .set_all_channels(value.eq_ignore_ascii_case("allchannels")),
+        "repl-backlog-size" => ctx.repl.set_backlog_size(number().max(0) as usize),
+        "repl-ping-replica-period" | "repl-ping-slave-period" => ctx
+            .repl
+            .settings
+            .ping_period
+            .store(number().max(1) as u64, Relaxed),
+        "repl-timeout" => ctx
+            .repl
+            .settings
+            .timeout
+            .store(number().max(1) as u64, Relaxed),
+        "masterauth" => {
+            *ctx.repl.settings.masterauth.lock() =
+                Some(value.as_bytes().to_vec()).filter(|p| !p.is_empty())
+        }
+        "masteruser" => {
+            *ctx.repl.settings.masteruser.lock() =
+                Some(value.as_bytes().to_vec()).filter(|u| !u.is_empty())
+        }
+        "min-replicas-to-write" | "min-slaves-to-write" => {
+            ctx.repl
+                .settings
+                .min_replicas_to_write
+                .store(number().max(0) as usize, Relaxed);
+            ctx.update_special();
+        }
+        "min-replicas-max-lag" | "min-slaves-max-lag" => ctx
+            .repl
+            .settings
+            .min_replicas_max_lag
+            .store(number().max(0) as u64, Relaxed),
+        "replica-announce-ip" | "slave-announce-ip" => {
+            *ctx.repl.settings.announce_ip.lock() =
+                Some(value.to_string()).filter(|ip| !ip.is_empty())
+        }
+        "replica-announce-port" | "slave-announce-port" => ctx
+            .repl
+            .settings
+            .announce_port
+            .store(number().clamp(0, 65535) as u16, Relaxed),
+        "replica-priority" | "slave-priority" => ctx
+            .repl
+            .settings
+            .priority
+            .store(number().max(0) as u32, Relaxed),
+        "replica-serve-stale-data" | "slave-serve-stale-data" => ctx
+            .repl
+            .settings
+            .serve_stale_data
+            .store(value == "yes", Relaxed),
         _ => {}
     }
 }
@@ -656,6 +710,23 @@ pub(super) fn wait(
     let Some(timeout) = wait_timeout(args.get(2), out) else {
         return Reply::Written;
     };
+    if ctx.repl.following() {
+        resp::write_error(
+            out,
+            b"ERR WAIT cannot be used with replica instances. Please also note that since Redis 4.0 if a replica is configured to be writable (which is not the default) writes to replicas are just local and are not propagated.",
+        );
+        return Reply::Written;
+    }
+    if let Some(master) = ctx.repl.master() {
+        return crate::repl::master::wait_for_replicas(
+            ctx,
+            session,
+            &master,
+            replicas.max(0) as usize,
+            timeout,
+            out,
+        );
+    }
     if replicas <= 0 || session.deny_blocking {
         resp::write_integer(out, 0);
         return Reply::Written;
@@ -715,34 +786,28 @@ pub(super) fn waitaof(
     crate::blocking::block_for(ctx, session, timeout, reply)
 }
 
-/// `ROLE`: a master, with no replicas.
+/// `ROLE`: a master, with the replicas that follow, or a replica.
 pub(super) fn role(
-    _: &Context,
+    ctx: &Context,
     _: &mut Session,
     _: Millis,
     _: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    out.extend_from_slice(b"*3\r\n$6\r\nmaster\r\n:0\r\n*0\r\n");
+    crate::repl::role(ctx, out);
     Reply::Written
 }
 
-/// `REPLICAOF NO ONE`, which is so already. There's no replication yet.
+/// `REPLICAOF host port` (and `SLAVEOF`): follow that master; `REPLICAOF NO
+/// ONE`: stop following, keeping the data.
 pub(super) fn replicaof(
-    _: &Context,
+    ctx: &Context,
     _: &mut Session,
     _: Millis,
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    if args.get(1).eq_ignore_ascii_case(b"NO") && args.get(2).eq_ignore_ascii_case(b"ONE") {
-        out.extend_from_slice(resp::OK);
-    } else {
-        resp::write_error(
-            out,
-            b"ERR replication isn't there yet: this server can't follow another",
-        );
-    }
+    crate::repl::replicaof(ctx, args, out);
     Reply::Written
 }
 
