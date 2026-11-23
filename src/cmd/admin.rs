@@ -441,6 +441,11 @@ fn apply(ctx: &Context, name: &str, value: &str) {
             .acl
             .set_all_channels(value.eq_ignore_ascii_case("allchannels")),
         "repl-backlog-size" => ctx.repl.set_backlog_size(number().max(0) as usize),
+        "repl-backlog-ttl" => ctx
+            .repl
+            .settings
+            .backlog_ttl
+            .store(number().max(0) as u64, Relaxed),
         "repl-ping-replica-period" | "repl-ping-slave-period" => ctx
             .repl
             .settings

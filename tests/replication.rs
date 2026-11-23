@@ -848,3 +848,230 @@ fn a_replica_has_what_its_master_has_after_random_writes() {
         assert_eq!(m.info("sync_partial_ok"), "1");
     }
 }
+
+#[test]
+fn a_master_lists_its_replicas_and_can_kill_them() {
+    let master = start();
+    let replica = start();
+    follow(&replica, master.addr);
+    synced(master.addr, replica.addr);
+    let mut m = Client::new(master.addr);
+    let listed = m.cmd("CLIENT LIST TYPE replica").text();
+    assert_eq!(listed.lines().count(), 1, "{listed}");
+    assert!(
+        listed.contains(" flags=S ") && listed.contains(" cmd=psync "),
+        "{listed}"
+    );
+    assert!(!m.cmd("CLIENT LIST TYPE normal").text().contains("flags=S"));
+    assert_eq!(m.info("connected_clients"), "1");
+    assert_eq!(m.cmd("CLIENT KILL TYPE replica"), Value::Int(1));
+    // It comes back, continuing where it was.
+    m.cmd("SET after kill");
+    synced(master.addr, replica.addr);
+    assert_eq!(m.info("sync_partial_ok"), "1");
+    assert_eq!(m.info("sync_full"), "1");
+}
+
+#[test]
+fn a_replica_tells_of_its_masters_writes() {
+    let master = start();
+    let replica = start();
+    follow(&replica, master.addr);
+    synced(master.addr, replica.addr);
+    let mut r = Client::new(replica.addr);
+    r.cmd("CONFIG SET notify-keyspace-events KEA");
+    let mut sub = Client::new(replica.addr);
+    sub.cmd("SUBSCRIBE __keyevent@0__:set");
+    let mut m = Client::new(master.addr);
+    m.cmd("SET k v");
+    let message = sub.read().items();
+    assert_eq!(message[0].text(), "message");
+    assert_eq!(message[1].text(), "__keyevent@0__:set");
+    assert_eq!(message[2].text(), "k");
+    // And MONITOR sees them.
+    let mut monitor = Client::new(replica.addr);
+    assert_eq!(monitor.cmd("MONITOR"), Value::Simple("OK".into()));
+    m.cmd("INCR n");
+    let line = monitor.read().text();
+    assert!(line.contains("\"INCR\" \"n\""), "{line}");
+}
+
+#[test]
+fn a_replica_follows_over_tls() {
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = std::env::temp_dir().join(format!("tantalum-repl-tls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+    std::fs::write(&cert, generated.cert.pem()).unwrap();
+    std::fs::write(&key, generated.signing_key.serialize_pem()).unwrap();
+    let acceptor = server::tls_acceptor(&cert, &key).unwrap();
+    // A master with a plain port (for this test's client) and a TLS one.
+    let master = start();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tls_addr = listener.local_addr().unwrap();
+    let ctx = master._ctx.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let _ = server::serve_with(listener, ctx, Some(acceptor)).await;
+        });
+    });
+    let replica = start();
+    // Its certificate, pinned (it's self-signed, for "localhost").
+    tantalum::repl::use_tls(&replica._ctx, &cert).unwrap();
+    let mut m = Client::new(master.addr);
+    m.cmd("SET before tls");
+    let mut r = Client::new(replica.addr);
+    assert_eq!(
+        r.cmd(&format!("REPLICAOF localhost {}", tls_addr.port())),
+        Value::Simple("OK".into())
+    );
+    synced(master.addr, replica.addr);
+    for i in 0..100 {
+        m.cmd(&format!("RPUSH l {i}"));
+    }
+    synced(master.addr, replica.addr);
+    assert_same(master.addr, replica.addr);
+    assert_eq!(m.cmd("WAIT 1 1000"), Value::Int(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_master_frees_its_stream_when_replicas_stay_away() {
+    let master = start();
+    let replica = start();
+    let mut m = Client::new(master.addr);
+    m.cmd("CONFIG SET repl-backlog-ttl 1");
+    follow(&replica, master.addr);
+    synced(master.addr, replica.addr);
+    m.cmd("SET a 1");
+    synced(master.addr, replica.addr);
+    let id = m.info("master_replid");
+    let offset: u64 = m.info("master_repl_offset").parse().unwrap();
+    assert_eq!(m.info("repl_backlog_active"), "1");
+    // The replica goes, and stays away.
+    let mut r = Client::new(replica.addr);
+    assert_eq!(r.cmd("REPLICAOF NO ONE"), Value::Simple("OK".into()));
+    wait_until("the stream to be freed", || {
+        m.info("repl_backlog_active") == "0"
+    });
+    assert_ne!(m.info("master_replid"), id);
+    assert_eq!(m.info("master_repl_offset"), offset.to_string());
+    // Writes go on, and a new replica syncs in full.
+    m.cmd("SET b 2");
+    m.cmd("SET c 3 PX 100000");
+    let newcomer = start();
+    follow(&newcomer, master.addr);
+    synced(master.addr, newcomer.addr);
+    assert_same(master.addr, newcomer.addr);
+    m.cmd("INCR a");
+    synced(master.addr, newcomer.addr);
+    assert_same(master.addr, newcomer.addr);
+}
+
+/// A server that saves snapshots to `path`, after loading what's there (and
+/// taking up where in a replication stream it says its data was).
+fn start_with_snapshot(path: &std::path::Path) -> Server {
+    let store = Arc::new(Store::with_config(Config {
+        shards: 16,
+        ..Config::default()
+    }));
+    let loaded = tantalum::snapshot::load(&store, path).unwrap();
+    let snapshots = tantalum::snapshot::Snapshots::new(store.clone(), path.to_path_buf(), None);
+    let ctx = Context::new(store, Settings::default()).with_snapshots(snapshots);
+    if let Some((id, offset)) = loaded.and_then(|l| l.repl) {
+        tantalum::repl::resume(&ctx, id, offset);
+    }
+    let ctx = Arc::new(ctx);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving = ctx.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            listener.set_nonblocking(true).unwrap();
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let _ = server::serve(listener, serving).await;
+        });
+    });
+    Server { addr, _ctx: ctx }
+}
+
+#[test]
+fn a_replica_restarted_from_its_snapshot_continues() {
+    let dir = std::env::temp_dir().join(format!("tantalum-repl-snap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("replica.snapshot");
+    let master = start();
+    let mut m = Client::new(master.addr);
+    for i in 0..50 {
+        m.cmd(&format!("SET k{i} {i}"));
+    }
+    {
+        let replica = start_with_snapshot(&path);
+        follow(&replica, master.addr);
+        synced(master.addr, replica.addr);
+        m.cmd("SET more 1");
+        synced(master.addr, replica.addr);
+        let mut r = Client::new(replica.addr);
+        assert_eq!(r.cmd("SAVE"), Value::Simple("OK".into()));
+        // It stops following, as a stopped server would.
+        r.cmd("REPLICAOF NO ONE");
+    }
+    m.cmd("SET while away 1");
+    // Started again from its snapshot: it continues where it was.
+    let again = start_with_snapshot(&path);
+    follow(&again, master.addr);
+    synced(master.addr, again.addr);
+    assert_same(master.addr, again.addr);
+    assert_eq!(m.info("sync_full"), "1");
+    assert_eq!(m.info("sync_partial_ok"), "1");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_snapshots_place_in_a_stream_lapses_with_a_write() {
+    let dir = std::env::temp_dir().join(format!("tantalum-repl-lapse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("master.snapshot");
+    // A snapshot that says where it was in a stream (a replica's).
+    let first = start();
+    let saver = start_with_snapshot(&path);
+    follow(&saver, first.addr);
+    Client::new(first.addr).cmd("SET a 1");
+    synced(first.addr, saver.addr);
+    Client::new(saver.addr).cmd("SAVE");
+    Client::new(saver.addr).cmd("REPLICAOF NO ONE");
+    // Loaded by a master that's written to before any replica comes.
+    let master = start_with_snapshot(&path);
+    let mut m = Client::new(master.addr);
+    let id = m.info("master_replid");
+    m.cmd("SET b 2");
+    let replica = start();
+    // It asks to continue that stream, as a replica of the first would.
+    let mut r = Client::new(replica.addr);
+    r.cmd(&format!(
+        "REPLICAOF {} {}",
+        master.addr.ip(),
+        master.addr.port()
+    ));
+    synced(master.addr, replica.addr);
+    assert_same(master.addr, replica.addr);
+    assert_ne!(
+        m.info("master_replid"),
+        id,
+        "a new ID: the old place no longer holds"
+    );
+    assert_eq!(m.info("sync_full"), "1");
+    let _ = std::fs::remove_dir_all(&dir);
+}

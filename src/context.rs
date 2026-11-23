@@ -775,6 +775,17 @@ impl Context {
         self.publish_log(crate::aof::Log::new(self.aof.get().cloned(), Some(master)));
     }
 
+    /// Writes no longer go to replicas (the stream was freed): only to the
+    /// log, if it's on, or nowhere, so they stop taking turns.
+    pub(crate) fn stop_logging_to_replicas(&self) {
+        match self.aof.get() {
+            Some(aof) => self.publish_log(crate::aof::Log::new(Some(aof.clone()), None)),
+            None => self
+                .log
+                .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release),
+        }
+    }
+
     fn publish_log(&self, log: crate::aof::Log) {
         // Leaked: commands hold it by reference without counting.
         let log = Box::into_raw(Box::new(log));
@@ -785,6 +796,9 @@ impl Context {
     /// server's loops, which hold it in an `Arc`.
     pub fn adopt(self: &Arc<Self>) {
         let _ = self.me.set(Arc::downgrade(self));
+        if let Some(snapshots) = &self.snapshots {
+            snapshots.attach(Arc::downgrade(self));
+        }
     }
 
     /// This context, if a server's loop runs it (see [`Context::adopt`]).
@@ -922,6 +936,7 @@ impl Context {
                     outbox: std::sync::Weak::new(),
                     kept: None,
                     tracker: None,
+                    replica: false,
                 },
             );
         }
@@ -973,11 +988,42 @@ impl Context {
             .clients
             .lock()
             .iter()
-            .filter(|(_, client)| client.pubsub == pubsub)
+            .filter(|(_, client)| client.pubsub == pubsub && !client.replica)
             .map(|(&id, _)| id)
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// The replicas' client ids, for `CLIENT LIST TYPE replica`.
+    pub(crate) fn replica_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .clients
+            .lock()
+            .iter()
+            .filter(|(_, client)| client.replica)
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Connection `id` is a replica's from now on (`SYNC`, `PSYNC`): its
+    /// thread has the socket, and the connection stays listed until
+    /// [`Context::forget_replica`].
+    pub(crate) fn hand_to_replica(&self, id: u64, command: &'static str) {
+        if let Some(client) = self.clients.lock().get_mut(&id) {
+            client.replica = true;
+            client.last_command = Some(command);
+        }
+    }
+
+    /// A replica's thread has ended.
+    pub(crate) fn forget_replica(&self, id: u64) {
+        let gone = self.clients.lock().remove(&id);
+        if let Some(client) = gone {
+            close(client.dup);
+        }
     }
 
     /// `CLIENT KILL`: closes the connections it picks, but for `me`'s own,
@@ -1107,6 +1153,7 @@ impl Context {
             laddr: None,
             id: 0,
             pubsub: None,
+            replica: None,
             none: false,
             skip_me: true,
             user: Some(name),
@@ -1142,6 +1189,7 @@ impl Context {
                     laddr: None,
                     id,
                     pubsub: None,
+                    replica: None,
                     none: false,
                     skip_me: true,
                     user: None,
@@ -1298,7 +1346,15 @@ impl Client<'_> {
 impl Drop for Client<'_> {
     fn drop(&mut self) {
         self.report(0);
-        let gone = self.ctx.clients.lock().remove(&self.id);
+        let gone = {
+            let mut clients = self.ctx.clients.lock();
+            // A replica's thread has it now (`Context::forget_replica`).
+            if clients.get(&self.id).is_some_and(|c| c.replica) {
+                None
+            } else {
+                clients.remove(&self.id)
+            }
+        };
         if let Some(client) = gone {
             close(client.dup);
             if let Some(tracker) = &client.tracker {
@@ -1337,6 +1393,9 @@ pub(crate) struct Registered {
     kept: Option<Arc<Subscriber>>,
     /// Its tracking, once it has turned it on, for `CLIENT LIST`.
     pub(crate) tracker: Option<Arc<crate::tracking::Tracker>>,
+    /// A replica, whose socket a thread of its own has now (`PSYNC`): it stays
+    /// listed after its connection's task ends, until that thread's does.
+    pub(crate) replica: bool,
 }
 
 fn new_run_id() -> String {
@@ -1384,6 +1443,8 @@ pub(crate) struct KillFilter<'a> {
     pub(crate) id: u64,
     /// Subscribed or not; `None` for either.
     pub(crate) pubsub: Option<bool>,
+    /// A replica or not; `None` for either.
+    pub(crate) replica: Option<bool>,
     /// A kind of client there's none of here: replicas, a master.
     pub(crate) none: bool,
     pub(crate) skip_me: bool,
@@ -1396,7 +1457,11 @@ impl KillFilter<'_> {
         if self.none || (self.skip_me && id == me) || (self.id != 0 && self.id != id) {
             return false;
         }
-        if self.pubsub.is_some_and(|pubsub| pubsub != client.pubsub) {
+        if self.pubsub.is_some_and(|pubsub| pubsub != client.pubsub)
+            || self
+                .replica
+                .is_some_and(|replica| replica != client.replica)
+        {
             return false;
         }
         if self
@@ -1460,6 +1525,9 @@ fn client_line(
     let subscriptions = session.and_then(|s| s.pubsub.as_deref());
     let count = |to| subscriptions.map_or(0, |s| s.count_of(to));
     let mut flags = String::new();
+    if client.replica {
+        flags.push('S');
+    }
     if client.pubsub {
         flags.push('P');
     }

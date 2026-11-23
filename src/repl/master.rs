@@ -140,8 +140,25 @@ impl Master {
 /// (each I/O thread has finished what it was running), so that a full sync
 /// after it misses none. Not on an I/O thread: it waits for them.
 pub(crate) fn enable(ctx: &Arc<Context>) -> Arc<Master> {
-    static ENABLING: Mutex<()> = Mutex::new(());
+    enable_with(ctx, |_| {})
+}
+
+/// Held while the stream is made or freed.
+static ENABLING: Mutex<()> = Mutex::new(());
+
+/// [`enable`], running `then` with the stream before it can be freed (a
+/// replica joining it).
+fn enable_with(ctx: &Arc<Context>, then: impl FnOnce(&Arc<Master>)) -> Arc<Master> {
     let _one = ENABLING.lock();
+    // A snapshot's place in a stream, taken up at startup, holds only if no
+    // write came since: otherwise replicas must sync in full.
+    if ctx.repl.written_since_resume(&ctx.store) {
+        ctx.repl.set_ids(super::Ids {
+            id: super::new_id(),
+            previous: super::NO_ID.to_string(),
+            previous_until: -1,
+        });
+    }
     let offset = ctx.repl.offset();
     let (master, made) = ctx.repl.master_or_new(offset);
     if made {
@@ -150,7 +167,24 @@ pub(crate) fn enable(ctx: &Arc<Context>) -> Arc<Master> {
         ctx.store.set_replicating(true);
         spawn_cron(ctx, &master);
     }
+    then(&master);
     master
+}
+
+/// Frees the stream after `repl-backlog-ttl` without replicas, as Redis frees
+/// its backlog: writes stop taking turns, and this server's replication ID
+/// changes (a replica that comes back syncs in full). Whether it did.
+fn disable(ctx: &Context, master: &Arc<Master>) -> bool {
+    let _one = ENABLING.lock();
+    if !master.followers().is_empty() || ctx.repl.following() {
+        return false;
+    }
+    // Reads go back to removing what they find expired before writes stop
+    // taking turns: a write outside a turn must never meet a key a read left.
+    ctx.store.set_replicating(false);
+    ctx.stop_logging_to_replicas();
+    ctx.repl.free_master(master.backlog.offset());
+    true
 }
 
 /// Every second: pings replicas through the stream every
@@ -163,11 +197,25 @@ fn spawn_cron(ctx: &Arc<Context>, master: &Arc<Master>) {
         .name("tantalum-repl-cron".into())
         .spawn(move || {
             let mut since_ping = 0;
+            let mut alone_since = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let (Some(ctx), Some(master)) = (ctx.upgrade(), master.upgrade()) else {
                     return;
                 };
+                if !ctx.repl.master().is_some_and(|m| Arc::ptr_eq(&m, &master)) {
+                    return; // freed
+                }
+                if !master.followers().is_empty() || ctx.repl.following() {
+                    alone_since = Instant::now();
+                }
+                let ttl = ctx.repl.settings.backlog_ttl.load(Relaxed);
+                if ttl > 0
+                    && alone_since.elapsed() >= Duration::from_secs(ttl)
+                    && disable(&ctx, &master)
+                {
+                    return;
+                }
                 since_ping += 1;
                 let period = ctx.repl.settings.ping_period.load(Relaxed).max(1);
                 let followers = master.followers();
@@ -273,12 +321,34 @@ pub(crate) fn sync(
         resp::write_error(out, b"ERR replication needs a running server");
         return Reply::Written;
     };
+    let handshake = ctx.repl.take_handshake(session.id);
+    let peer = ctx.peer_of(session);
+    let ip = handshake.ip.clone().unwrap_or_else(|| {
+        peer.rsplit_once(':')
+            .map_or(peer.clone(), |(ip, _)| ip.to_string())
+    });
+    let id = session.id;
+    let command = if psync.is_some() { "psync" } else { "sync" };
+    // Before its thread starts, which forgets it when it ends.
+    ctx.hand_to_replica(id, command);
+    let start = move |conn: Box<dyn FeedConn>| {
+        let feeding = ctx.clone();
+        let started = std::thread::Builder::new()
+            .name("tantalum-replica-feed".into())
+            .spawn(move || {
+                if let Err(e) = feed(&feeding, conn, id, ip, handshake, psync) {
+                    eprintln!("replica {id}: {e}");
+                }
+                feeding.forget_replica(id);
+            });
+        if started.is_err() {
+            ctx.forget_replica(id);
+        }
+    };
     if session.socket < 0 {
-        resp::write_error(
-            out,
-            b"ERR replication over TLS isn't supported yet: replicas connect on the plain port",
-        );
-        return Reply::Written;
+        // TLS: the connection hands its stream over as it closes.
+        HANDOFF.set(Some(Box::new(start)));
+        return Reply::Close;
     }
     // SAFETY: the connection's socket is open while its command runs; this
     // copy of it lives on after the connection closes its own.
@@ -289,54 +359,73 @@ pub(crate) fn sync(
     }
     // SAFETY: `fd` is a fresh duplicate this owns.
     let socket = unsafe { TcpStream::from_raw_fd(fd) };
-    let handshake = ctx.repl.take_handshake(session.id);
-    let peer = ctx.peer_of(session);
-    let ip = handshake.ip.clone().unwrap_or_else(|| {
-        peer.rsplit_once(':')
-            .map_or(peer.clone(), |(ip, _)| ip.to_string())
-    });
-    let id = session.id;
-    let started = std::thread::Builder::new()
-        .name("tantalum-replica-feed".into())
-        .spawn(move || {
-            let _ = socket.set_nonblocking(false);
-            if let Err(e) = feed(&ctx, socket, id, ip, handshake, psync) {
-                eprintln!("replica {id}: {e}");
-            }
-        });
-    if started.is_err() {
-        resp::write_error(out, b"ERR can't start a replica's thread");
-        return Reply::Written;
-    }
+    let _ = socket.set_nonblocking(false);
+    start(Box::new(socket));
     // The connection closes its own copy of the socket; the replica's thread
     // has it now.
     Reply::Close
+}
+
+/// A replica's connection, as its thread uses it: plain, or TLS over it.
+pub(crate) trait FeedConn: Read + Write + Send {
+    /// The TCP socket under it.
+    fn tcp(&self) -> &TcpStream;
+}
+
+impl FeedConn for TcpStream {
+    fn tcp(&self) -> &TcpStream {
+        self
+    }
+}
+
+impl FeedConn for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn tcp(&self) -> &TcpStream {
+        &self.sock
+    }
+}
+
+type Handoff = Box<dyn FnOnce(Box<dyn FeedConn>)>;
+
+thread_local! {
+    /// A replica's `PSYNC` over TLS: what its connection does with its stream
+    /// as it closes (it can't be shared, as a plain socket is).
+    static HANDOFF: std::cell::Cell<Option<Handoff>> = const { std::cell::Cell::new(None) };
+}
+
+/// For a connection that's closing: what to do with its stream, if it's a
+/// replica's.
+pub(crate) fn take_handoff() -> Option<Handoff> {
+    HANDOFF.take()
 }
 
 /// A replica's thread: syncs it, then sends it the stream and reads its acks
 /// until it goes.
 fn feed(
     ctx: &Arc<Context>,
-    mut socket: TcpStream,
+    mut socket: Box<dyn FeedConn>,
     id: u64,
     ip: String,
     handshake: Handshake,
     psync: Option<(String, i64)>,
 ) -> std::io::Result<()> {
-    let master = enable(ctx);
-    let log = ctx.log().expect("enabled");
     let bell = Arc::new(Bell::new()?);
-    let follower = Arc::new(Follower {
-        id,
-        ip,
-        port: handshake.port,
-        state: AtomicU8::new(WAIT_BGSAVE),
-        ack: AtomicU64::new(0),
-        ack_at: AtomicU64::new(master.millis()),
-        bell: bell.clone(),
-        stop: AtomicBool::new(false),
+    let mut follower = None;
+    let master = enable_with(ctx, |master| {
+        let joined = Arc::new(Follower {
+            id,
+            ip,
+            port: handshake.port,
+            state: AtomicU8::new(WAIT_BGSAVE),
+            ack: AtomicU64::new(0),
+            ack_at: AtomicU64::new(master.millis()),
+            bell: bell.clone(),
+            stop: AtomicBool::new(false),
+        });
+        master.followers.lock().push(joined.clone());
+        follower = Some(joined);
     });
-    master.followers.lock().push(follower.clone());
+    let follower = follower.expect("joined");
+    let log = ctx.log().expect("enabled");
     struct Leave<'a>(&'a Master, u64);
     impl Drop for Leave<'_> {
         fn drop(&mut self) {
@@ -346,8 +435,8 @@ fn feed(
     }
     let _leave = Leave(&master, id);
     let timeout = Duration::from_secs(ctx.repl.settings.timeout.load(Relaxed).max(1));
-    socket.set_write_timeout(Some(timeout))?;
-    let _ = socket.set_nodelay(true);
+    socket.tcp().set_write_timeout(Some(timeout))?;
+    let _ = socket.tcp().set_nodelay(true);
 
     // Continue where it was, if the stream still has that.
     let ids = ctx.repl.ids();
@@ -408,7 +497,7 @@ fn feed(
             }
             BacklogRead::Dropped => return Ok(()),
             BacklogRead::Waiting => {
-                let (readable, _) = wait(socket.as_raw_fd(), bell.ear.as_raw_fd(), 1000);
+                let (readable, _) = wait(socket.tcp().as_raw_fd(), bell.ear.as_raw_fd(), 1000);
                 bell.hush();
                 if readable {
                     if !read_acks(&mut socket, &mut acks, true)? {
@@ -445,8 +534,12 @@ fn wait(a: RawFd, b: RawFd, millis: i32) -> (bool, bool) {
 
 /// Reads what the replica sent into `acks`, without waiting. `false` if it
 /// closed (when `must` says something was there).
-fn read_acks(socket: &mut TcpStream, acks: &mut Vec<u8>, must: bool) -> std::io::Result<bool> {
-    socket.set_nonblocking(true)?;
+fn read_acks(
+    socket: &mut Box<dyn FeedConn>,
+    acks: &mut Vec<u8>,
+    must: bool,
+) -> std::io::Result<bool> {
+    socket.tcp().set_nonblocking(true)?;
     let mut chunk = [0u8; 4096];
     let mut any = false;
     let result = loop {
@@ -461,7 +554,7 @@ fn read_acks(socket: &mut TcpStream, acks: &mut Vec<u8>, must: bool) -> std::io:
             Err(e) => break Err(e),
         }
     };
-    socket.set_nonblocking(false)?;
+    socket.tcp().set_nonblocking(false)?;
     if acks.len() > 1 << 20 {
         return Err(std::io::Error::other("a replica sent too much"));
     }

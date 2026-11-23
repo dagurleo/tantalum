@@ -500,7 +500,7 @@ fn execute_checked(
             refuse_in_multi(session);
             return Reply::Written;
         }
-        if session.special && held_back(ctx, session, command) {
+        if session.special && held_back(ctx, session, command) && !crate::repl::applying() {
             session.commands -= 1;
             return Reply::Paused;
         }
@@ -518,6 +518,7 @@ fn execute_checked(
         if session.special
             && let Some(busy) = ctx.scripting.busy_error(ctx)
             && !allowed_when_busy(command, args)
+            && !crate::repl::applying()
         {
             resp::write_error(out, busy);
             refuse_in_multi(session);
@@ -591,6 +592,10 @@ fn refused_on_replica(
     session: &Session,
     command: &Command,
 ) -> Option<&'static [u8]> {
+    // A replica's master runs anything, whatever else waits.
+    if crate::repl::applying() {
+        return None;
+    }
     if ctx.loading() && !command.flags.contains(&"loading") {
         return Some(b"LOADING Redis is loading the dataset in memory");
     }
@@ -2542,6 +2547,7 @@ fn client_kill(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
         laddr: None,
         id: 0,
         pubsub: None,
+        replica: None,
         none: false,
         skip_me: true,
         user: None,
@@ -2579,9 +2585,12 @@ fn client_kill(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
                 let kind = |name: &[u8]| value.eq_ignore_ascii_case(name);
                 if kind(b"NORMAL") {
                     filter.pubsub = Some(false);
+                    filter.replica = Some(false);
                 } else if kind(b"PUBSUB") {
                     filter.pubsub = Some(true);
-                } else if kind(b"MASTER") || kind(b"REPLICA") || kind(b"SLAVE") {
+                } else if kind(b"REPLICA") || kind(b"SLAVE") {
+                    filter.replica = Some(true);
+                } else if kind(b"MASTER") {
                     filter.none = true;
                 } else {
                     let mut msg = b"ERR Unknown client type '".to_vec();
@@ -2644,7 +2653,14 @@ fn client_list(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
             } else {
                 ctx.client_lines(session, &ids, "client|list")
             }
-        } else if is(b"MASTER") || is(b"REPLICA") || is(b"SLAVE") {
+        } else if is(b"REPLICA") || is(b"SLAVE") {
+            let ids = ctx.replica_ids();
+            if ids.is_empty() {
+                Vec::new()
+            } else {
+                ctx.client_lines(session, &ids, "client|list")
+            }
+        } else if is(b"MASTER") {
             Vec::new()
         } else {
             let mut msg = b"ERR Unknown client type '".to_vec();

@@ -155,6 +155,12 @@ Options:
   --repl-backlog-size <SIZE>
                     How much of the replication stream to keep for replicas
                     that reconnect to continue [default: 1mb]
+  --tls-replication <yes|no>
+  --tls-ca-cert-file <FILE>
+                    Connect to the master over TLS, trusting the certificates
+                    in FILE (PEM): CAs, or the master's own, as it is (a
+                    self-signed one) [default: no]. A master serves replicas
+                    on its --tls-port too.
   -h, --help        Print this help
 
 On SIGTERM or SIGINT, Tantalum stops accepting, lets each connection finish
@@ -184,6 +190,8 @@ struct Config {
     masterauth: Option<Vec<u8>>,
     masteruser: Option<Vec<u8>>,
     repl_backlog_size: Option<usize>,
+    tls_replication: bool,
+    tls_ca_cert: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -273,6 +281,8 @@ fn parse_args() -> Result<Config, String> {
         masterauth: None,
         masteruser: None,
         repl_backlog_size: None,
+        tls_replication: false,
+        tls_ca_cert: None,
     };
     let mut aof_options = aof::Options {
         dir: PathBuf::new(),
@@ -367,6 +377,14 @@ fn parse_args() -> Result<Config, String> {
             "--masteruser" => {
                 config.masteruser = Some(value.into_bytes()).filter(|u| !u.is_empty())
             }
+            "--tls-replication" => {
+                config.tls_replication = match value.as_str() {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Err(bad(())),
+                }
+            }
+            "--tls-ca-cert-file" => config.tls_ca_cert = Some(PathBuf::from(value)),
             "--repl-backlog-size" => {
                 config.repl_backlog_size = Some(parse_size(&value).ok_or_else(|| bad(()))?);
             }
@@ -435,11 +453,12 @@ fn main() -> std::io::Result<()> {
         .aof
         .as_ref()
         .is_some_and(|options| aof::exists(&options.dir));
+    let mut in_stream = None;
     if let Some(path) = &config.snapshot {
         if logged {
             eprintln!("loading from the append-only log, not {}", path.display());
         } else {
-            load_snapshot(&store, path);
+            in_stream = load_snapshot(&store, path);
         }
         let snapshots = Snapshots::new(store.clone(), path.clone(), config.snapshot_interval);
         snapshots.spawn_periodic()?;
@@ -469,6 +488,20 @@ fn main() -> std::io::Result<()> {
         config.masteruser.clone(),
         config.repl_backlog_size,
     );
+    // Replicas (or this one's master) may continue from where it was.
+    if let Some((id, offset)) = in_stream {
+        tantalum::repl::resume(&ctx, id, offset);
+    }
+    if config.tls_replication {
+        let Some(ca) = &config.tls_ca_cert else {
+            eprintln!("error: --tls-replication needs --tls-ca-cert-file\n\n{USAGE}");
+            std::process::exit(2);
+        };
+        if let Err(e) = tantalum::repl::use_tls(&ctx, ca) {
+            eprintln!("error: --tls-ca-cert-file: {e}");
+            std::process::exit(2);
+        }
+    }
     let ctx = Arc::new(ctx);
     ctx.adopt();
     if let Some((host, port)) = &config.replicaof {
@@ -673,10 +706,15 @@ fn start_aof(ctx: &Context, options: aof::Options) {
 
 /// Loads the snapshot at `path`, if there is one. A damaged one stops the
 /// server, as in Redis: starting empty would overwrite it at the next save.
-fn load_snapshot(store: &Arc<store::Store>, path: &std::path::Path) {
+/// Loads the snapshot at `path`: where its data is in a replication stream,
+/// if it says.
+fn load_snapshot(store: &Arc<store::Store>, path: &std::path::Path) -> Option<(String, u64)> {
     let started = Instant::now();
     match snapshot::load(store, path) {
-        Ok(None) => eprintln!("no snapshot at {} yet: starting empty", path.display()),
+        Ok(None) => {
+            eprintln!("no snapshot at {} yet: starting empty", path.display());
+            None
+        }
         Ok(Some(loaded)) => {
             let mut line = format!(
                 "loaded {} keys from {} in {} ms",
@@ -694,6 +732,7 @@ fn load_snapshot(store: &Arc<store::Store>, path: &std::path::Path) {
                 );
             }
             eprintln!("{line}");
+            loaded.repl
         }
         Err(e) => {
             eprintln!(

@@ -167,11 +167,15 @@ fn run(
     cached: &mut Option<(String, u64)>,
 ) -> std::io::Result<()> {
     let timeout = timeout_of(ctx);
-    let addr = (link.host.as_str(), link.port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| std::io::Error::other("no address for the master"))?;
-    let socket = TcpStream::connect_timeout(&addr, timeout)?;
+    // Each address the name has, in turn (localhost may be ::1 or 127.0.0.1).
+    let mut connected = Err(std::io::Error::other("no address for the master"));
+    for addr in (link.host.as_str(), link.port).to_socket_addrs()? {
+        connected = TcpStream::connect_timeout(&addr, timeout);
+        if connected.is_ok() {
+            break;
+        }
+    }
+    let socket = connected?;
     socket.set_nodelay(true)?;
     socket.set_read_timeout(Some(timeout))?;
     socket.set_write_timeout(Some(timeout))?;
@@ -179,10 +183,22 @@ fn run(
     if link.stop.load(Relaxed) {
         return Ok(());
     }
-    let mut writer = socket.try_clone()?;
-    let mut reader = BufReader::with_capacity(64 * 1024, socket);
-    let mut ask = |args: &[&[u8]], reader: &mut BufReader<TcpStream>| -> std::io::Result<Vec<u8>> {
-        writer.write_all(&command(args))?;
+    let tls = ctx.repl.settings.tls.lock().clone();
+    let conn = match tls {
+        None => Conn::Plain(socket),
+        Some(config) => {
+            let name =
+                rustls::pki_types::ServerName::try_from(link.host.clone()).map_err(|_| {
+                    std::io::Error::other("the master's host isn't a name TLS can check")
+                })?;
+            let session =
+                rustls::ClientConnection::new(config, name).map_err(std::io::Error::other)?;
+            Conn::Tls(Box::new(rustls::StreamOwned::new(session, socket)))
+        }
+    };
+    let mut reader = BufReader::with_capacity(64 * 1024, conn);
+    let ask = |args: &[&[u8]], reader: &mut BufReader<Conn>| -> std::io::Result<Vec<u8>> {
+        reader.get_mut().write_all(&command(args))?;
         line(reader)
     };
 
@@ -282,7 +298,7 @@ fn run(
 /// master that streams it, for a replica that said `capa eof`) `$EOF:mark`,
 /// the file, and the mark. Newlines before it are the master saying it's
 /// still working on it.
-fn read_rdb(reader: &mut BufReader<TcpStream>, link: &Link) -> std::io::Result<Vec<u8>> {
+fn read_rdb(reader: &mut BufReader<Conn>, link: &Link) -> std::io::Result<Vec<u8>> {
     let header = loop {
         let line = line(reader)?;
         *link.last_io.lock() = Instant::now();
@@ -356,14 +372,14 @@ fn apply(
     ctx: &Arc<Context>,
     link: &Link,
     master: &Arc<super::Master>,
-    mut reader: BufReader<TcpStream>,
+    mut reader: BufReader<Conn>,
     cached: &mut Option<(String, u64)>,
 ) -> std::io::Result<()> {
     let log = ctx.log().expect("replicas take turns");
-    let mut writer = reader.get_ref().try_clone()?;
     // Reads wake at least every second, to ack.
     reader
         .get_ref()
+        .tcp()
         .set_read_timeout(Some(Duration::from_secs(1)))?;
     let timeout = timeout_of(ctx);
     let mut session = master_session(ctx);
@@ -406,6 +422,10 @@ fn apply(
                 && args.get(0).eq_ignore_ascii_case(b"REPLCONF")
                 && args.get(1).eq_ignore_ascii_case(b"GETACK");
             {
+                // As other connections do once a batch: so that what's
+                // watching every command (keyspace notifications, MONITOR,
+                // statistics) sees the master's, as on Redis' replicas.
+                ctx.follow_special(&mut session);
                 let turn = log.turn(&ctx.store, false, session.db);
                 if !args.is_empty() && !getack && !args.get(0).eq_ignore_ascii_case(b"REPLCONF") {
                     out.clear();
@@ -431,7 +451,7 @@ fn apply(
                 *offset = link.offset();
             }
             if getack {
-                writer.write_all(&ack(link.offset()))?;
+                reader.get_mut().write_all(&ack(link.offset()))?;
                 acked = Instant::now();
             }
             pos = end;
@@ -439,7 +459,7 @@ fn apply(
         buf.drain(..pos);
         ctx.publish(&mut session);
         if acked.elapsed() >= Duration::from_secs(1) {
-            writer.write_all(&ack(link.offset()))?;
+            reader.get_mut().write_all(&ack(link.offset()))?;
             acked = Instant::now();
         }
         let _ = master;
@@ -485,4 +505,153 @@ fn error(what: &str, reply: &[u8]) -> std::io::Error {
         "the master replied to {what}: {}",
         String::from_utf8_lossy(reply)
     ))
+}
+
+/// The connection to the master: plain, or TLS (`--tls-replication`).
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Conn {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Conn::Plain(socket) => socket,
+            Conn::Tls(stream) => &stream.sock,
+        }
+    }
+}
+
+impl Read for Conn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(socket) => socket.read(buf),
+            Conn::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Conn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Conn::Plain(socket) => socket.write(buf),
+            Conn::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(socket) => socket.flush(),
+            Conn::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+/// How a replica checks its master's certificate (`--tls-ca-cert-file`): by
+/// the CAs in the file, or, for a certificate in it that the master presents
+/// as it is, by that alone (a self-signed one, pinned).
+#[derive(Debug)]
+struct Verifier {
+    by_ca: Option<Arc<rustls::client::WebPkiServerVerifier>>,
+    pinned: Vec<rustls::pki_types::CertificateDer<'static>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Verifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self
+            .pinned
+            .iter()
+            .any(|cert| cert.as_ref() == end_entity.as_ref())
+        {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        match &self.by_ca {
+            Some(by_ca) => {
+                by_ca.verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
+            }
+            None => Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            )),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// The TLS setup a replica connects to its master with: trusting the
+/// certificates in the PEM file `ca_file`, as CAs or as they are.
+pub(crate) fn tls_config(ca_file: &std::path::Path) -> std::io::Result<Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::pem::PemObject;
+    let certs = rustls::pki_types::CertificateDer::pem_file_iter(ca_file)
+        .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| std::io::Error::other(format!("{}: {e}", ca_file.display())))?;
+    if certs.is_empty() {
+        return Err(std::io::Error::other(format!(
+            "{}: no certificates in it",
+            ca_file.display()
+        )));
+    }
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in &certs {
+        let _ = roots.add(cert.clone());
+    }
+    let by_ca = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .build()
+    .ok();
+    let verifier = Verifier {
+        by_ca,
+        pinned: certs,
+        provider: provider.clone(),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    Ok(Arc::new(config))
 }

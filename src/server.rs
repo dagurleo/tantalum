@@ -915,6 +915,15 @@ trait Stream: AsyncRead + AsyncWrite + Unpin {
     fn plain_socket(&self) -> std::os::fd::RawFd {
         -1
     }
+
+    /// The stream as a blocking one, for a replica's thread to go on with
+    /// (`PSYNC` over TLS: see `repl::master::sync`).
+    fn into_feed(self) -> Option<Box<dyn crate::repl::master::FeedConn>>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 impl Stream for TcpStream {
@@ -933,6 +942,13 @@ impl Stream for TcpStream {
 
 impl Stream for tokio_rustls::server::TlsStream<TcpStream> {
     const WAIT_FOR_DATA: bool = false;
+
+    fn into_feed(self) -> Option<Box<dyn crate::repl::master::FeedConn>> {
+        let (tcp, session) = self.into_inner();
+        let tcp = tcp.into_std().ok()?;
+        tcp.set_nonblocking(false).ok()?;
+        Some(Box::new(rustls::StreamOwned::new(session, tcp)))
+    }
 }
 
 /// Serves one connection, after a TLS handshake if `tls` is given.
@@ -1463,6 +1479,12 @@ async fn serve_stream(
             wbuf.clear();
         }
         if close {
+            // A replica over TLS: its thread goes on with the stream.
+            if let Some(handoff) = crate::repl::master::take_handoff()
+                && let Some(conn) = socket.into_feed()
+            {
+                handoff(conn);
+            }
             return Ok(());
         }
         if rbuf.len() > MAX_QUERY_BUFFER {

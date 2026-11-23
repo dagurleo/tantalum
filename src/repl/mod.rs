@@ -59,6 +59,9 @@ pub(crate) struct Settings {
     pub(crate) masterauth: Mutex<Option<Vec<u8>>>,
     pub(crate) masteruser: Mutex<Option<Vec<u8>>>,
     pub(crate) min_replicas_to_write: AtomicUsize,
+    /// `repl-backlog-ttl`, seconds: the stream is freed after this long
+    /// without replicas (0: never).
+    pub(crate) backlog_ttl: AtomicU64,
     /// `min-replicas-max-lag`, seconds.
     pub(crate) min_replicas_max_lag: AtomicU64,
     pub(crate) announce_ip: Mutex<Option<String>>,
@@ -66,6 +69,8 @@ pub(crate) struct Settings {
     pub(crate) priority: AtomicU32,
     pub(crate) read_only: AtomicBool,
     pub(crate) serve_stale_data: AtomicBool,
+    /// `--tls-replication`: how a replica connects to its master over TLS.
+    pub(crate) tls: Mutex<Option<Arc<rustls::ClientConfig>>>,
 }
 
 impl Default for Settings {
@@ -77,12 +82,14 @@ impl Default for Settings {
             masterauth: Mutex::new(None),
             masteruser: Mutex::new(None),
             min_replicas_to_write: AtomicUsize::new(0),
+            backlog_ttl: AtomicU64::new(3600),
             min_replicas_max_lag: AtomicU64::new(10),
             announce_ip: Mutex::new(None),
             announce_port: AtomicU16::new(0),
             priority: AtomicU32::new(100),
             read_only: AtomicBool::new(true),
             serve_stale_data: AtomicBool::new(true),
+            tls: Mutex::new(None),
         }
     }
 }
@@ -93,6 +100,13 @@ pub(crate) struct Replication {
     /// The stream replicas follow: made when the first one asks, or when this
     /// server starts following a master (for replicas of its own).
     master: Mutex<Option<Arc<Master>>>,
+    /// Where the last stream ended, if one was freed (or a snapshot says where
+    /// the data it loaded was): the next goes on from there.
+    freed_at: Mutex<Option<u64>>,
+    /// The store's change count when a snapshot's place in a stream was taken
+    /// up (`resume`): if writes came before the next stream, that place no
+    /// longer holds.
+    resumed_at_changes: Mutex<Option<u64>>,
     /// The master this server follows, if any.
     pub(crate) link: Mutex<Option<Arc<replica::Link>>>,
     /// Whether `link` is set: read once a batch by connections (`special`).
@@ -120,6 +134,8 @@ impl Default for Replication {
                 previous_until: -1,
             }),
             master: Mutex::new(None),
+            freed_at: Mutex::new(None),
+            resumed_at_changes: Mutex::new(None),
             link: Mutex::new(None),
             following: AtomicBool::new(false),
             handshakes: Mutex::new(std::collections::HashMap::new()),
@@ -154,6 +170,7 @@ impl Replication {
             self.settings.backlog_size.load(Relaxed),
             offset,
         ));
+        self.resumed_at_changes.lock().take();
         *master = Some(made.clone());
         (made, true)
     }
@@ -165,6 +182,24 @@ impl Replication {
         if let Some(master) = self.master() {
             master.backlog.set_size(size);
         }
+    }
+
+    /// Frees the stream, which ended at `offset`: the next one goes on from
+    /// there, under a new ID (see `master::disable`).
+    pub(crate) fn free_master(&self, offset: u64) {
+        *self.master.lock() = None;
+        *self.freed_at.lock() = Some(offset);
+        self.set_ids(Ids {
+            id: new_id(),
+            previous: NO_ID.to_string(),
+            previous_until: -1,
+        });
+    }
+
+    /// Whether writes came since a snapshot's place in a stream was taken up.
+    pub(crate) fn written_since_resume(&self, store: &crate::store::Store) -> bool {
+        let resumed = *self.resumed_at_changes.lock();
+        resumed.is_some_and(|changes| store.changes() != changes)
     }
 
     /// Whether this server follows a master.
@@ -184,10 +219,13 @@ impl Replication {
 
     /// `master_repl_offset`: how far the stream has got (0 if there's none).
     pub(crate) fn offset(&self) -> u64 {
-        self.master().map_or_else(
-            || self.link.lock().as_ref().map_or(0, |link| link.offset()),
-            |master| master.backlog.offset(),
-        )
+        if let Some(master) = self.master() {
+            return master.backlog.offset();
+        }
+        if let Some(link) = self.link.lock().as_ref() {
+            return link.offset();
+        }
+        self.freed_at.lock().unwrap_or(0)
     }
 }
 
@@ -367,6 +405,15 @@ pub(crate) fn replicaof(
     out.extend_from_slice(resp::OK);
 }
 
+/// Whether this thread is a replica's, running what its master sent: its
+/// commands pass the checks other clients' get on a replica (`-READONLY`,
+/// `CLIENT PAUSE`, a busy script), and no key expires on it by this server's
+/// clock. Looked at only on the checked path.
+#[cold]
+pub(crate) fn applying() -> bool {
+    crate::segment::expiry_suspended()
+}
+
 /// Replication's settings given at startup: the password and user to `AUTH`
 /// to a master with, and the backlog's size.
 pub fn configure(
@@ -390,6 +437,28 @@ pub fn configure(
         ctx.config.set("repl-backlog-size", &size.to_string());
         settings.backlog_size.store(size.max(16 * 1024), Relaxed);
     }
+}
+
+/// A replica connects to its master over TLS (`--tls-replication yes`),
+/// trusting the certificates in `ca_file` (`--tls-ca-cert-file`): as CAs, or
+/// one the master presents as it is (a self-signed one).
+pub fn use_tls(ctx: &crate::context::Context, ca_file: &std::path::Path) -> std::io::Result<()> {
+    let config = replica::tls_config(ca_file)?;
+    *ctx.repl.settings.tls.lock() = Some(config);
+    ctx.config.set("tls-replication", "yes");
+    ctx.config
+        .set("tls-ca-cert-file", &ca_file.display().to_string());
+    Ok(())
+}
+
+/// The data a snapshot loaded was at offset `offset` of the replication
+/// stream with ID `id`: replicas of this server (or, with `--replicaof`, its
+/// master) can continue from there, if no write comes first.
+pub fn resume(ctx: &crate::context::Context, id: String, offset: u64) {
+    let ids = ctx.repl.ids();
+    ctx.repl.set_ids(Ids { id, ..ids });
+    *ctx.repl.freed_at.lock() = Some(offset);
+    *ctx.repl.resumed_at_changes.lock() = Some(ctx.store.changes());
 }
 
 /// Follows the master at `host:port` (`--replicaof`): `ctx` must have been
