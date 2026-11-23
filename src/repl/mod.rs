@@ -16,6 +16,7 @@
 //! writes to remove and propagate.
 
 pub(crate) mod backlog;
+pub(crate) mod failover;
 pub(crate) mod master;
 pub(crate) mod propagate;
 pub(crate) mod replica;
@@ -26,6 +27,8 @@ use std::sync::atomic::{
 };
 
 use parking_lot::Mutex;
+
+use crate::store::Store;
 
 pub(crate) use master::Master;
 
@@ -115,6 +118,12 @@ pub(crate) struct Replication {
     handshakes: Mutex<std::collections::HashMap<u64, master::Handshake>>,
     pub(crate) settings: Settings,
     pub(crate) syncs: Syncs,
+    /// A writable replica's keys given a TTL by its own writes, by database:
+    /// they expire here, as the master doesn't know of them (Redis'
+    /// `slaveKeysWithExpire`).
+    written_here: Mutex<std::collections::HashSet<(u32, Box<[u8]>)>>,
+    /// A `FAILOVER` going on, if one is.
+    pub(crate) failover: Mutex<failover::Failover>,
 }
 
 /// `INFO`'s counts of replicas' syncs: full, and continued or not.
@@ -141,6 +150,8 @@ impl Default for Replication {
             handshakes: Mutex::new(std::collections::HashMap::new()),
             settings: Settings::default(),
             syncs: Syncs::default(),
+            written_here: Mutex::new(std::collections::HashSet::new()),
+            failover: Mutex::new(failover::Failover::default()),
         }
     }
 }
@@ -171,6 +182,7 @@ impl Replication {
             offset,
         ));
         self.resumed_at_changes.lock().take();
+        made.set_following(self.following());
         *master = Some(made.clone());
         (made, true)
     }
@@ -209,7 +221,74 @@ impl Replication {
     }
 
     pub(crate) fn set_following(&self, on: bool) {
+        let master = self.master.lock();
         self.following.store(on, Relaxed);
+        if let Some(master) = &*master {
+            master.set_following(on);
+        }
+        drop(master);
+        self.written_here.lock().clear();
+    }
+
+    /// After a writable replica's own writes: of the keys they wrote, those
+    /// with a TTL now expire here, and those without no longer do.
+    pub(crate) fn note_written_here(&self, store: &Arc<Store>, keys: Vec<(u32, Box<[u8]>)>) {
+        let mut here = self.written_here.lock();
+        for (db, key) in keys {
+            let db_store = store.db(db as usize);
+            let expires = db_store.update_key(db_store.key(&key), store.now(), |c| {
+                (
+                    crate::store::Update::Peek,
+                    c.is_some_and(|c| c.expiry != crate::store::Expiry::Never),
+                )
+            });
+            if expires.unwrap_or(false) {
+                here.insert((db, key));
+            } else {
+                here.remove(&(db, key));
+            }
+        }
+    }
+
+    /// Whether a writable replica has keys of its own to expire.
+    pub(crate) fn any_written_here(&self) -> bool {
+        !self.written_here.lock().is_empty()
+    }
+
+    /// Expires a writable replica's own keys whose time has come (in a
+    /// write's turn, which removes them, and keeps the removal here), and
+    /// forgets those gone or no longer expiring (`expireSlaveKeys`).
+    pub(crate) fn expire_written_here(&self, ctx: &crate::context::Context) {
+        let Some(log) = ctx.log() else {
+            return;
+        };
+        let keys: Vec<_> = self.written_here.lock().iter().cloned().collect();
+        let mut gone = Vec::new();
+        {
+            let turn = log.turn(&ctx.store, false, 0);
+            for (db, key) in &keys {
+                crate::aof::select(*db as usize);
+                let store = ctx.store.db(*db as usize);
+                let expires = store.update_key(store.key(key), turn.now, |c| {
+                    (
+                        crate::store::Update::Peek,
+                        c.is_some_and(|c| c.expiry != crate::store::Expiry::Never),
+                    )
+                });
+                if !expires.unwrap_or(false) {
+                    gone.push((*db, key.clone()));
+                }
+            }
+        }
+        let mut here = self.written_here.lock();
+        for key in gone {
+            here.remove(&key);
+        }
+    }
+
+    /// A full sync replaced the data: the keys this replica wrote are gone.
+    pub(crate) fn forget_written_here(&self) {
+        self.written_here.lock().clear();
     }
 
     /// Whether this server follows a master and is connected to it, synced.
@@ -321,10 +400,11 @@ pub(crate) fn info(ctx: &crate::context::Context) -> String {
     };
     let _ = write!(
         s,
-        "master_failover_state:no-failover\r\nmaster_replid:{}\r\nmaster_replid2:{}\r\n\
+        "master_failover_state:{}\r\nmaster_replid:{}\r\nmaster_replid2:{}\r\n\
          master_repl_offset:{offset}\r\nsecond_repl_offset:{}\r\nrepl_backlog_active:{active}\r\n\
          repl_backlog_size:{size}\r\nrepl_backlog_first_byte_offset:{first}\r\n\
          repl_backlog_histlen:{histlen}\r\n\r\n",
+        repl.failover.lock().state.name(),
         ids.id,
         ids.previous,
         if ids.previous_until >= 0 {
@@ -379,6 +459,10 @@ pub(crate) fn replicaof(
     out: &mut Vec<u8>,
 ) {
     use crate::resp;
+    if ctx.repl.failover.lock().state != failover::State::None {
+        resp::write_error(out, b"ERR REPLICAOF not allowed while failing over.");
+        return;
+    }
     let (host, port) = (args.get(1), args.get(2));
     if host.eq_ignore_ascii_case(b"NO") && port.eq_ignore_ascii_case(b"ONE") {
         replica::promote(ctx);

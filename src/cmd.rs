@@ -256,6 +256,7 @@ static COMMANDS: &[Command] = &[
     Command { name: "role", arity: 1, flags: &["noscript", "loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: admin::role },
     Command { name: "replicaof", arity: 3, flags: &["admin", "noscript", "stale", "no_async_loading"], fast: false, keys: NO_KEYS, run: admin::replicaof },
     Command { name: "slaveof", arity: 3, flags: &["admin", "noscript", "stale", "no_async_loading"], fast: false, keys: NO_KEYS, run: admin::replicaof },
+    Command { name: "failover", arity: -1, flags: &["admin", "noscript", "stale"], fast: false, keys: NO_KEYS, run: admin::failover },
     Command { name: "sync", arity: 1, flags: &["admin", "noscript", "no_async_loading", "no_multi"], fast: false, keys: NO_KEYS, run: crate::repl::master::sync },
     Command { name: "psync", arity: -3, flags: &["admin", "noscript", "no_async_loading", "no_multi"], fast: false, keys: NO_KEYS, run: crate::repl::master::sync },
     Command { name: "replconf", arity: -1, flags: &["admin", "noscript", "loading", "stale", "allow_busy"], fast: false, keys: NO_KEYS, run: crate::repl::master::replconf },
@@ -617,6 +618,14 @@ fn refused_on_replica(
         return None;
     }
     if following {
+        if !ctx
+            .repl
+            .settings
+            .read_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
         return Some(b"READONLY You can't write against a read only replica.");
     }
     let lag = ctx
@@ -1009,6 +1018,15 @@ pub fn spawn_expirer(
                 let now = ctx.store.now();
                 // As in Redis, what's paused doesn't change by itself meanwhile.
                 // A replica's keys go when its master says.
+                // But for a writable replica's own (Redis' `expireSlaveKeys`).
+                if ctx.repl.following()
+                    && ctx.pause_mode().is_none()
+                    && !ctx.cron_paused()
+                    && ctx.repl.any_written_here()
+                {
+                    let _expiring = ctx.expiring.lock();
+                    ctx.repl.expire_written_here(&ctx);
+                }
                 if ctx.pause_mode().is_none()
                     && ctx.active_expire()
                     && !ctx.cron_paused()

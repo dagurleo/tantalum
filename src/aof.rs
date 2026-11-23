@@ -459,7 +459,11 @@ impl Log {
         let previous = ACTIVE.replace(Some(active));
         debug_assert!(previous.is_none(), "a write turn inside another");
         if let Some(repl) = &self.repl {
-            crate::repl::propagate::begin(repl, store, now, db);
+            if repl.following() && !crate::repl::applying() {
+                crate::repl::propagate::begin_local();
+            } else {
+                crate::repl::propagate::begin(repl, store, now, db);
+            }
         }
         Turn {
             now,

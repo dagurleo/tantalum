@@ -208,6 +208,8 @@ pub struct Context {
     pause: Mutex<Option<Pause>>,
     /// Whether `pause` holds one, so that the checked path's commands needn't lock it.
     paused: AtomicBool,
+    /// A `FAILOVER` holds writes back (`pause_for_failover`).
+    failover_paused: AtomicBool,
     /// `notify-keyspace-events`, as flags (see `notify.rs`).
     keyspace_events: AtomicU32,
     /// What `CONFIG SET` can change of [`Settings`].
@@ -261,6 +263,7 @@ impl Context {
             monitors: Mutex::new(Vec::new()),
             pause: Mutex::new(None),
             paused: AtomicBool::new(false),
+            failover_paused: AtomicBool::new(false),
             keyspace_events: AtomicU32::new(0),
             maxclients: AtomicUsize::new(settings.maxclients),
             timeout: AtomicU64::new(settings.timeout.map_or(0, |t| t.as_millis() as u64)),
@@ -447,6 +450,7 @@ impl Context {
             || self.loading()
             || self.repl.settings.min_replicas_to_write.load(Relaxed) > 0
             || self.pause.lock().is_some()
+            || self.failover_paused.load(Relaxed)
             || self.slowlog.needs_precise()
             || self.latency.threshold() != 0
             || self.stats.is_on()
@@ -597,7 +601,19 @@ impl Context {
 
     pub(crate) fn unpause_clients(&self) {
         *self.pause.lock() = None;
-        self.paused.store(false, Relaxed);
+        self.paused
+            .store(self.failover_paused.load(Relaxed), Relaxed);
+        self.update_special();
+    }
+
+    /// A `FAILOVER` holds writes back (as `CLIENT PAUSE WRITE`, but until it's
+    /// over), or lets them go.
+    pub(crate) fn pause_for_failover(&self, on: bool) {
+        let pause = self.pause.lock();
+        self.failover_paused.store(on, Relaxed);
+        self.paused
+            .store(on || pause.is_some(), std::sync::atomic::Ordering::Release);
+        drop(pause);
         self.update_special();
     }
 
@@ -658,11 +674,16 @@ impl Context {
             return None;
         }
         let mut pause = self.pause.lock();
-        let current = (*pause)?;
-        if Instant::now() < current.until {
-            return Some(current.all);
+        let failover = self.failover_paused.load(Relaxed);
+        if let Some(current) = *pause {
+            if Instant::now() < current.until {
+                return Some(current.all);
+            }
+            *pause = None;
         }
-        *pause = None;
+        if failover {
+            return Some(false);
+        }
         self.paused.store(false, Relaxed);
         drop(pause);
         self.update_special();

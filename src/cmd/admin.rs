@@ -379,9 +379,6 @@ fn can_set(ctx: &Context, name: &str, value: &str) -> Result<(), &'static str> {
         "save" if ctx.snapshots.is_some() => {
             Err("snapshots are set by starting with --snapshot and --snapshot-interval")
         }
-        "replica-read-only" | "slave-read-only" if value == "no" => {
-            Err("replicas here are read-only: writable replicas aren't supported")
-        }
         // Where `~` trims depends on it, and the log's commands run again with the default.
         "stream-node-max-entries" | "stream-node-max-bytes"
             if ctx.aof().is_some() && config::default_of(name) != Some(value) =>
@@ -495,6 +492,9 @@ fn apply(ctx: &Context, name: &str, value: &str) {
             .settings
             .serve_stale_data
             .store(value == "yes", Relaxed),
+        "replica-read-only" | "slave-read-only" => {
+            ctx.repl.settings.read_only.store(value == "yes", Relaxed);
+        }
         _ => {}
     }
 }
@@ -813,6 +813,18 @@ pub(super) fn replicaof(
     out: &mut Vec<u8>,
 ) -> Reply {
     crate::repl::replicaof(ctx, args, out);
+    Reply::Written
+}
+
+/// `FAILOVER`: hand over to a replica (`repl/failover.rs`).
+pub(super) fn failover(
+    ctx: &Context,
+    _: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::repl::failover::command(ctx, args, out);
     Reply::Written
 }
 

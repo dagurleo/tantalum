@@ -119,6 +119,10 @@ pub(crate) fn follow(ctx: &Arc<Context>, host: String, port: u16) {
                 match run(&ctx, &link, &master, &mut cached) {
                     Ok(()) => {}
                     Err(e) if link.stop.load(Relaxed) => drop(e),
+                    // A failover whose target can't be reached is over.
+                    Err(e) if super::failover::in_progress(&ctx) => {
+                        super::failover::abort(&ctx, &e.to_string());
+                    }
                     Err(e) => eprintln!(
                         "replica of {}:{}: {e}; trying again in a second",
                         link.host, link.port
@@ -241,7 +245,16 @@ fn run(
         Some((id, offset)) => (id.clone(), (offset + 1).to_string()),
         None => ("?".to_string(), "-1".to_string()),
     };
-    let mut reply = ask(&[b"PSYNC", id.as_bytes(), next.as_bytes()], &mut reader)?;
+    // A master failing over asks the replica it follows now to take over.
+    let failing_over = super::failover::in_progress(ctx);
+    let mut reply = if failing_over {
+        ask(
+            &[b"PSYNC", id.as_bytes(), next.as_bytes(), b"FAILOVER"],
+            &mut reader,
+        )?
+    } else {
+        ask(&[b"PSYNC", id.as_bytes(), next.as_bytes()], &mut reader)?
+    };
     // Newlines are the master saying it's getting ready (a diskless sync
     // waits `repl-diskless-sync-delay` for more replicas first).
     while reply.is_empty() {
@@ -249,6 +262,14 @@ fn run(
         *link.last_io.lock() = Instant::now();
     }
     let words: Vec<&[u8]> = reply.split(|&b| b == b' ').collect();
+    if failing_over {
+        // (A full sync isn't what's expected, but works.)
+        let accepted = reply.starts_with(b"+FULLRESYNC") || reply.starts_with(b"+CONTINUE");
+        super::failover::answered(ctx, accepted);
+        if !accepted {
+            return Err(error("PSYNC FAILOVER", &reply));
+        }
+    }
     if reply.starts_with(b"+FULLRESYNC") && words.len() >= 3 {
         let id = String::from_utf8_lossy(words[1]).into_owned();
         let offset = crate::resp::parse_int(words[2])
@@ -331,6 +352,7 @@ fn load(ctx: &Context, reader: &mut BufReader<Conn>, link: &Link) -> std::io::Re
     ctx.set_loading(true);
     let loaded = log.exclusive(|| {
         empty();
+        ctx.repl.forget_written_here();
         let loaded = if let Some(mark) = mark {
             let mut src = Marked::new(Progress::new(&mut *reader, link), mark);
             crate::rdb_file::load(ctx, &mut src).and_then(|loaded| {

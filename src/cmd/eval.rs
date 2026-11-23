@@ -286,8 +286,15 @@ pub(crate) fn call_from_script(
         resp::write_error(out, aof.failure().as_bytes());
         return Ok(false);
     }
-    // A replica's scripts may only read, as in Redis.
-    if write && ctx.repl.following() {
+    // A read-only replica's scripts may only read, as in Redis.
+    if write
+        && ctx.repl.following()
+        && ctx
+            .repl
+            .settings
+            .read_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
         resp::write_error(
             out,
             b"READONLY You can't write against a read only replica.",

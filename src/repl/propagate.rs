@@ -56,6 +56,8 @@ struct Unit {
     /// The command running changed nothing Redis would propagate, whatever
     /// its watchers were told (`LTRIM` of the whole list).
     clean: bool,
+    /// A writable replica's own write's turn (see [`begin_local`]).
+    local: bool,
 }
 
 thread_local! {
@@ -63,6 +65,10 @@ thread_local! {
     /// Expired keys reads found and left while replicating, to remove after
     /// the batch, in a turn: `(database, key)`.
     static EXPIRED_READS: RefCell<Vec<(u32, Box<[u8]>)>> = const { RefCell::new(Vec::new()) };
+    /// Keys a writable replica's own writes wrote, to see after the batch
+    /// whether they have a TTL, which the replica keeps to itself.
+    static WRITTEN_HERE: RefCell<Vec<(u32, Box<[u8]>)>> = const { RefCell::new(Vec::new()) };
+    /// Whether either has anything.
     static ANY_EXPIRED_READS: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -80,6 +86,14 @@ pub(crate) fn begin(master: &Arc<Master>, store: &Store, now: Millis, db: u32) {
         unit.clean = false;
         debug_assert!(unit.ops.is_empty());
     });
+}
+
+/// A writable replica's own write's turn begins: what it changes stays here
+/// (its replicas get its master's stream, as Redis' do), and the keys it
+/// writes are noted, for the TTLs they're given, which expire here (as
+/// Redis' `rememberSlaveKeyWithExpire` has it).
+pub(crate) fn begin_local() {
+    UNIT.with_borrow_mut(|unit| unit.local = true);
 }
 
 /// Whether this thread is in a turn that propagates.
@@ -110,6 +124,7 @@ pub(crate) fn end() {
         flush(unit);
         unit.master = None;
         unit.store = None;
+        unit.local = false;
     });
 }
 
@@ -197,6 +212,9 @@ pub(crate) fn op_owned(args: Vec<Vec<u8>>) {
 pub(crate) fn changed(db: u16, key: &[u8], how: Change) {
     UNIT.with_borrow_mut(|unit| {
         if unit.master.is_none() {
+            if unit.local && matches!(how, Change::Written | Change::Created) {
+                written_here(db, key);
+            }
             return;
         }
         match how {
@@ -765,11 +783,22 @@ pub(crate) fn after_batch(ctx: &crate::context::Context) {
 }
 
 #[cold]
+fn written_here(db: u16, key: &[u8]) {
+    WRITTEN_HERE.with_borrow_mut(|keys| keys.push((u32::from(db), key.into())));
+    ANY_EXPIRED_READS.set(true);
+}
+
+#[cold]
 fn remove_expired_reads(ctx: &crate::context::Context) {
     ANY_EXPIRED_READS.set(false);
+    let written = WRITTEN_HERE.with_borrow_mut(std::mem::take);
+    if !written.is_empty() {
+        ctx.repl.note_written_here(&ctx.store, written);
+    }
     let keys = EXPIRED_READS.with_borrow_mut(std::mem::take);
-    // A replica's keys go when its master says.
-    if ctx.repl.following() {
+    // A replica's keys go when its master says; and as in Redis, while writes
+    // are paused, nothing expires by itself (a failover's stream stands still).
+    if ctx.repl.following() || ctx.pause_mode().is_some() {
         return;
     }
     let Some(log) = ctx.log() else {

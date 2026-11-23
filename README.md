@@ -138,12 +138,13 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, database, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and how many subscriptions) reads as 0, `N` or `NULL` |
 | `CLIENT KILL addr:port`, `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port] [LADDR addr:port] [SKIPME yes\|no]` | Closes other connections at once, and the caller's own after its reply |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS\|GETKEYS\|GETKEYSANDFLAGS]` | Each entry is Redis 7.2.4's own, ACL categories, key specifications, tips and documentation included (`tools/command-table.py`). `COUNT` and `LIST` say what's here, not what Redis has |
-| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `acllog-max-len`, `acl-pubsub-default`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `latency-tracking`, `latency-tracking-info-percentiles`, `notify-keyspace-events`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`), and replication's: `masterauth`, `masteruser`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-timeout`, `repl-ping-replica-period`, `min-replicas-to-write`, `min-replicas-max-lag`, `replica-announce-ip` and `-port`, `replica-priority`, `replica-serve-stale-data`. The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started, `save` with `--snapshot`, and `replica-read-only no`. `CONFIG REWRITE` says there's no config file |
+| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `acllog-max-len`, `acl-pubsub-default`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `latency-tracking`, `latency-tracking-info-percentiles`, `notify-keyspace-events`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`), and replication's: `masterauth`, `masteruser`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-timeout`, `repl-ping-replica-period`, `min-replicas-to-write`, `min-replicas-max-lag`, `replica-announce-ip` and `-port`, `replica-priority`, `replica-serve-stale-data`, `replica-read-only`. The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started, and `save` with `--snapshot`. `CONFIG REWRITE` says there's no config file |
 | `MONITOR` | Every command run, as Redis' lines show them: what's secret `(redacted)`, a script's own commands as `lua`, admin commands left out. It costs commands nothing until someone runs it (see Design) |
 | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` | As Redis', with what's secret `(redacted)`, and the commands inside `EXEC` and scripts too. At its default of 10 ms and above, durations are in 5 ms ticks, and commands Redis flags `fast` aren't timed (see Design); below that, a real clock as in Redis |
 | `LATENCY LATEST\|HISTORY\|RESET\|GRAPH\|DOCTOR\|HELP`, `LATENCY HISTOGRAM [command ...]` | With `latency-monitor-threshold`, spikes in `command` and `fast-command`, as Redis keeps them. `HISTOGRAM` is each command's latencies, in Redis' steps, counted from the first time something asks for command statistics (see "Command statistics") |
 | `MEMORY USAGE key [SAMPLES n]\|STATS\|DOCTOR\|PURGE\|MALLOC-STATS\|HELP` | `STATS` has Redis' fields; the allocator's are what's in use and the process's RSS |
 | `WAIT numreplicas timeout`, `WAITAOF numlocal numreplicas timeout` | `WAIT` replies once that many replicas have acknowledged what was written before it, or at the timeout with how many have (asking them at once with `REPLCONF GETACK`), as Redis does; on a replica it's Redis' error. `WAITAOF 1` syncs the log at once with `--aof`, and is refused without; replicas don't count toward it |
+| `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`, `FAILOVER ABORT` | Hand over to a replica, Redis or Tantalum, without losing a write, as Redis 6.2 does: writes held, then, once the replica named (or the first) has acked the whole stream, this server follows it with `PSYNC id offset FAILOVER`, which makes it take over and continue the stream; `FORCE` hands over at the timeout anyway, and a timeout without it, or `ABORT`, leaves this server a master. Redis' errors, and `master_failover_state` in `INFO` |
 | `REPLICAOF host port`, `REPLICAOF NO ONE`, `SLAVEOF`, `ROLE` | Follow a master, Redis or Tantalum, over Redis' protocol (see "Replication" in the design notes), or stop following and keep the data, which then goes on under a new replication ID with the old one kept, so the other replicas can continue from here. `ROLE` as Redis 7.2 replies it, either side |
 | `SYNC`, `PSYNC replid offset`, `REPLCONF listening-port\|ip-address\|capa\|ack\|getack ...` | What a replica sends its master (Redis' or Tantalum's): this server sends the data as a Redis RDB file and the stream after it, or only what came since, if its backlog still has that. On the plain port or the TLS one; a replica connects over TLS with `--tls-replication yes` and `--tls-ca-cert-file` (the master's CA, or its self-signed certificate, pinned). Replicas are in `CLIENT LIST` (flag `S`, `cmd=psync`) and `CLIENT KILL TYPE replica` closes them |
 | `DEBUG POPULATE\|SLEEP\|ERROR\|OBJECT\|SET-ACTIVE-EXPIRE` | With `--enable-debug-command yes` or `local`, as in Redis |
@@ -971,13 +972,27 @@ was lost, by what it needs (`results.txt` has the details), against one server:
     as Redis' `checkAlreadyExpired` has it. A transaction counts as run, toward the
     offset it acks and what it passes on, once its `EXEC` has, so a link that drops in
     the middle gets it again whole; the database the stream is in carries over a
-    reconnect. Other clients get `-READONLY` for writes (scripts' too), `-LOADING` while
-    the master's file loads (the old data until then), and see keys expire by its clock;
+    reconnect. Other clients get `-READONLY` for writes (scripts' too) unless it's
+    writable, `-LOADING` while the master's file loads, and see keys expire by its clock;
     keyspace notifications, `MONITOR` and command statistics see the master's commands,
     which take the same checked path theirs do (passing its checks).
     `REPLICAOF NO ONE` keeps the data and goes on under a new replication ID, keeping the
     master's as the one before with the offset it ends at, so the old master and its
     other replicas can `PSYNC` here and continue (Redis' PSYNC2).
+  - *A writable replica* (`replica-read-only no`) runs its own clients' writes as a
+    master would, but they stay on it: they take a write's turn (so they're in its
+    append-only log), and its replicas get its master's stream, as Redis' do. The keys
+    they give a TTL are noted, after the batch, and expire by the replica's clock (the
+    master doesn't know of them); the master's keys still go only when it says, and a
+    full sync forgets the lot (Redis' `slaveKeysWithExpire`).
+  - *`FAILOVER`* holds writes as `CLIENT PAUSE WRITE` does, with nothing expiring and no
+    pings meanwhile, so the stream stands still; once a replica has acked all of it
+    (one that has acked since it synced: one that was only sent the file doesn't count),
+    this server follows it, its `PSYNC` saying `FAILOVER`, and the replica, if the
+    replication ID is its master's, takes over before it answers; the old master
+    continues from there. Checked both ways with Redis 7.2.4, each continuing the
+    other's stream (`sync_partial_ok`), and with a client writing throughout: what it
+    was told was written was there, and nothing else.
   - `WAIT` asks replicas for their acks (`REPLCONF GETACK *`, through the stream) and
     replies when enough have the writes made before it; `min-replicas-to-write` refuses
     writes with `-NOREPLICAS` while too few have acked within `min-replicas-max-lag`.
@@ -1543,7 +1558,7 @@ hit rates share the seeding flaw described above.
   `IDLETIME`), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
-  the 234 commands that are here (1, which expects over 300).
+  the 235 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1613,8 +1628,7 @@ hit rates share the seeding flaw described above.
   build without the one check that change puts on shard locks was as slow, so it's
   where the stream code landed in the binary rather than work done; kept, as agreed,
   for full syncs that hold writes 1 ms where they held them 107 (1M keys).
-- **Replication gaps**: no writable replicas (`replica-read-only no` is refused), no
-  `FAILOVER` and no Sentinel, and no cluster. A replica over TLS checks its master's
+- **Replication gaps**: no Sentinel, and no cluster. A replica over TLS checks its master's
   certificate against `--tls-ca-cert-file` only (no `tls-ca-cert-dir`, no client
   certificate of its own). A replica loads its master's file
   as it comes, whatever `repl-diskless-load` says, so it serves `LOADING`, not its old

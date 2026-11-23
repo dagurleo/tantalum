@@ -1191,3 +1191,237 @@ fn a_master_back_from_its_snapshot_continues_from_the_replica_that_took_over() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_writable_replica_keeps_its_own_writes_and_expires_their_ttls() {
+    let master = start();
+    let replica = start();
+    let sub = start();
+    let mut m = Client::new(master.addr);
+    let mut r = Client::new(replica.addr);
+    let mut s = Client::new(sub.addr);
+    // The master's keys expire when it says, even here: it doesn't, now.
+    m.cmd("DEBUG SET-ACTIVE-EXPIRE 0");
+    m.cmd("SET kept 1");
+    m.cmd("SET theirs 1 PX 200");
+    follow(&replica, master.addr);
+    follow(&sub, replica.addr);
+    synced(master.addr, replica.addr);
+    synced(master.addr, sub.addr);
+    assert_eq!(
+        r.cmd("SET mine 1"),
+        Value::Error("READONLY You can't write against a read only replica.".into())
+    );
+    assert_eq!(
+        r.cmd("CONFIG SET replica-read-only no"),
+        Value::Simple("OK".into())
+    );
+    assert_eq!(r.info("slave_read_only"), "0");
+    assert_eq!(r.cmd("SET mine 1"), Value::Simple("OK".into()));
+    assert_eq!(r.cmd("SET brief 1 PX 100"), Value::Simple("OK".into()));
+    assert_eq!(r.cmd("SET kept 2"), Value::Simple("OK".into()));
+    assert_eq!(
+        r.call(&[
+            b"EVAL",
+            b"return redis.call('SET', KEYS[1], 'x')",
+            b"1",
+            b"scripted"
+        ]),
+        Value::Simple("OK".into())
+    );
+    assert_eq!(r.cmd("GET mine"), Value::Bulk(Some(b"1".to_vec())));
+    // None of it went to the master, or into the stream the replica's own
+    // replicas get: theirs is still the master's, at the master's offset.
+    m.cmd("SET more 1");
+    synced(master.addr, replica.addr);
+    synced(master.addr, sub.addr);
+    assert_eq!(m.cmd("EXISTS mine brief scripted"), Value::Int(0));
+    assert_eq!(s.cmd("EXISTS mine brief scripted more"), Value::Int(1));
+    assert_eq!(s.cmd("GET kept"), Value::Bulk(Some(b"1".to_vec())));
+    // Its own key's TTL ends here; the master's key stays until the master
+    // says (hidden, but held).
+    wait_until("the replica's own key to expire", || {
+        r.cmd("DBSIZE") == Value::Int(5)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        r.cmd("DBSIZE"),
+        Value::Int(5),
+        "kept, theirs, mine, scripted, more"
+    );
+    assert_eq!(r.cmd("EXISTS theirs"), Value::Int(0));
+    // Read-only again: writes refused.
+    r.cmd("CONFIG SET replica-read-only yes");
+    assert_eq!(
+        r.cmd("SET mine 2"),
+        Value::Error("READONLY You can't write against a read only replica.".into())
+    );
+    // A full sync replaces what it wrote.
+    r.cmd("REPLICAOF NO ONE");
+    follow(&replica, master.addr);
+    synced(master.addr, replica.addr);
+    assert_same(master.addr, replica.addr);
+}
+
+/// A replica that says where it listens (as one on its own port would).
+fn follow_announced(replica: &Server, master: SocketAddr) {
+    Client::new(replica.addr).cmd(&format!(
+        "CONFIG SET replica-announce-port {}",
+        replica.addr.port()
+    ));
+    follow(replica, master);
+}
+
+#[test]
+fn failover_hands_over_to_a_replica_without_losing_a_write() {
+    let a = start();
+    let b = start();
+    let c = start();
+    let mut ca = Client::new(a.addr);
+    let mut cb = Client::new(b.addr);
+    for i in 0..200 {
+        ca.cmd(&format!("SET k{i} {i}"));
+    }
+    assert_eq!(
+        ca.cmd("FAILOVER"),
+        Value::Error("ERR FAILOVER requires connected replicas.".into())
+    );
+    follow_announced(&b, a.addr);
+    follow_announced(&c, a.addr);
+    synced(a.addr, b.addr);
+    synced(a.addr, c.addr);
+    let b_port = b.addr.port();
+    for (line, error) in [
+        ("FAILOVER ABORT", "ERR No failover in progress."),
+        (
+            "FAILOVER TIMEOUT 0",
+            "ERR FAILOVER timeout must be greater than 0",
+        ),
+        (
+            "FAILOVER TIMEOUT x",
+            "ERR value is not an integer or out of range",
+        ),
+        (
+            "FAILOVER TO 127.0.0.1 1",
+            "ERR FAILOVER target HOST and PORT is not a replica.",
+        ),
+        (
+            &format!("FAILOVER TO 127.0.0.1 {b_port} FORCE"),
+            "ERR FAILOVER with force option requires both a timeout and target HOST and IP.",
+        ),
+        ("FAILOVER FORCE FORCE", "ERR syntax error"),
+    ] {
+        assert_eq!(ca.cmd(line), Value::Error(error.into()), "{line}");
+    }
+    assert_eq!(
+        cb.cmd("FAILOVER"),
+        Value::Error("ERR FAILOVER is not valid when server is a replica.".into())
+    );
+    assert_eq!(ca.info("master_failover_state"), "no-failover");
+    // A client writes throughout; what it's told was written must survive.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (addr, stop) = (a.addr, stop.clone());
+        std::thread::spawn(move || {
+            let mut c = Client::new(addr);
+            let mut written = 0i64;
+            while !stop.load(Ordering::Relaxed) {
+                match c.cmd("INCR counter") {
+                    Value::Int(n) => written = n,
+                    Value::Error(e) if e.starts_with("READONLY") => break,
+                    other => panic!("{other:?}"),
+                }
+            }
+            written
+        })
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        ca.cmd(&format!("FAILOVER TO 127.0.0.1 {b_port} TIMEOUT 10000")),
+        Value::Simple("OK".into())
+    );
+    assert_eq!(
+        ca.cmd("REPLICAOF NO ONE"),
+        Value::Error("ERR REPLICAOF not allowed while failing over.".into())
+    );
+    wait_until("B to take over", || {
+        cb.info("role") == "master" && ca.info("master_link_status") == "up"
+    });
+    assert_eq!(ca.info("master_failover_state"), "no-failover");
+    assert_eq!(ca.info("master_port"), b_port.to_string());
+    let written = writer.join().unwrap();
+    stop.store(true, Ordering::Relaxed);
+    assert!(written > 0);
+    let counter = match cb.cmd("GET counter") {
+        Value::Bulk(Some(v)) => String::from_utf8(v).unwrap().parse::<i64>().unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(counter, written, "every write it was told of, and no other");
+    assert_eq!(
+        cb.info("sync_partial_ok"),
+        "1",
+        "A continued from B's stream"
+    );
+    assert_eq!(cb.info("sync_full"), "0");
+    // B's writes reach A, and C through it.
+    cb.cmd("SET after failover");
+    synced(b.addr, a.addr);
+    synced(b.addr, c.addr);
+    assert_same(b.addr, a.addr);
+    assert_same(b.addr, c.addr);
+    assert_eq!(
+        ca.cmd("SET k 1"),
+        Value::Error("READONLY You can't write against a read only replica.".into())
+    );
+}
+
+#[test]
+fn failover_to_any_replica_and_abort() {
+    let a = start();
+    let b = start();
+    let mut ca = Client::new(a.addr);
+    let mut cb = Client::new(b.addr);
+    ca.cmd("SET k 1");
+    follow_announced(&b, a.addr);
+    synced(a.addr, b.addr);
+    // To whichever replica has it all first.
+    assert_eq!(ca.cmd("FAILOVER"), Value::Simple("OK".into()));
+    wait_until("B to take over", || cb.info("role") == "master");
+    wait_until("A to follow", || ca.info("master_link_status") == "up");
+    assert_eq!(ca.info("master_port"), b.addr.port().to_string());
+    assert_eq!(cb.cmd("SET k 2"), Value::Simple("OK".into()));
+    synced(b.addr, a.addr);
+    assert_eq!(ca.cmd("GET k"), Value::Bulk(Some(b"2".to_vec())));
+    // A replica that never says how far it got: B waits, writes held, until
+    // the time's up or it's told to stop, and stays a master.
+    let mut stuck = Client::new(b.addr);
+    stuck.cmd("REPLCONF listening-port 1234");
+    stuck.call(&[b"PSYNC", b"?", b"-1"]);
+    ca.cmd("REPLICAOF NO ONE");
+    wait_until("only the one that never acks", || {
+        cb.info("connected_slaves") == "1"
+    });
+    assert_eq!(cb.cmd("FAILOVER TIMEOUT 300"), Value::Simple("OK".into()));
+    assert_eq!(cb.info("master_failover_state"), "waiting-for-sync");
+    assert_eq!(
+        cb.cmd("FAILOVER"),
+        Value::Error("ERR FAILOVER already in progress.".into())
+    );
+    wait_until("the failover to time out", || {
+        cb.info("master_failover_state") == "no-failover"
+    });
+    assert_eq!(cb.info("role"), "master");
+    assert_eq!(cb.cmd("SET k 3"), Value::Simple("OK".into()));
+    assert_eq!(cb.cmd("FAILOVER"), Value::Simple("OK".into()));
+    // Held while it waits, as `CLIENT PAUSE WRITE` holds them.
+    let held = {
+        let addr = b.addr;
+        std::thread::spawn(move || Client::new(addr).cmd("SET k 4"))
+    };
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!held.is_finished());
+    assert_eq!(cb.cmd("GET k"), Value::Bulk(Some(b"3".to_vec())));
+    assert_eq!(cb.cmd("FAILOVER ABORT"), Value::Simple("OK".into()));
+    assert_eq!(held.join().unwrap(), Value::Simple("OK".into()));
+    assert_eq!(cb.info("role"), "master");
+    assert_eq!(cb.info("master_failover_state"), "no-failover");
+}

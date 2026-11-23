@@ -43,6 +43,9 @@ pub(crate) struct Follower {
     pub(crate) ack: AtomicU64,
     /// When it last said so, in milliseconds since the stream was made.
     pub(crate) ack_at: AtomicU64,
+    /// It has said so since it synced (until then, `ack` is where its sync
+    /// started, which it may not have loaded yet).
+    pub(crate) acked: AtomicBool,
     bell: Arc<Bell>,
     stop: AtomicBool,
 }
@@ -68,6 +71,9 @@ pub(crate) struct Master {
     followers: Mutex<Vec<Arc<Follower>>>,
     waiting: Mutex<Vec<Waiting>>,
     born: Instant,
+    /// This server follows a master, whose stream this is: its own writes
+    /// (a writable replica's) aren't in it.
+    following: AtomicBool,
 }
 
 impl Master {
@@ -77,7 +83,17 @@ impl Master {
             followers: Mutex::new(Vec::new()),
             waiting: Mutex::new(Vec::new()),
             born: Instant::now(),
+            following: AtomicBool::new(false),
         }
+    }
+
+    #[inline]
+    pub(crate) fn following(&self) -> bool {
+        self.following.load(Relaxed)
+    }
+
+    pub(crate) fn set_following(&self, on: bool) {
+        self.following.store(on, Relaxed);
     }
 
     pub(crate) fn followers(&self) -> Vec<Arc<Follower>> {
@@ -222,7 +238,12 @@ fn spawn_cron(ctx: &Arc<Context>, master: &Arc<Master>) {
                 let period = ctx.repl.settings.ping_period.load(Relaxed).max(1);
                 let followers = master.followers();
                 // A replica's own replicas hear its master's pings.
-                if since_ping >= period && !followers.is_empty() && !ctx.repl.following() {
+                // Nor while a failover holds the stream still.
+                if since_ping >= period
+                    && !followers.is_empty()
+                    && !ctx.repl.following()
+                    && ctx.repl.failover.lock().state == super::failover::State::None
+                {
                     since_ping = 0;
                     if let Some(log) = ctx.log() {
                         log.exclusive(|| master.backlog.append_raw(b"*1\r\n$4\r\nPING\r\n"));
@@ -306,6 +327,31 @@ pub(crate) fn sync(
 ) -> Reply {
     if session.multi.is_some() {
         resp::write_error(out, b"ERR Command not allowed inside a transaction");
+        return Reply::Written;
+    }
+    // A master failing over to this replica: it takes over first, then
+    // goes on as with any replica's `PSYNC`.
+    if args.len() > 3
+        && args.get(0).eq_ignore_ascii_case(b"PSYNC")
+        && args.get(3).eq_ignore_ascii_case(b"FAILOVER")
+    {
+        eprintln!(
+            "Failover request received for replid {}.",
+            String::from_utf8_lossy(args.get(1))
+        );
+        if !ctx.repl.following() {
+            resp::write_error(out, b"ERR PSYNC FAILOVER can't be sent to a master.");
+            return Reply::Written;
+        }
+        if args.get(1) != ctx.repl.ids().id.as_bytes() {
+            resp::write_error(out, b"ERR PSYNC FAILOVER replid must match my replid.");
+            return Reply::Written;
+        }
+        super::replica::promote(ctx);
+        eprintln!("MASTER MODE enabled (failover request)");
+    }
+    if ctx.repl.failover.lock().state != super::failover::State::None {
+        resp::write_error(out, b"NOMASTERLINK Can't SYNC while failing over");
         return Reply::Written;
     }
     if ctx.repl.following() && !ctx.repl.link_up() {
@@ -420,6 +466,7 @@ fn feed(
             state: AtomicU8::new(WAIT_BGSAVE),
             ack: AtomicU64::new(0),
             ack_at: AtomicU64::new(master.millis()),
+            acked: AtomicBool::new(false),
             bell: bell.clone(),
             stop: AtomicBool::new(false),
         });
@@ -616,6 +663,7 @@ fn took_acks(master: &Master, follower: &Follower, acks: &mut Vec<u8>) {
         {
             follower.ack.fetch_max(offset.max(0) as u64, Relaxed);
             follower.ack_at.store(master.millis(), Relaxed);
+            follower.acked.store(true, Relaxed);
             acked = true;
         }
         pos = end;
