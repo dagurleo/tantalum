@@ -12,8 +12,9 @@ lists, sorted sets, streams, blocking commands, pub/sub, transactions and
 Lua scripts (enough to run [BullMQ](https://bullmq.io), whose jobs cost
 the server about a third of the CPU they cost Redis), numbered databases, and
 `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS, optional snapshots
-and an append-only log on disk, and replication over Redis' own protocol, so Redis and
-Tantalum can follow each other either way. The point: be a faster drop-in for the "Redis as
+and an append-only log on disk, replication over Redis' own protocol, so Redis and
+Tantalum can follow each other either way, and a Sentinel that fails masters over
+alongside Redis' Sentinels or on its own. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
 Named after the metal of tantalum capacitors, known for packing the most into
@@ -32,6 +33,7 @@ cargo run --release -- --tls-port 6380 --tls-cert-file cert.pem --tls-key-file k
 cargo run --release -- --notify-keyspace-events Egx   # keyspace notifications, as Redis' setting
 cargo run --release -- --port 6380 --replicaof 127.0.0.1:6379   # a replica (of Redis or Tantalum)
 cargo run --release -- --replicaof master.example:6380 --tls-replication yes --tls-ca-cert-file cert.pem
+cargo run --release -- --sentinel sentinel.conf   # a Sentinel: Redis' sentinel.conf directives
 redis-cli SET greeting hello EX 60
 redis-cli GET greeting
 ```
@@ -996,6 +998,33 @@ was lost, by what it needs (`results.txt` has the details), against one server:
   - `WAIT` asks replicas for their acks (`REPLCONF GETACK *`, through the stream) and
     replies when enough have the writes made before it; `min-replicas-to-write` refuses
     writes with `-NOREPLICAS` while too few have acked within `min-replicas-max-lag`.
+- **Sentinel** (`src/sentinel/`, `tantalum --sentinel FILE`): Redis 7.2's Sentinel, the
+  same protocol and the same steps, so Tantalum's and Redis' Sentinels watch the same
+  masters together (Redis or Tantalum), and clients find the master as they do with
+  Redis' (`SENTINEL get-master-addr-by-name`, the `+switch-master` event). FILE has Redis'
+  `sentinel.conf` directives, and is rewritten as it learns (the replicas and Sentinels
+  it found, `known-replica`/`known-sentinel`, the epochs), as Redis rewrites it. It's a
+  server of its own, which costs the data server nothing: one task owns all the state,
+  ten times a second (at a rate that varies, as Redis' does, so Sentinels don't keep
+  asking for votes at the same moment); links to each master, replica and Sentinel
+  (`PING` every second, `INFO` every ten or every second while a master is down, a
+  hello on `__sentinel__:hello` every two) hand it what they hear. A master that
+  doesn't answer for `down-after-milliseconds` is down by its account (`+sdown`); asked
+  (`SENTINEL is-master-down-by-addr`), `quorum` Sentinels agreeing make it down
+  (`+odown`); one with a majority of the votes in a new epoch picks the replica (by
+  priority, offset, run ID), sends it `SLAVEOF NO ONE` (with `CONFIG REWRITE` and
+  `CLIENT KILL TYPE normal`, in a transaction, as Redis does), points the others at it
+  `parallel-syncs` at a time, and announces it; the others take it up from its hellos,
+  and an old master that comes back is made a replica. TILT, `SENTINEL FAILOVER`,
+  `MONITOR`/`REMOVE`/`SET`/`RESET`/`CKQUORUM`/`CONFIG`/`DEBUG`/`INFO-CACHE`,
+  notification and client-reconfig scripts, `rename-command`, `requirepass`, and the
+  replies' fields and errors as Redis 7.2.4's (34 of 35 commands compared byte for byte,
+  the other fixed). Checked: three Tantalum Sentinels, and mixed with Redis' (one of
+  three and two of three), each through three failovers in a row, leaders of both
+  kinds: every Sentinel named the same new master within about a second of the 1 s
+  `down-after`, every replica had the write after, and the old master came back as a
+  replica; Redis' Sentinels manage Tantalum servers the same (`SENTINEL FAILOVER`
+  too).
 - **Lock hygiene**: hashing and big-value allocations happen before locking.
   Values ≤ 16 KB are copied out under the lock; larger ones are shared by
   refcount and written with `writev` after unlocking. Freed big values are
@@ -1628,7 +1657,9 @@ hit rates share the seeding flaw described above.
   build without the one check that change puts on shard locks was as slow, so it's
   where the stream code landed in the binary rather than work done; kept, as agreed,
   for full syncs that hold writes 1 ms where they held them 107 (1M keys).
-- **Replication gaps**: no Sentinel, and no cluster. A replica over TLS checks its master's
+- **Replication gaps**: no cluster. A Sentinel over TLS isn't there (its links and its
+  port are plain), nor ACL users for its own clients (`requirepass` only), and a
+  notification or client-reconfig script runs once (Redis retries one that exits 1). A replica over TLS checks its master's
   certificate against `--tls-ca-cert-file` only (no `tls-ca-cert-dir`, no client
   certificate of its own). A replica loads its master's file
   as it comes, whatever `repl-diskless-load` says, so it serves `LOADING`, not its old

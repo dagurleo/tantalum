@@ -81,6 +81,12 @@ fn spawn_memory_returner() -> std::io::Result<std::thread::JoinHandle<()>> {
 
 const USAGE: &str = "\
 Usage: tantalum [OPTIONS]
+       tantalum --sentinel <FILE> [--port <PORT>]
+
+  --sentinel <FILE> Run a Sentinel, not a server: watch the masters FILE
+                    names (Redis' sentinel.conf directives) and fail them
+                    over, with Redis' Sentinels or on its own; it rewrites
+                    FILE as it learns.
 
 Options:
   --bind <ADDR>     Address to listen on [default: 127.0.0.1]
@@ -256,6 +262,43 @@ fn raise_open_file_limit(maxclients: usize) {
     }
 }
 
+/// `tantalum --sentinel FILE [--port N]`, or as Redis has it,
+/// `tantalum FILE --sentinel`.
+fn sentinel() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut file = None;
+    let mut port = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sentinel"
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") && file.is_none() =>
+            {
+                file = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--sentinel" => {}
+            "--port" if i + 1 < args.len() => {
+                port = args[i + 1].parse::<u16>().ok();
+                i += 1;
+            }
+            other if !other.starts_with("--") && file.is_none() => {
+                file = Some(other.to_string());
+            }
+            other => {
+                eprintln!("error: {other} isn't an option of a Sentinel\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(file) = file else {
+        eprintln!("error: a Sentinel needs its configuration file\n\n{USAGE}");
+        std::process::exit(2);
+    };
+    tantalum::sentinel::run(std::path::Path::new(&file), port)
+}
+
 fn parse_args() -> Result<Config, String> {
     let mut config = Config {
         bind: "127.0.0.1".into(),
@@ -418,6 +461,9 @@ fn disable_transparent_huge_pages() {
 }
 
 fn main() -> std::io::Result<()> {
+    if std::env::args().any(|a| a == "--sentinel") {
+        return sentinel();
+    }
     #[cfg(target_os = "linux")]
     disable_transparent_huge_pages();
     let config = parse_args().unwrap_or_else(|e| {

@@ -27,6 +27,7 @@ pub mod repl;
 pub mod resp;
 mod script;
 mod segment;
+pub mod sentinel;
 pub mod server;
 mod set;
 mod shard_lock;
