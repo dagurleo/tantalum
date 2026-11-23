@@ -459,6 +459,10 @@ pub(crate) fn replicaof(
     out: &mut Vec<u8>,
 ) {
     use crate::resp;
+    if ctx.cluster.is_some() {
+        resp::write_error(out, b"ERR REPLICAOF not allowed in cluster mode.");
+        return;
+    }
     if ctx.repl.failover.lock().state != failover::State::None {
         resp::write_error(out, b"ERR REPLICAOF not allowed while failing over.");
         return;

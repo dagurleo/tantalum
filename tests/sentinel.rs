@@ -31,12 +31,19 @@ impl Drop for Procs {
     }
 }
 
+/// A port to listen on, below the range outgoing connections take theirs
+/// from (32768 and up, on Linux), so that a node started again on its old
+/// port finds it free.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20_000 + (std::process::id() % 500) as u16 * 20;
+    loop {
+        let port = base + NEXT.fetch_add(1, Ordering::Relaxed) % 2000;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn spawn(args: &[&str]) -> Child {

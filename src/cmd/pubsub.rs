@@ -229,6 +229,9 @@ pub(super) fn publish(
     out: &mut Vec<u8>,
 ) -> Reply {
     let receivers = ctx.pubsub.publish(args.get(1), args.get(2));
+    if let Some(cluster) = &ctx.cluster {
+        cluster.propagate_publish(args.get(1), args.get(2), false);
+    }
     resp::write_integer(out, receivers as i64);
     Reply::Written
 }
@@ -242,6 +245,9 @@ pub(super) fn spublish(
     out: &mut Vec<u8>,
 ) -> Reply {
     let receivers = ctx.pubsub.publish_shard(args.get(1), args.get(2));
+    if let Some(cluster) = &ctx.cluster {
+        cluster.propagate_publish(args.get(1), args.get(2), true);
+    }
     resp::write_integer(out, receivers as i64);
     Reply::Written
 }

@@ -266,6 +266,7 @@ impl Waiter {
             reply: ReplyMode::On,
             no_evict: false,
             no_touch: false,
+            cluster: 0,
             monitor: None,
             peer: None,
             commands: 0,

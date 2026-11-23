@@ -269,6 +269,11 @@ static COMMANDS: &[Command] = &[
     Command { name: "object", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: keys::object },
     Command { name: "dump", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: dump::dump },
     Command { name: "restore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: dump::restore },
+    Command { name: "restore-asking", arity: -4, flags: &["write", "denyoom", "asking"], fast: false, keys: ONE_KEY, run: dump::restore },
+    Command { name: "cluster", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: cluster_command },
+    Command { name: "asking", arity: 1, flags: &["fast"], fast: true, keys: NO_KEYS, run: asking },
+    Command { name: "readonly", arity: 1, flags: &["loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: readonly },
+    Command { name: "readwrite", arity: 1, flags: &["loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: readwrite },
     Command { name: "migrate", arity: -6, flags: &["write", "movablekeys"], fast: false, keys: (3, 3, 1), run: dump::migrate },
     Command { name: "hget", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hget },
     Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hset },
@@ -495,6 +500,14 @@ fn execute_checked(
     }
     if !session.unrestricted {
         if session.special
+            && let Some(cluster) = &ctx.cluster
+            && !crate::repl::applying()
+            && !cluster_serves(ctx, cluster, session, command, args, out)
+        {
+            refuse_in_multi(session);
+            return Reply::Written;
+        }
+        if session.special
             && let Some(error) = refused_on_replica(ctx, session, command)
         {
             resp::write_error(out, error);
@@ -581,6 +594,136 @@ fn checked_first(
         return Some(Reply::Close);
     }
     None
+}
+
+/// Cluster mode: whether this node serves the command's keys (a
+/// transaction's, for `EXEC`); if not, writes where to go (`-MOVED`, ...).
+#[cold]
+#[inline(never)]
+fn cluster_serves(
+    ctx: &Context,
+    cluster: &crate::cluster::Cluster,
+    session: &mut Session,
+    command: &Command,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> bool {
+    let asking_cmd = command.name == "asking";
+    let served = if command.name == "exec" {
+        match &session.multi {
+            None => true,
+            Some(queue) => {
+                let commands: Vec<Args<'_>> = (0..queue.len()).map(|i| queue.command(i)).collect();
+                let queries: Vec<crate::cluster::Query<'_>> = commands
+                    .iter()
+                    .filter_map(|a| find_command(a.get(0)).map(|c| cluster_query(c, a)))
+                    .collect();
+                route_queries(ctx, cluster, session, &queries, out)
+            }
+        }
+    } else if command.keys == NO_KEYS && !command.flags.contains(&"movablekeys") {
+        true
+    } else {
+        // (Queued in a transaction too: checked as it's queued, as Redis
+        // does, and again at EXEC.)
+        let queries = [cluster_query(command, args)];
+        route_queries(ctx, cluster, session, &queries, out)
+    };
+    if !asking_cmd && session.multi.is_none() {
+        session.cluster &= !crate::cluster::ASKING;
+    }
+    served
+}
+
+fn route_queries(
+    ctx: &Context,
+    cluster: &crate::cluster::Cluster,
+    session: &Session,
+    queries: &[crate::cluster::Query<'_>],
+    out: &mut Vec<u8>,
+) -> bool {
+    let store = &ctx.store;
+    let now = store.now();
+    crate::cluster::route(
+        cluster,
+        session,
+        queries,
+        |key| update(store, store.key(key), now, |c| (Update::Peek, c.is_some())),
+        out,
+    )
+}
+
+/// A command's keys, as the cluster sees them.
+fn cluster_query<'a>(command: &Command, args: &Args<'a>) -> crate::cluster::Query<'a> {
+    let n = args.len() as i32;
+    let mut keys = Vec::new();
+    if command.flags.contains(&"movablekeys") {
+        let argv: Vec<&[u8]> = (0..args.len()).map(|i| args.get(i)).collect();
+        if let Ok(found) = crate::command_table::keys_of(&argv) {
+            for (pos, _) in found {
+                if pos < args.len() {
+                    keys.push(args.get(pos));
+                }
+            }
+        }
+    } else {
+        let (first, last, step) = command.keys;
+        if first > 0 && step > 0 {
+            let last = if last < 0 { n + last } else { last.min(n - 1) };
+            let mut i = first;
+            while i <= last && i < n {
+                keys.push(args.get(i as usize));
+                i += step;
+            }
+        }
+    }
+    crate::cluster::Query {
+        writes: command.writes(),
+        keys,
+        migrate: command.name == "migrate",
+        pubsub_shard: matches!(command.name, "ssubscribe" | "sunsubscribe" | "spublish"),
+        asking: command.name == "restore-asking",
+    }
+}
+
+fn cluster_command(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::cluster(ctx, session, args, out)
+}
+
+fn asking(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::asking(ctx, session, out)
+}
+
+fn readonly(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::readonly(ctx, session, out)
+}
+
+fn readwrite(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::readwrite(ctx, session, out)
 }
 
 /// On a replica: what Redis refuses there, while it loads its master's data
@@ -2141,6 +2284,13 @@ fn select(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
+    if ctx.cluster.is_some()
+        && let Some(index) = resp::parse_int(args.get(1))
+        && index != 0
+    {
+        resp::write_error(out, b"ERR SELECT is not allowed in cluster mode");
+        return Reply::Written;
+    }
     if let Some(index) = db_index(ctx, args.get(1), out) {
         session.select(ctx, index);
         crate::aof::select(index as usize);
@@ -3238,7 +3388,11 @@ fn info(
         s.push_str("\r\n");
     }
     if wants("cluster", true) {
-        s.push_str("# Cluster\r\ncluster_enabled:0\r\n\r\n");
+        s.push_str(if ctx.cluster.is_some() {
+            "# Cluster\r\ncluster_enabled:1\r\n\r\n"
+        } else {
+            "# Cluster\r\ncluster_enabled:0\r\n\r\n"
+        });
     }
     if wants("keyspace", true) {
         s.push_str("# Keyspace\r\n");

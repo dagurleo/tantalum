@@ -198,6 +198,8 @@ struct Config {
     repl_backlog_size: Option<usize>,
     tls_replication: bool,
     tls_ca_cert: Option<PathBuf>,
+    /// Cluster mode, if `--cluster-enabled yes`.
+    cluster: Option<tantalum::cluster::Options>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -205,6 +207,14 @@ enum Io {
     Shared,
     PerThread,
     Uring,
+}
+
+fn yes_no(value: &str) -> Option<bool> {
+    match value {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parses sizes the way Redis does: `1k` is 1000 bytes, `1kb` is 1024.
@@ -326,7 +336,10 @@ fn parse_args() -> Result<Config, String> {
         repl_backlog_size: None,
         tls_replication: false,
         tls_ca_cert: None,
+        cluster: None,
     };
+    let mut cluster = tantalum::cluster::Options::default();
+    let mut cluster_enabled = false;
     let mut aof_options = aof::Options {
         dir: PathBuf::new(),
         fsync: aof::Fsync::EverySec,
@@ -420,6 +433,38 @@ fn parse_args() -> Result<Config, String> {
             "--masteruser" => {
                 config.masteruser = Some(value.into_bytes()).filter(|u| !u.is_empty())
             }
+            "--cluster-enabled" => cluster_enabled = yes_no(&value).ok_or_else(|| bad(()))?,
+            "--cluster-config-file" => cluster.config_file = PathBuf::from(&value),
+            "--cluster-node-timeout" => {
+                cluster.node_timeout = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|&t| t > 0)
+                    .ok_or_else(|| bad(()))?;
+            }
+            "--cluster-port" => cluster.cport = value.parse().map_err(|_| bad(()))?,
+            "--cluster-announce-ip" => {
+                cluster.announce_ip = Some(value.clone()).filter(|v| !v.is_empty())
+            }
+            "--cluster-announce-hostname" => {
+                cluster.announce_hostname = Some(value.clone()).filter(|v| !v.is_empty());
+            }
+            "--cluster-require-full-coverage" => {
+                cluster.require_full_coverage = yes_no(&value).ok_or_else(|| bad(()))?;
+            }
+            "--cluster-allow-reads-when-down" => {
+                cluster.allow_reads_when_down = yes_no(&value).ok_or_else(|| bad(()))?;
+            }
+            "--cluster-replica-no-failover" | "--cluster-slave-no-failover" => {
+                cluster.replica_no_failover = yes_no(&value).ok_or_else(|| bad(()))?;
+            }
+            "--cluster-replica-validity-factor" | "--cluster-slave-validity-factor" => {
+                cluster.replica_validity_factor = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|&f| f >= 0)
+                    .ok_or_else(|| bad(()))?;
+            }
             "--tls-replication" => {
                 config.tls_replication = match value.as_str() {
                     "yes" => true,
@@ -445,6 +490,11 @@ fn parse_args() -> Result<Config, String> {
         // The log's commands run again at the times they ran at.
         config.store.unix_clock = true;
         config.aof = Some(aof_options);
+    }
+    if cluster_enabled {
+        cluster.port = config.port;
+        cluster.bind = vec![config.bind.clone()];
+        config.cluster = Some(cluster);
     }
     Ok(config)
 }
@@ -548,10 +598,25 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2);
         }
     }
+    let cluster = match &config.cluster {
+        None => None,
+        Some(options) => {
+            let cluster = tantalum::cluster::Cluster::new(options).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+            ctx.config.set("cluster-enabled", "yes");
+            ctx = ctx.with_cluster(cluster.clone());
+            Some((cluster, options.bind.clone()))
+        }
+    };
     let ctx = Arc::new(ctx);
     ctx.adopt();
     if let Some((host, port)) = &config.replicaof {
         tantalum::repl::follow(&ctx, host.clone(), *port);
+    }
+    if let Some((cluster, bind)) = cluster {
+        cluster.start(&ctx, bind)?;
     }
     // After the log's commands ran again: they may still use keys that have
     // expired since.

@@ -50,6 +50,13 @@ pub(crate) struct Failover {
 /// `FAILOVER [TO host port [FORCE]] [ABORT] [TIMEOUT ms]`, with Redis'
 /// replies.
 pub(crate) fn command(ctx: &Context, args: &Args<'_>, out: &mut Vec<u8>) {
+    if ctx.cluster.is_some() {
+        resp::write_error(
+            out,
+            b"ERR FAILOVER not allowed in cluster mode. Use CLUSTER FAILOVER command instead.",
+        );
+        return;
+    }
     if args.len() == 2 && args.get(1).eq_ignore_ascii_case(b"ABORT") {
         if ctx.repl.failover.lock().state == State::None {
             resp::write_error(out, b"ERR No failover in progress.");

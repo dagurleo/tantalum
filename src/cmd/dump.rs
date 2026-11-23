@@ -535,15 +535,21 @@ pub(super) fn migrate(
         if select {
             put_command(&mut request, &[b"SELECT", db.to_string().as_bytes()]);
         }
+        // In a cluster, to a node importing the slot (as Redis sends it).
+        let restore: &[u8] = if ctx.cluster.is_some() {
+            b"RESTORE-ASKING"
+        } else {
+            b"RESTORE"
+        };
         for (i, ttl, payload) in &keys {
             let key = args.get(*i);
             if replace {
                 put_command(
                     &mut request,
-                    &[b"RESTORE", key, ttl.as_bytes(), payload, b"REPLACE"],
+                    &[restore, key, ttl.as_bytes(), payload, b"REPLACE"],
                 );
             } else {
-                put_command(&mut request, &[b"RESTORE", key, ttl.as_bytes(), payload]);
+                put_command(&mut request, &[restore, key, ttl.as_bytes(), payload]);
             }
         }
         // Sent in 64 KB pieces, each within the timeout, as Redis sends it.

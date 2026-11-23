@@ -148,6 +148,8 @@ pub struct Context {
     pub settings: Settings,
     /// Set when the server saves snapshots (`--snapshot`).
     pub snapshots: Option<Arc<Snapshots>>,
+    /// Cluster mode (`--cluster-enabled yes`).
+    pub cluster: Option<Arc<crate::cluster::Cluster>>,
     /// The append-only log (`--aof`), once it's taking writes.
     aof: std::sync::OnceLock<Arc<crate::aof::Aof>>,
     /// What writes are logged to, while there's anything (the log, replicas):
@@ -276,6 +278,7 @@ impl Context {
             store,
             settings,
             snapshots: None,
+            cluster: None,
             aof: std::sync::OnceLock::new(),
             log: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             repl: crate::repl::Replication::default(),
@@ -451,6 +454,7 @@ impl Context {
             || self.repl.settings.min_replicas_to_write.load(Relaxed) > 0
             || self.pause.lock().is_some()
             || self.failover_paused.load(Relaxed)
+            || self.cluster.is_some()
             || self.slowlog.needs_precise()
             || self.latency.threshold() != 0
             || self.stats.is_on()
@@ -910,6 +914,13 @@ impl Context {
         self.aof.get()
     }
 
+    /// In cluster mode, this node's part (its bus started by `Cluster::start`).
+    pub fn with_cluster(mut self, cluster: Arc<crate::cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self.update_special();
+        self
+    }
+
     /// Saves snapshots with `snapshots` (for `SAVE`, `BGSAVE` and `INFO`).
     pub fn with_snapshots(mut self, snapshots: Arc<Snapshots>) -> Self {
         self.snapshots = Some(snapshots);
@@ -1331,6 +1342,7 @@ impl Client<'_> {
             reply: ReplyMode::On,
             no_evict: false,
             no_touch: false,
+            cluster: 0,
             monitor: None,
             peer: None,
             commands: 0,
@@ -1635,6 +1647,8 @@ pub struct Session {
     pub(crate) reply: ReplyMode,
     pub(crate) no_evict: bool,
     pub(crate) no_touch: bool,
+    /// Cluster mode's `ASKING` and `READONLY` (`cluster::ASKING`, ...).
+    pub(crate) cluster: u8,
     /// Its outbox, if it's run `MONITOR`.
     pub(crate) monitor: Option<Arc<Subscriber>>,
     /// Its address, once something's wanted it.
@@ -1691,6 +1705,7 @@ impl Session {
             reply: ReplyMode::On,
             no_evict: false,
             no_touch: false,
+            cluster: 0,
             monitor: None,
             peer: None,
             commands: 0,

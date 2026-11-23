@@ -5,6 +5,7 @@ pub mod aof;
 mod big;
 pub mod blocking;
 mod bullmq;
+pub mod cluster;
 pub mod cmd;
 mod collection;
 mod command_table;

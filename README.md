@@ -13,8 +13,9 @@ Lua scripts (enough to run [BullMQ](https://bullmq.io), whose jobs cost
 the server about a third of the CPU they cost Redis), numbered databases, and
 `SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS, optional snapshots
 and an append-only log on disk, replication over Redis' own protocol, so Redis and
-Tantalum can follow each other either way, and a Sentinel that fails masters over
-alongside Redis' Sentinels or on its own. The point: be a faster drop-in for the "Redis as
+Tantalum can follow each other either way, a Sentinel that fails masters over
+alongside Redis' Sentinels or on its own, and cluster mode, in one cluster with Redis
+nodes or on its own. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
 Named after the metal of tantalum capacitors, known for packing the most into
@@ -34,6 +35,7 @@ cargo run --release -- --notify-keyspace-events Egx   # keyspace notifications, 
 cargo run --release -- --port 6380 --replicaof 127.0.0.1:6379   # a replica (of Redis or Tantalum)
 cargo run --release -- --replicaof master.example:6380 --tls-replication yes --tls-ca-cert-file cert.pem
 cargo run --release -- --sentinel sentinel.conf   # a Sentinel: Redis' sentinel.conf directives
+cargo run --release -- --port 7000 --cluster-enabled yes --cluster-config-file nodes-7000.conf
 redis-cli SET greeting hello EX 60
 redis-cli GET greeting
 ```
@@ -147,6 +149,7 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `MEMORY USAGE key [SAMPLES n]\|STATS\|DOCTOR\|PURGE\|MALLOC-STATS\|HELP` | `STATS` has Redis' fields; the allocator's are what's in use and the process's RSS |
 | `WAIT numreplicas timeout`, `WAITAOF numlocal numreplicas timeout` | `WAIT` replies once that many replicas have acknowledged what was written before it, or at the timeout with how many have (asking them at once with `REPLCONF GETACK`), as Redis does; on a replica it's Redis' error. `WAITAOF 1` syncs the log at once with `--aof`, and is refused without; replicas don't count toward it |
 | `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`, `FAILOVER ABORT` | Hand over to a replica, Redis or Tantalum, without losing a write, as Redis 6.2 does: writes held, then, once the replica named (or the first) has acked the whole stream, this server follows it with `PSYNC id offset FAILOVER`, which makes it take over and continue the stream; `FORCE` hands over at the timeout anyway, and a timeout without it, or `ABORT`, leaves this server a master. Redis' errors, and `master_failover_state` in `INFO` |
+| `CLUSTER ...` (`MEET`, `NODES`, `SLOTS`, `SHARDS`, `INFO`, `MYID`, `MYSHARDID`, `ADDSLOTS`, `ADDSLOTSRANGE`, `DELSLOTS`, `DELSLOTSRANGE`, `FLUSHSLOTS`, `SETSLOT`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `REPLICATE`, `REPLICAS`, `FAILOVER [FORCE\|TAKEOVER]`, `FORGET`, `RESET`, `BUMPEPOCH`, `SET-CONFIG-EPOCH`, `COUNT-FAILURE-REPORTS`, `SAVECONFIG`, `LINKS`, `HELP`), `ASKING`, `READONLY`, `READWRITE`, `RESTORE-ASKING` | With `--cluster-enabled yes`: Redis 7.2's cluster (see "Cluster" in the design notes), replies and errors as its (32 of 34 compared byte for byte, the other two fixed). Without, Redis' `ERR This instance has cluster support disabled` |
 | `REPLICAOF host port`, `REPLICAOF NO ONE`, `SLAVEOF`, `ROLE` | Follow a master, Redis or Tantalum, over Redis' protocol (see "Replication" in the design notes), or stop following and keep the data, which then goes on under a new replication ID with the old one kept, so the other replicas can continue from here. `ROLE` as Redis 7.2 replies it, either side |
 | `SYNC`, `PSYNC replid offset`, `REPLCONF listening-port\|ip-address\|capa\|ack\|getack ...` | What a replica sends its master (Redis' or Tantalum's): this server sends the data as a Redis RDB file and the stream after it, or only what came since, if its backlog still has that. On the plain port or the TLS one; a replica connects over TLS with `--tls-replication yes` and `--tls-ca-cert-file` (the master's CA, or its self-signed certificate, pinned). Replicas are in `CLIENT LIST` (flag `S`, `cmd=psync`) and `CLIENT KILL TYPE replica` closes them |
 | `DEBUG POPULATE\|SLEEP\|ERROR\|OBJECT\|SET-ACTIVE-EXPIRE` | With `--enable-debug-command yes` or `local`, as in Redis |
@@ -1025,6 +1028,34 @@ was lost, by what it needs (`results.txt` has the details), against one server:
   `down-after`, every replica had the write after, and the old master came back as a
   replica; Redis' Sentinels manage Tantalum servers the same (`SENTINEL FAILOVER`
   too).
+- **Cluster** (`src/cluster/`, `--cluster-enabled yes`): Redis 7.2's cluster, ported from
+  `cluster.c` step for step, over its bus's binary messages byte for byte (`wire.rs`:
+  the 2256-byte header, gossip, the extensions), so Redis and Tantalum nodes are one
+  cluster, and `redis-cli --cluster` and cluster clients work as with Redis'. Keys hash
+  to 16384 slots (CRC16, `{hash tags}`); a command whose keys aren't in this node's
+  slots gets `-MOVED slot host:port`, `-ASK` while its slot moves and the key's gone,
+  `-TRYAGAIN`, `-CROSSSLOT` or `-CLUSTERDOWN`, as `getNodeByQuery` answers, a
+  transaction's checked as it's queued and at `EXEC`; replicas answer reads after
+  `READONLY`; only database 0. Nodes gossip (`PING`/`PONG`/`MEET`), mark a node that
+  doesn't answer for `cluster-node-timeout` `PFAIL`, and `FAIL` once most masters say
+  so; a failed master's replicas hold an election (delayed by rank, by replication
+  offset), and the one with most masters' votes in a new epoch takes its slots;
+  `CLUSTER FAILOVER` hands over with writes paused until the replica has it all
+  (`FORCE`, `TAKEOVER` as Redis has them). Slots belong to whoever claims them in
+  the highest config epoch (`UPDATE` messages, epoch collisions settled by node ID); a
+  node that loses a slot with keys deletes them. `PUBLISH` reaches every node,
+  `SPUBLISH` its shard. `MIGRATE` sends `RESTORE-ASKING`. The state's kept in the
+  config file (`nodes.conf`, as Redis writes it), and a node restarted from it rejoins
+  (an old master as its successor's replica). The store isn't laid out by
+  slot: putting a key's slot in its hash cost every key's lookup, cluster or not
+  (7-8% at pipeline 16 end to end, against the same build without it), so
+  `GETKEYSINSLOT` and `COUNTKEYSINSLOT` look at every key, and outside cluster mode
+  nothing of this runs: commands take the fast path as before. Checked with `redis-cli --cluster create` (6
+  Tantalum nodes, and 3 Redis with 3 Tantalum), `reshard` (1000 slots with their keys),
+  `check`, a master killed (its replica took over in about 3 s with a 2 s node
+  timeout, either kind voting for either kind, every key there after), `CLUSTER
+  FAILOVER` with a client writing (20,000 `INCR`s, the last 20,000), and pub/sub both
+  ways between Redis and Tantalum nodes.
 - **Lock hygiene**: hashing and big-value allocations happen before locking.
   Values ≤ 16 KB are copied out under the lock; larger ones are shared by
   refcount and written with `writev` after unlocking. Freed big values are
@@ -1587,7 +1618,7 @@ hit rates share the seeding flaw described above.
   `IDLETIME`), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
-  the 235 commands that are here (1, which expects over 300).
+  the 240 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1657,7 +1688,14 @@ hit rates share the seeding flaw described above.
   build without the one check that change puts on shard locks was as slow, so it's
   where the stream code landed in the binary rather than work done; kept, as agreed,
   for full syncs that hold writes 1 ms where they held them 107 (1M keys).
-- **Replication gaps**: no cluster. A Sentinel over TLS isn't there (its links and its
+- **Cluster gaps**: `CLUSTER GETKEYSINSLOT` and `COUNTKEYSINSLOT` look at all of a
+  node's keys (Redis keeps a list per slot): 4 and 8 ms on a node of 333,000 keys,
+  where `redis-cli --cluster reshard` moved 100 slots (6,131 keys) in 4 s; on much
+  bigger nodes moving slots slows with their size. No replica migration (a master left without replicas doesn't
+  get one from a master with more), no `cluster-port` TLS (the bus is plain), no
+  `cluster-preferred-endpoint-type` but `ip`, blocked clients (`BLPOP`, ...) aren't
+  redirected when their slot moves, and module messages are dropped.
+- **Replication gaps**: a Sentinel over TLS isn't there (its links and its
   port are plain), nor ACL users for its own clients (`requirepass` only), and a
   notification or client-reconfig script runs once (Redis retries one that exits 1). A replica over TLS checks its master's
   certificate against `--tls-ca-cert-file` only (no `tls-ca-cert-dir`, no client
