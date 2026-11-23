@@ -16,7 +16,9 @@ use std::io::{self, Write};
 use crate::cmd::dump;
 use crate::context::Context;
 use crate::rdb::{self, Reader};
-use crate::store::{Expiry, Millis, NO_EXPIRY, Store};
+use std::sync::Arc;
+
+use crate::store::{CopySlot, Expiry, Millis, NO_EXPIRY, Store};
 
 /// What Redis 7.2 writes; anything up to it loads.
 const VERSION: u16 = 11;
@@ -69,12 +71,79 @@ fn aux_field(buf: &mut Vec<u8>, name: &str, value: &[u8]) {
 /// RDB file to `out`, as of store-clock time `now`: what has expired by then
 /// is left out (`now` 0 leaves nothing out). Nothing may write meanwhile (the
 /// caller holds the write turn). Returns how many keys it wrote.
+#[cfg(test)]
 pub(crate) fn write(
-    store: &Store,
+    store: &Arc<Store>,
     now: Millis,
     aux: &Aux,
     out: &mut impl Write,
 ) -> io::Result<u64> {
+    write_copied(copy(store, now), aux, out)
+}
+
+/// The data as it is, copied to be written later ([`copy`]).
+pub(crate) struct Copied {
+    now: Millis,
+    /// The store clock's Unix time at 0: deadlines are this much after it.
+    unix_base: i64,
+    used_memory: usize,
+    functions: Vec<std::sync::Arc<[u8]>>,
+    dbs: Vec<CopiedDb>,
+}
+
+/// A database as [`copy`] found it.
+struct CopiedDb {
+    index: usize,
+    /// How many keys, and how many with a TTL (for `RESIZEDB`).
+    keys: usize,
+    with_ttl: usize,
+    db: Arc<Store>,
+    /// Its shards' copies, owed.
+    slots: Vec<Arc<CopySlot>>,
+}
+
+/// The data as it is now, to be written as an RDB file later
+/// ([`write_copied`]), with nothing copied yet: each shard copies itself
+/// before anything changes it (its segments' bytes, big collections cloned,
+/// big values shared), or when the writing gets to it. So a full sync holds
+/// writes only while this marks them. Keys expired at `now` (unless it's 0)
+/// are left out when written.
+pub(crate) fn copy(store: &Arc<Store>, now: Millis) -> Copied {
+    let made: Vec<usize> = store.live().map(Store::index).collect();
+    let dbs = made
+        .into_iter()
+        .map(|i| {
+            let db = store.db(i).clone();
+            let (keys, with_ttl, slots) = db.request_copies();
+            CopiedDb {
+                index: i,
+                keys,
+                with_ttl,
+                db,
+                slots,
+            }
+        })
+        .collect();
+    Copied {
+        now,
+        unix_base: store.deadline_to_unix_ms(0, 0),
+        used_memory: store.used_memory(),
+        functions: store.function_codes().1,
+        dbs,
+    }
+}
+
+/// Writes what [`copy`] copied as a whole RDB file, as Redis 7.2.4 writes one
+/// for a replica, dropping each shard's copy once written. Returns how many
+/// keys it wrote.
+pub(crate) fn write_copied(copied: Copied, aux: &Aux, out: &mut impl Write) -> io::Result<u64> {
+    let Copied {
+        now,
+        unix_base,
+        used_memory,
+        functions,
+        dbs,
+    } = copied;
     let mut out = Summed { out, crc: 0 };
     let mut buf = Vec::with_capacity(1 << 16);
     buf.extend_from_slice(format!("REDIS{VERSION:04}").as_bytes());
@@ -86,36 +155,47 @@ pub(crate) fn write(
     aux_field(&mut buf, "redis-ver", b"7.2.4");
     aux_field(&mut buf, "redis-bits", &int(usize::BITS as i64));
     aux_field(&mut buf, "ctime", &int(ctime));
-    aux_field(&mut buf, "used-mem", &int(store.used_memory() as i64));
+    aux_field(&mut buf, "used-mem", &int(used_memory as i64));
     aux_field(&mut buf, "repl-stream-db", &int(aux.repl_stream_db));
     aux_field(&mut buf, "repl-id", aux.repl_id.as_bytes());
     aux_field(&mut buf, "repl-offset", &int(aux.repl_offset));
     aux_field(&mut buf, "aof-base", b"0");
-    for code in store.function_codes().1 {
+    for code in &functions {
         buf.push(rdb::OPCODE_FUNCTION2);
-        rdb::put_string(&mut buf, &code);
+        rdb::put_string(&mut buf, code);
     }
     out.put(&buf)?;
     let mut keys = 0u64;
     let mut body = Vec::new();
-    for db in store.live() {
-        let (count, with_ttl) = db.key_counts();
+    for CopiedDb {
+        index,
+        keys: count,
+        with_ttl,
+        db,
+        slots,
+    } in dbs
+    {
         if count == 0 {
+            // (Its shards made, or will make, their copies, which go unread.)
+            for (i, slot) in slots.iter().enumerate() {
+                drop(db.take_copy(i, slot));
+            }
             continue;
         }
         buf.clear();
         buf.push(OPCODE_SELECTDB);
-        rdb::put_len(&mut buf, db.index() as u64);
+        rdb::put_len(&mut buf, index as u64);
         buf.push(OPCODE_RESIZEDB);
         rdb::put_len(&mut buf, count as u64);
         rdb::put_len(&mut buf, with_ttl as u64);
         out.put(&buf)?;
-        for shard in 0..db.shard_count() {
+        for (i, slot) in slots.iter().enumerate() {
+            let shard = db.take_copy(i, slot);
             buf.clear();
-            db.for_each_live_ref(shard, now, |key, value, deadline| {
+            shard.for_each_live_ref(now, |key, value, deadline| {
                 if deadline != NO_EXPIRY {
                     buf.push(OPCODE_EXPIRETIME_MS);
-                    let at = db.deadline_to_unix_ms(now, deadline);
+                    let at = unix_base.saturating_add(deadline as i64);
                     buf.extend_from_slice(&at.to_le_bytes());
                 }
                 body.clear();

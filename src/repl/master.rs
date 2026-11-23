@@ -3,11 +3,13 @@
 //! nothing if it can continue) and then the stream, as it grows, and reads
 //! its `REPLCONF ACK`s, for `WAIT` and `INFO`.
 //!
-//! The full sync's RDB is the data at one point of the stream: written while
-//! no write runs (`Log::exclusive`; reads go on, as when the append-only log
-//! writes a new base), at the offset the replica's reading starts from. Redis
-//! forks for that; here, writes wait while it's written, about as long as
-//! `DEBUG RELOAD` would take, and the file is held in memory until sent.
+//! The full sync's RDB is the data at one point of the stream: while no
+//! write runs (`Log::exclusive`; reads go on), every shard is marked as owing
+//! a copy of itself, at the offset the replica's reading starts from. Then
+//! writes go on, and each shard makes its copy before the first of them can
+//! change it (`Store::request_copies`), as a fork's pages are copied before
+//! they're written; the file is written from the copies, streamed to a
+//! replica that says it reads that (`capa eof`).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -456,26 +458,66 @@ fn feed(
         }
         ctx.repl.syncs.full.fetch_add(1, Relaxed);
         follower.state.store(SEND_BULK, Relaxed);
-        let (rdb, offset) = log.exclusive(|| {
+        // Writes wait only while the data is copied out; it's written from
+        // the copy after, while they go on (into the backlog, from `offset`).
+        let paused = Instant::now();
+        let (copied, offset) = log.exclusive(|| {
             master.backlog.forget_db();
             let offset = master.backlog.offset();
             master.backlog.add_reader(id, offset, bell.clone());
-            let aux = crate::rdb_file::Aux {
-                repl_id: ids.id.clone(),
-                repl_offset: offset as i64,
-                repl_stream_db: 0,
-            };
-            let mut rdb = Vec::new();
-            let written = crate::rdb_file::write(&ctx.store, ctx.store.now(), &aux, &mut rdb);
-            (written.map(|_| rdb), offset)
+            (crate::rdb_file::copy(&ctx.store, ctx.store.now()), offset)
         });
-        let rdb = rdb?;
+        let waited = paused.elapsed();
+        if waited > Duration::from_millis(100) {
+            eprintln!(
+                "replica {id}: full sync: writes waited {} ms while the data was copied",
+                waited.as_millis()
+            );
+        }
+        let aux = crate::rdb_file::Aux {
+            repl_id: ids.id.clone(),
+            repl_offset: offset as i64,
+            repl_stream_db: 0,
+        };
         if psync.is_some() {
             socket.write_all(format!("+FULLRESYNC {} {offset}\r\n", ids.id).as_bytes())?;
         }
-        socket.write_all(format!("${}\r\n", rdb.len()).as_bytes())?;
-        socket.write_all(&rdb)?;
-        drop(rdb);
+        if handshake.eof {
+            // Streamed as it's written, between a mark it ends with, for a
+            // replica that said it reads that (`capa eof`): never held whole.
+            let mark = super::new_id();
+            socket.write_all(format!("$EOF:{mark}\r\n").as_bytes())?;
+            let mut out = std::io::BufWriter::with_capacity(256 * 1024, &mut socket);
+            crate::rdb_file::write_copied(copied, &aux, &mut out)?;
+            out.write_all(mark.as_bytes())?;
+            out.flush()?;
+            drop(out);
+            // As Redis: the stream comes once the replica says it has loaded
+            // the file (its first ack), so that what comes after the mark
+            // isn't read as more of the file.
+            let mut acks = Vec::new();
+            let started = Instant::now();
+            loop {
+                if follower.stop.load(Relaxed) || started.elapsed() > timeout {
+                    return Ok(());
+                }
+                let (readable, _) = wait(socket.tcp().as_raw_fd(), bell.ear.as_raw_fd(), 1000);
+                if readable {
+                    if !read_acks(&mut socket, &mut acks, true)? {
+                        return Ok(());
+                    }
+                    took_acks(&master, &follower, &mut acks);
+                    if follower.ack.load(Relaxed) >= offset {
+                        break;
+                    }
+                }
+            }
+        } else {
+            let mut rdb = Vec::new();
+            crate::rdb_file::write_copied(copied, &aux, &mut rdb)?;
+            socket.write_all(format!("${}\r\n", rdb.len()).as_bytes())?;
+            socket.write_all(&rdb)?;
+        }
         follower.ack.store(offset, Relaxed);
     }
     follower.ack_at.store(master.millis(), Relaxed);

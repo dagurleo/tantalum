@@ -35,6 +35,33 @@ const BRIEFLY: Duration = Duration::from_millis(1);
 /// Threads holding shards across commands right now.
 static EXCLUSIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Shards that owe a copy of themselves as they were at a point in time (a
+/// replica's full sync: see `Store::request_copies`): while there are any,
+/// each guard lets its data see to that before anything can change it.
+static COPIES_OWED: AtomicUsize = AtomicUsize::new(0);
+
+/// What a shard's data does whenever it's locked, while copies are owed.
+pub(crate) trait OnLock {
+    fn on_lock(&mut self);
+}
+
+/// Out of the way of every lock's path: while copies are owed.
+#[cold]
+#[inline(never)]
+fn owing<T: OnLock>(data: &mut T) {
+    data.on_lock();
+}
+
+/// A shard now owes a copy (see [`COPIES_OWED`]).
+pub(crate) fn copy_owed() {
+    COPIES_OWED.fetch_add(1, Relaxed);
+}
+
+/// A shard made the copy it owed.
+pub(crate) fn copy_made() {
+    COPIES_OWED.fetch_sub(1, Relaxed);
+}
+
 /// What a thread holds shards across commands for.
 #[derive(Clone, Copy, PartialEq)]
 enum Holding {
@@ -100,7 +127,7 @@ pub(crate) struct ShardGuard<'a, T> {
     lock: Option<MutexGuard<'a, T>>,
 }
 
-impl<T> ShardLock<T> {
+impl<T: OnLock> ShardLock<T> {
     pub(crate) fn new(value: T) -> Self {
         ShardLock {
             mutex: Mutex::new(value),
@@ -115,15 +142,18 @@ impl<T> ShardLock<T> {
         if lock.is_some() {
             LOCKED.set(LOCKED.get() + 1);
         }
-        ShardGuard {
-            // SAFETY: the caller holds what guards the data: this lock, or the
-            // one standing for it (`lock_for`). It's only reached through guards
-            // like this one, one at a time per shard (no store code locks a
-            // shard it already holds, and `Partial`'s guards are never
-            // dereferenced).
-            data: unsafe { &mut *self.mutex.data_ptr() },
-            lock,
+        // SAFETY: the caller holds what guards the data: this lock, or the
+        // one standing for it (`lock_for`). It's only reached through guards
+        // like this one, one at a time per shard (no store code locks a
+        // shard it already holds, and `Partial`'s guards are never
+        // dereferenced).
+        let data = unsafe { &mut *self.mutex.data_ptr() };
+        // Every way to a shard's data comes through here, so a copy it owes
+        // is made before anything can change it.
+        if COPIES_OWED.load(Relaxed) != 0 {
+            owing(data);
         }
+        ShardGuard { data, lock }
     }
 
     #[inline]
@@ -357,6 +387,10 @@ impl<T> Drop for Partial<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl OnLock for u32 {
+        fn on_lock(&mut self) {}
+    }
 
     fn leaked_locks() -> &'static [ShardLock<u32>] {
         Box::leak(

@@ -938,10 +938,22 @@ was lost, by what it needs (`results.txt` has the details), against one server:
     `repl-backlog-ttl` (an hour) without replicas, the stream is freed, as Redis frees its
     backlog: writes stop taking turns, and the replication ID changes, so a replica that
     comes back syncs in full.
-  - *The full sync's file is the data at one point of the stream*: written while no
-    write runs (reads go on), as the append-only log writes a new base, at the offset
-    the replica's reading starts from. Redis forks for that; here writes wait while it's
-    written, and the file is held in memory, on both sides, until it's sent and loaded.
+  - *The full sync's file is the data at one point of the stream*, the offset the
+    replica's reading starts from. Redis forks for that, and the kernel copies a page
+    before a write changes it; here, each shard does. While no write runs, every shard is
+    marked as owing a copy of itself (a shard's lock at a time: well under a
+    millisecond), and then writes go on. A shard makes its copy (its segments' bytes,
+    big collections cloned, big values shared) the next time anything locks it, before
+    anything can change it, or when the file's writing gets to it, and the file is
+    written from the copies, each dropped once written. Every way to a shard's data goes
+    through one guard, which looks at one count of copies owed, 0 but during a sync. On
+    a 4-vCPU VM, with 1M small keys and two collections of 100,000, a client writing
+    throughout saw its longest write take 1 ms (107 when writes waited for the whole
+    file; 11 when they waited for a copy of it all); with 4M, 7 ms. To a replica that
+    says it can (`capa eof`, as Redis' and Tantalum's do), the file is streamed as it's
+    written, between a mark it ends with, and the stream starts once the replica has
+    acked; to one that can't, it's written to memory first, to send with its length.
+    A replica holds the file in memory until it's loaded.
   - *A replica runs what its master sends as its master ran it*: on a thread of its own,
     in a write's turn (so its own replicas get the same bytes, at the same offsets, and
     a full sync of one is consistent), past `maxmemory`, and with no key expiring by its
@@ -1586,13 +1598,21 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
+- **Consumer groups, pipelined, about 3-4% slower since 0.33.0's copy-on-write full
+  sync** in the in-process benchmark (`group_p16_ns`: `XADD`, `XREADGROUP`, `XACK`), in
+  three runs of the speed guard, where every other workload was level or faster. A
+  build without the one check that change puts on shard locks was as slow, so it's
+  where the stream code landed in the binary rather than work done; kept, as agreed,
+  for full syncs that hold writes 1 ms where they held them 107 (1M keys).
 - **Replication gaps**: no writable replicas (`replica-read-only no` is refused), no
   `FAILOVER` and no Sentinel, and no cluster. A replica over TLS checks its master's
   certificate against `--tls-ca-cert-file` only (no `tls-ca-cert-dir`, no client
-  certificate of its own). A full sync holds writes while
-  the master writes its file (no fork), which is held in memory on both sides; a master
-  sends it with its length up front, not streamed (`repl-diskless-sync` and its delay
-  are accepted and do nothing). `repl-diskless-load` and `replica-lazy-flush` take anything and do
+  certificate of its own). A replica holds its master's
+  file in memory until it has loaded it (Redis' `repl-diskless-load disabled` writes it
+  to disk first), and a full sync copies the data, shard by shard, as writes come (memory
+  up to about the data's size again, at worst, as with Redis' fork).
+  `repl-diskless-sync` and its delay are accepted and do nothing: a master streams the
+  file at once. `repl-diskless-load` and `replica-lazy-flush` take anything and do
   nothing. A master's periodic snapshots don't say where in the stream they are (that
   would hold writes while they're written), only the one it saves at shutdown.
 - **`DUMP` in Redis' order but for hash tables**: a big hash or set (past 128 members)

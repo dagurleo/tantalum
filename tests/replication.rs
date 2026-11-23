@@ -1075,3 +1075,54 @@ fn a_snapshots_place_in_a_stream_lapses_with_a_write() {
     assert_eq!(m.info("sync_full"), "1");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_full_sync_while_writes_go_on() {
+    let master = start();
+    let mut m = Client::new(master.addr);
+    // Data in every shard, collections big and small.
+    for i in 0..3000 {
+        m.cmd(&format!("SET s{i} {i}"));
+        if i % 10 == 0 {
+            m.cmd(&format!("HSET h{} f{i} {i}", i % 37));
+            m.cmd(&format!("ZADD z{} {i} m{i}", i % 23));
+            m.cmd(&format!("RPUSH l{} {i}", i % 19));
+        }
+    }
+    for i in 0..300 {
+        m.cmd(&format!("SADD bigset member{i}"));
+    }
+    // Writes all through the sync, to every kind of key.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (stop, addr) = (stop.clone(), master.addr);
+        std::thread::spawn(move || {
+            let mut c = Client::new(addr);
+            let mut rng = Rng(77);
+            while !stop.load(Ordering::SeqCst) {
+                let i = rng.below(3000);
+                let line = match rng.below(7) {
+                    0 => format!("INCR s{i}"),
+                    1 => format!("HSET h{} g{i} {i}", i % 37),
+                    2 => format!("ZINCRBY z{} 1 m{}", i % 23, i / 10 * 10),
+                    3 => format!("LPUSH l{} x{i}", i % 19),
+                    4 => format!("DEL s{i}"),
+                    5 => format!("SREM bigset member{}", i % 300),
+                    _ => format!("SET n{i} {i} PX 100000"),
+                };
+                c.cmd(&line);
+            }
+        })
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    let replica = start();
+    follow(&replica, master.addr);
+    wait_until("the link", || {
+        Client::new(replica.addr).info("master_link_status") == "up"
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    synced(master.addr, replica.addr);
+    assert_same(master.addr, replica.addr);
+}

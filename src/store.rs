@@ -290,6 +290,7 @@ impl SharedValue {
 
 /// A big collection and its key, kept by its shard (for `EXTERNAL` entries
 /// of collection kinds).
+#[derive(Clone)]
 struct Object {
     key: Box<[u8]>,
     value: Collection,
@@ -697,6 +698,51 @@ struct ShardInner {
     waiting: HashMap<Box<[u8]>, VecDeque<Arc<Waiter>>, foldhash::fast::RandomState>,
     /// What hears of this shard's keys changing.
     watched: Notices,
+}
+
+/// Where shards that owe a copy of themselves put it (a replica's full sync:
+/// [`Store::request_copies`]), by the address of their data: kept apart, so
+/// that a shard's own layout doesn't change, and read only while copies are
+/// owed (`OnLock`).
+static OWED: Mutex<Vec<(usize, Arc<CopySlot>)>> = Mutex::new(Vec::new());
+
+/// A shard's copy, owed and then made ([`Store::request_copies`]).
+#[derive(Default)]
+pub(crate) struct CopySlot(Mutex<Option<ShardCopy>>);
+
+impl crate::shard_lock::OnLock for ShardInner {
+    /// Makes the copy this shard owes, if it owes one, before anything can
+    /// change it.
+    fn on_lock(&mut self) {
+        let me = self as *const ShardInner as usize;
+        let slot = {
+            let mut owed = OWED.lock();
+            let Some(at) = owed.iter().position(|(shard, _)| *shard == me) else {
+                return;
+            };
+            owed.swap_remove(at).1
+        };
+        // Unless the sync that asked has gone.
+        if Arc::strong_count(&slot) > 1 {
+            *slot.0.lock() = Some(self.copy_out());
+        }
+        crate::shard_lock::copy_made();
+    }
+}
+
+impl ShardInner {
+    /// Its data as it is now ([`ShardCopy`]).
+    fn copy_out(&self) -> ShardCopy {
+        ShardCopy {
+            segments: self
+                .segments
+                .iter()
+                .map(|seg| seg.as_ref().map(|seg| seg.buf[..].to_vec()))
+                .collect(),
+            externals: self.externals.clone(),
+            objects: self.objects.clone(),
+        }
+    }
 }
 
 /// What hears of a shard's keys changing: clients watching them (`WATCH`),
@@ -3844,33 +3890,6 @@ impl Store {
         }
     }
 
-    /// [`Store::for_each_live`], showing each value as reads see it (big
-    /// collections as themselves, not packed), with its deadline. `now` 0
-    /// counts nothing as expired.
-    pub(crate) fn for_each_live_ref(
-        &self,
-        index: usize,
-        now: Millis,
-        mut f: impl FnMut(&[u8], ValueRef<'_>, Millis),
-    ) {
-        let inner = self.lock(&self.shards[index]);
-        for (id, seg) in inner.segments.iter().enumerate() {
-            let Some(seg) = seg else { continue };
-            for (offset, header) in seg.entries() {
-                if header.is_dead() || (now != 0 && header.is_expired(now)) {
-                    continue;
-                }
-                let key =
-                    ShardInner::entry_key(&seg.buf, &header, &inner.externals, &inner.objects);
-                f(
-                    key,
-                    inner.value_ref(join(id, offset), &header),
-                    header.deadline,
-                );
-            }
-        }
-    }
-
     /// Calls `f` with the key and kind of every live entry in shard
     /// `index`, under its lock.
     pub fn for_each_key(&self, index: usize, now: Millis, mut f: impl FnMut(&[u8], Kind)) {
@@ -4112,6 +4131,44 @@ impl Store {
     }
 
     /// This database's keys, and how many of them have a TTL.
+    /// Asks every shard for a copy of its data as it is now, to read later
+    /// without its lock: its segments' bytes as they are, the values too big
+    /// for them (shared, by count: they're replaced, never changed), and its
+    /// big collections (cloned). For a replica's full sync, while no write
+    /// runs: each shard makes its copy the next time anything locks it, so
+    /// before any write changes it ([`Store::take_copy`] locks it to). This
+    /// only marks them. Also returns how many keys there are, and with a TTL.
+    pub(crate) fn request_copies(&self) -> (usize, usize, Vec<Arc<CopySlot>>) {
+        let (mut keys, mut with_ttl) = (0, 0);
+        let slots = self
+            .shards
+            .iter()
+            .map(|shard| {
+                let inner = self.lock(shard);
+                keys += inner.table.len();
+                with_ttl += inner.mem.with_ttl;
+                let slot = Arc::new(CopySlot::default());
+                OWED.lock()
+                    .push((&*inner as *const ShardInner as usize, slot.clone()));
+                crate::shard_lock::copy_owed();
+                slot
+            })
+            .collect();
+        (keys, with_ttl, slots)
+    }
+
+    /// The copy shard `index` made into `slot` ([`Store::request_copies`]),
+    /// made now if nothing has locked it since.
+    pub(crate) fn take_copy(&self, index: usize, slot: &CopySlot) -> ShardCopy {
+        if slot.0.lock().is_none() {
+            drop(self.lock(&self.shards[index]));
+        }
+        slot.0
+            .lock()
+            .take()
+            .expect("a shard makes the copy it owes when locked")
+    }
+
     pub fn key_counts(&self) -> (usize, usize) {
         self.shards.iter().fold((0, 0), |(keys, with_ttl), shard| {
             let inner = self.lock(shard);
@@ -4146,3 +4203,46 @@ pub struct Stats {
 
 #[cfg(test)]
 mod tests;
+
+/// A shard's data as it was ([`Store::copy_shard`]).
+pub(crate) struct ShardCopy {
+    segments: Vec<Option<Vec<u8>>>,
+    externals: Vec<Option<KeyValue>>,
+    objects: Vec<Option<Object>>,
+}
+
+impl ShardCopy {
+    /// Calls `f` with each live entry's key, value and deadline, as
+    /// [`Store::for_each_live_ref`] does with the shard (skipping what had
+    /// expired at `now`, unless it's 0).
+    pub(crate) fn for_each_live_ref(
+        &self,
+        now: Millis,
+        mut f: impl FnMut(&[u8], ValueRef<'_>, Millis),
+    ) {
+        for buf in self.segments.iter().flatten() {
+            let mut offset = 0;
+            while offset < buf.len() {
+                let header = segment::parse(buf, offset);
+                offset += header.len;
+                if header.is_dead() || (now != 0 && header.is_expired(now)) {
+                    continue;
+                }
+                let key = ShardInner::entry_key(buf, &header, &self.externals, &self.objects);
+                let value = match &header.body {
+                    Body::Inline { value, .. } => Borrowed::Inline(&buf[value.clone()]),
+                    Body::External(i) if header.kind().is_collection() => Borrowed::Object(
+                        &self.objects[*i as usize]
+                            .as_ref()
+                            .expect("live object")
+                            .value,
+                    ),
+                    Body::External(i) => Borrowed::External(
+                        self.externals[*i as usize].as_ref().expect("live external"),
+                    ),
+                };
+                f(key, ValueRef(value, header.kind()), header.deadline);
+            }
+        }
+    }
+}

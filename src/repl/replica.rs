@@ -390,6 +390,9 @@ fn apply(
     let mut acked = Instant::now();
     let mut chunk = vec![0u8; 64 * 1024];
     let mut held = Vec::new();
+    // Loaded, or continuing: the master hears so at once (after a streamed
+    // file, it waits for this before sending the stream).
+    reader.get_mut().write_all(&ack(link.offset()))?;
     loop {
         if link.stop.load(Relaxed) {
             return Ok(());
