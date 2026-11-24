@@ -290,6 +290,7 @@ impl SharedValue {
 
 /// A big collection and its key, kept by its shard (for `EXTERNAL` entries
 /// of collection kinds).
+#[derive(Clone)]
 struct Object {
     key: Box<[u8]>,
     value: Collection,
@@ -699,6 +700,51 @@ struct ShardInner {
     watched: Notices,
 }
 
+/// Where shards that owe a copy of themselves put it (a replica's full sync:
+/// [`Store::request_copies`]), by the address of their data: kept apart, so
+/// that a shard's own layout doesn't change, and read only while copies are
+/// owed (`OnLock`).
+static OWED: Mutex<Vec<(usize, Arc<CopySlot>)>> = Mutex::new(Vec::new());
+
+/// A shard's copy, owed and then made ([`Store::request_copies`]).
+#[derive(Default)]
+pub(crate) struct CopySlot(Mutex<Option<ShardCopy>>);
+
+impl crate::shard_lock::OnLock for ShardInner {
+    /// Makes the copy this shard owes, if it owes one, before anything can
+    /// change it.
+    fn on_lock(&mut self) {
+        let me = self as *const ShardInner as usize;
+        let slot = {
+            let mut owed = OWED.lock();
+            let Some(at) = owed.iter().position(|(shard, _)| *shard == me) else {
+                return;
+            };
+            owed.swap_remove(at).1
+        };
+        // Unless the sync that asked has gone.
+        if Arc::strong_count(&slot) > 1 {
+            *slot.0.lock() = Some(self.copy_out());
+        }
+        crate::shard_lock::copy_made();
+    }
+}
+
+impl ShardInner {
+    /// Its data as it is now ([`ShardCopy`]).
+    fn copy_out(&self) -> ShardCopy {
+        ShardCopy {
+            segments: self
+                .segments
+                .iter()
+                .map(|seg| seg.as_ref().map(|seg| seg.buf[..].to_vec()))
+                .collect(),
+            externals: self.externals.clone(),
+            objects: self.objects.clone(),
+        }
+    }
+}
+
 /// What hears of a shard's keys changing: clients watching them (`WATCH`),
 /// clients blocked in `XREADGROUP`, and clients caching them (`CLIENT
 /// TRACKING`). A change checks one flag, `any`, and costs nothing more while
@@ -712,6 +758,10 @@ struct Notices {
     /// While keyspace notifications are on: this shard's database, whose
     /// changes go into the thread's log for them (see `notify.rs`).
     events: Option<u16>,
+    /// While replicas may follow (`repl/propagate.rs`): this shard's database,
+    /// whose changes count toward what the command propagates, and whose
+    /// expirations and evictions propagate as `DEL`s.
+    repl: Option<u16>,
     /// Whether any of those has anything.
     any: bool,
 }
@@ -748,7 +798,10 @@ enum Watcher {
 
 impl Notices {
     fn update(&mut self) {
-        self.any = !self.by_key.is_empty() || self.broadcast.is_some() || self.events.is_some();
+        self.any = !self.by_key.is_empty()
+            || self.broadcast.is_some()
+            || self.events.is_some()
+            || self.repl.is_some();
     }
 
     /// After `key` changed (written, removed, expired or evicted): tells what
@@ -763,6 +816,9 @@ impl Notices {
 
     #[cold]
     fn mark(&mut self, key: &[u8], how: Change) {
+        if let Some(db) = self.repl {
+            crate::repl::propagate::changed(db, key, how);
+        }
         if let Some(db) = self.events {
             crate::notify::log(db, key, how);
         }
@@ -948,6 +1004,9 @@ impl ShardInner {
         if let Some((loc, header)) = &existing
             && header.is_expired(now)
         {
+            if self.keeps_expired(key) {
+                return (None, false);
+            }
             self.watched.changed(key, Change::Expired);
             self.unlink(hash, *loc);
             garbage.extend(self.kill(*loc));
@@ -955,6 +1014,21 @@ impl ShardInner {
             return (None, true);
         }
         (existing, false)
+    }
+
+    /// Whether an expired key a lookup finds must stay: while replicating
+    /// (see [`Store::set_replicating`]), unless this thread is in a write's
+    /// turn, which propagates its removal as a `DEL` in order. A read that
+    /// leaves it sees no key; the background sweep or a write removes it.
+    #[cold]
+    fn keeps_expired(&self, key: &[u8]) -> bool {
+        match self.watched.repl {
+            Some(db) if !crate::aof::logging() => {
+                crate::repl::propagate::expired_read(db, key);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Calls `f` with the entry as [`Store::update_collection`] shows it,
@@ -1799,6 +1873,10 @@ pub struct Store {
     /// In database 0: keyspace notifications are on, so every change is
     /// logged for them (see `set_notifying`).
     notifying: AtomicBool,
+    /// In database 0: replicas may follow this server, or it follows a master
+    /// (see `set_replicating`). Expired keys are then removed only by writes,
+    /// which propagate the removal in order: a read that finds one leaves it.
+    replicating: AtomicBool,
     /// Function libraries' code (`FUNCTION LOAD`), in database 0, kept with the
     /// data for snapshots and the log, with a version that goes up as it
     /// changes. `FLUSHALL` leaves it, as Redis does.
@@ -1808,14 +1886,20 @@ pub struct Store {
 /// `n` empty shards; changes in them are queued for `broadcast` (database 0) if
 /// some client tracks in `BCAST` mode, and logged as database `events`'s
 /// while keyspace notifications are on.
-fn new_shards(n: usize, broadcast: Option<&Arc<Store>>, events: Option<u16>) -> Box<[Shard]> {
+fn new_shards(
+    n: usize,
+    broadcast: Option<&Arc<Store>>,
+    events: Option<u16>,
+    repl: Option<u16>,
+) -> Box<[Shard]> {
     (0..n)
         .map(|_| Shard {
             inner: ShardLock::new(ShardInner {
                 watched: Notices {
                     broadcast: broadcast.cloned(),
                     events,
-                    any: broadcast.is_some() || events.is_some(),
+                    repl,
+                    any: broadcast.is_some() || events.is_some() || repl.is_some(),
                     ..Notices::default()
                 },
                 ..ShardInner::default()
@@ -1938,7 +2022,7 @@ impl Store {
             n => n,
         };
         Store {
-            shards: new_shards(n, None, None),
+            shards: new_shards(n, None, None, None),
             shard_mask: n - 1,
             hasher: if config.fixed_seed {
                 Hasher::fixed()
@@ -1971,6 +2055,7 @@ impl Store {
             base: None,
             others: (1..databases).map(|_| OnceLock::new()).collect(),
             notifying: AtomicBool::new(false),
+            replicating: AtomicBool::new(false),
         }
     }
 
@@ -2051,9 +2136,15 @@ impl Store {
         // and `set_notifying` either see it or come before it.
         let broadcasting = self.broadcasting.lock();
         let events = self.notifying.load(Relaxed).then_some(index as u16);
+        let repl = self.replicating.load(Relaxed).then_some(index as u16);
         self.others[index - 1].get_or_init(|| {
             Arc::new(Store {
-                shards: new_shards(self.shards.len(), (*broadcasting).then_some(self), events),
+                shards: new_shards(
+                    self.shards.len(),
+                    (*broadcasting).then_some(self),
+                    events,
+                    repl,
+                ),
                 shard_mask: self.shard_mask,
                 hasher: self.hasher.clone(),
                 epoch: self.epoch,
@@ -2073,6 +2164,7 @@ impl Store {
                 base: Some(self.clone()),
                 others: Box::default(),
                 notifying: AtomicBool::new(false),
+                replicating: AtomicBool::new(false),
             })
         })
     }
@@ -2360,6 +2452,9 @@ impl Store {
             if !header.is_expired(now) {
                 inner.touch(loc, &header);
                 return f(Some(inner.value_ref(loc, &header)));
+            }
+            if inner.keeps_expired(key) {
+                return f(None);
             }
             inner.watched.changed(key, Change::Expired);
             inner.unlink(hash, loc);
@@ -2982,6 +3077,10 @@ impl Store {
             (Update::ChangedUnseen, Some((loc, header))) => {
                 inner.touch(*loc, header);
                 inner.mem.writes += 1;
+                // Not a change watchers see, but one replicas must.
+                if inner.watched.repl.is_some() {
+                    crate::repl::propagate::changed_unseen();
+                }
                 return Ok(true);
             }
             (Update::Delete, Some((loc, _))) => {
@@ -2997,7 +3096,12 @@ impl Store {
                     Expiry::Never => NO_EXPIRY,
                     Expiry::At(deadline) => deadline,
                 };
-                let how = if deadline != NO_EXPIRY && deadline <= now {
+                // (A replica's master says when a key goes: one it set to
+                // a time passed already, by the time it got here, stays.)
+                let how = if deadline != NO_EXPIRY
+                    && deadline <= now
+                    && !crate::segment::expiry_suspended()
+                {
                     inner.unlink(hash, *loc);
                     garbage.extend(inner.kill(*loc));
                     Change::Removed
@@ -3232,6 +3336,24 @@ impl Store {
             for shard in db.shards.iter() {
                 let mut inner = db.lock(shard);
                 inner.watched.events = events;
+                inner.watched.update();
+            }
+        }
+    }
+
+    /// Replicas may follow, or this server follows a master: every change is
+    /// counted for what commands propagate, expirations and evictions
+    /// propagate as `DEL`s, and reads leave expired keys for writes to remove
+    /// (see `repl/propagate.rs`). Off again only when that stops.
+    pub(crate) fn set_replicating(&self, on: bool) {
+        let base = self.base();
+        let _creating = base.broadcasting.lock();
+        base.replicating.store(on, Relaxed);
+        for db in base.live() {
+            let repl = on.then_some(db.index() as u16);
+            for shard in db.shards.iter() {
+                let mut inner = db.lock(shard);
+                inner.watched.repl = repl;
                 inner.watched.update();
             }
         }
@@ -4009,6 +4131,44 @@ impl Store {
     }
 
     /// This database's keys, and how many of them have a TTL.
+    /// Asks every shard for a copy of its data as it is now, to read later
+    /// without its lock: its segments' bytes as they are, the values too big
+    /// for them (shared, by count: they're replaced, never changed), and its
+    /// big collections (cloned). For a replica's full sync, while no write
+    /// runs: each shard makes its copy the next time anything locks it, so
+    /// before any write changes it ([`Store::take_copy`] locks it to). This
+    /// only marks them. Also returns how many keys there are, and with a TTL.
+    pub(crate) fn request_copies(&self) -> (usize, usize, Vec<Arc<CopySlot>>) {
+        let (mut keys, mut with_ttl) = (0, 0);
+        let slots = self
+            .shards
+            .iter()
+            .map(|shard| {
+                let inner = self.lock(shard);
+                keys += inner.table.len();
+                with_ttl += inner.mem.with_ttl;
+                let slot = Arc::new(CopySlot::default());
+                OWED.lock()
+                    .push((&*inner as *const ShardInner as usize, slot.clone()));
+                crate::shard_lock::copy_owed();
+                slot
+            })
+            .collect();
+        (keys, with_ttl, slots)
+    }
+
+    /// The copy shard `index` made into `slot` ([`Store::request_copies`]),
+    /// made now if nothing has locked it since.
+    pub(crate) fn take_copy(&self, index: usize, slot: &CopySlot) -> ShardCopy {
+        if slot.0.lock().is_none() {
+            drop(self.lock(&self.shards[index]));
+        }
+        slot.0
+            .lock()
+            .take()
+            .expect("a shard makes the copy it owes when locked")
+    }
+
     pub fn key_counts(&self) -> (usize, usize) {
         self.shards.iter().fold((0, 0), |(keys, with_ttl), shard| {
             let inner = self.lock(shard);
@@ -4043,3 +4203,60 @@ pub struct Stats {
 
 #[cfg(test)]
 mod tests;
+
+/// A shard's data as it was ([`Store::copy_shard`]).
+pub(crate) struct ShardCopy {
+    segments: Vec<Option<Vec<u8>>>,
+    externals: Vec<Option<KeyValue>>,
+    objects: Vec<Option<Object>>,
+}
+
+impl ShardCopy {
+    /// Calls `f` with each live entry's key, kind, value (collections in
+    /// their compact form) and deadline, as [`Store::for_each_live`] does with
+    /// the shard (skipping what had expired at `now`, unless it's 0).
+    pub(crate) fn for_each_live(&self, now: Millis, mut f: impl FnMut(&[u8], Kind, &[u8], Millis)) {
+        self.for_each_live_ref(now, |key, value, deadline| {
+            let ValueRef(value, kind) = value;
+            match value {
+                Borrowed::Inline(bytes) => f(key, kind, bytes, deadline),
+                Borrowed::External(kv) => f(key, kind, kv.value(), deadline),
+                Borrowed::Object(object) => f(key, kind, &object.to_compact(), deadline),
+            }
+        });
+    }
+
+    /// Calls `f` with each live entry's key, value and deadline, as
+    /// [`Store::for_each_live_ref`] does with the shard (skipping what had
+    /// expired at `now`, unless it's 0).
+    pub(crate) fn for_each_live_ref(
+        &self,
+        now: Millis,
+        mut f: impl FnMut(&[u8], ValueRef<'_>, Millis),
+    ) {
+        for buf in self.segments.iter().flatten() {
+            let mut offset = 0;
+            while offset < buf.len() {
+                let header = segment::parse(buf, offset);
+                offset += header.len;
+                if header.is_dead() || (now != 0 && header.is_expired(now)) {
+                    continue;
+                }
+                let key = ShardInner::entry_key(buf, &header, &self.externals, &self.objects);
+                let value = match &header.body {
+                    Body::Inline { value, .. } => Borrowed::Inline(&buf[value.clone()]),
+                    Body::External(i) if header.kind().is_collection() => Borrowed::Object(
+                        &self.objects[*i as usize]
+                            .as_ref()
+                            .expect("live object")
+                            .value,
+                    ),
+                    Body::External(i) => Borrowed::External(
+                        self.externals[*i as usize].as_ref().expect("live external"),
+                    ),
+                };
+                f(key, ValueRef(value, header.kind()), header.deadline);
+            }
+        }
+    }
+}

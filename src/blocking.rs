@@ -121,7 +121,13 @@ pub struct Waiter {
     /// What it replies when time's up, for a wait that isn't for a key (`WAIT`):
     /// otherwise a null array.
     timed_out: Option<&'static [u8]>,
+    /// Or what it replies then, worked out then (`WAIT` with replicas: how
+    /// many have acknowledged by then).
+    timed_out_with: Option<TimedOut>,
 }
+
+/// A blocked client's reply at its timeout, worked out then.
+pub(crate) type TimedOut = Box<dyn Fn() -> Vec<u8> + Send + Sync>;
 
 impl Waiter {
     pub(crate) fn client(&self) -> u64 {
@@ -132,12 +138,20 @@ impl Waiter {
         self.kind
     }
 
-    fn timed_out_reply(&self) -> &'static [u8] {
-        match self.timed_out {
-            Some(reply) => reply,
-            None if self.resp3 => resp::NULL,
-            None => b"*-1\r\n",
+    fn timed_out_reply(&self) -> std::borrow::Cow<'static, [u8]> {
+        if let Some(reply) = &self.timed_out_with {
+            return reply().into();
         }
+        match self.timed_out {
+            Some(reply) => reply.into(),
+            None if self.resp3 => resp::NULL.into(),
+            None => b"*-1\r\n"[..].into(),
+        }
+    }
+
+    /// Whether it still waits: not served, timed out or gone.
+    pub(crate) fn is_pending(&self) -> bool {
+        !matches!(self.state.load(Ordering::Acquire), SERVED | CANCELLED)
     }
 
     pub(crate) fn wakes_on_change(&self) -> bool {
@@ -252,6 +266,7 @@ impl Waiter {
             reply: ReplyMode::On,
             no_evict: false,
             no_touch: false,
+            cluster: 0,
             monitor: None,
             peer: None,
             commands: 0,
@@ -407,6 +422,7 @@ pub(crate) fn block(
         waker: Mutex::new(None),
         on_change: on_change.then(|| Arc::new(AtomicBool::new(false))),
         timed_out: None,
+        timed_out_with: None,
     });
     let store = ctx.store.db(session.db as usize);
     let blocked = Blocked {
@@ -463,6 +479,7 @@ pub(crate) fn block_for(
         waker: Mutex::new(None),
         on_change: None,
         timed_out: Some(reply),
+        timed_out_with: None,
     });
     let store = ctx.store.db(session.db as usize);
     store.count_blocked(1);
@@ -473,6 +490,55 @@ pub(crate) fn block_for(
         store: store.clone(),
         timeout,
     }))
+}
+
+/// Blocks the client until something outside the store serves it
+/// ([`serve_from_outside`]), or until `timeout`, when it replies what
+/// `timed_out` says then: `WAIT` for replicas' acks.
+pub(crate) fn block_until(
+    ctx: &Context,
+    session: &Session,
+    timeout: Option<Duration>,
+    timed_out: TimedOut,
+) -> (Reply, Arc<Waiter>) {
+    fn never(_: &Context, _: &mut Session, _: Millis, _: &Args<'_>, _: &mut Vec<u8>) -> Attempt {
+        Attempt::Done
+    }
+    let waiter = Arc::new(Waiter {
+        state: AtomicU8::new(ARMING),
+        kind: Kind::String,
+        buf: Box::default(),
+        ranges: Box::default(),
+        keys: 0..0,
+        attempt: never,
+        client: session.id,
+        user: None,
+        resp3: session.resp3,
+        db: session.db,
+        socket: -1,
+        reply: Mutex::new(Vec::new()),
+        waker: Mutex::new(None),
+        on_change: None,
+        timed_out: None,
+        timed_out_with: Some(timed_out),
+    });
+    let store = ctx.store.db(session.db as usize);
+    store.count_blocked(1);
+    store.track_waiter(&waiter);
+    waiter.arm();
+    let reply = Reply::Block(Box::new(Blocked {
+        waiter: waiter.clone(),
+        store: store.clone(),
+        timeout,
+    }));
+    (reply, waiter)
+}
+
+/// Serves a client [`block_until`] blocked with `reply`, if it still waits.
+pub(crate) fn serve_from_outside(waiter: &Waiter, reply: Vec<u8>) {
+    if waiter.claim() {
+        waiter.serve(reply);
+    }
 }
 
 /// `CLIENT UNBLOCK`: ends client `id`'s blocking command as if it had timed out, or
@@ -616,7 +682,7 @@ impl Blocked {
     pub fn finish(self, out: &mut Vec<u8>) {
         if self.waiter.give_up() {
             // Timed out: a null array, whatever the command.
-            out.extend_from_slice(self.waiter.timed_out_reply());
+            out.extend_from_slice(&self.waiter.timed_out_reply());
         } else {
             out.extend_from_slice(&self.waiter.reply.lock());
         }
@@ -682,6 +748,7 @@ mod tests {
             state: AtomicU8::new(ARMING),
             kind: Kind::List,
             timed_out: None,
+            timed_out_with: None,
             db: 0,
             buf: Box::new([]),
             ranges: Box::new([]),

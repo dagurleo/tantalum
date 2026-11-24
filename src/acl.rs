@@ -405,8 +405,8 @@ impl Selector {
             let allow = first == b'+';
             self.note_rule(&op[1..], allow);
             let table = commands();
-            for id in 0..table.names.len() {
-                if table.categories[id] & bit != 0 {
+            for (id, categories) in table.categories.iter().enumerate().take(table.names.len()) {
+                if categories & bit != 0 {
                     self.change(id as u16, allow);
                 }
             }

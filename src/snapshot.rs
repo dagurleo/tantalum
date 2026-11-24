@@ -19,8 +19,11 @@
 //! Version 1 has only strings, version 2 adds hashes, version 3 the other
 //! collections, version 4 streams, version 5 streams' consumer groups (after
 //! a stream's chunks), version 6 numbered databases (a record that says which
-//! the records after it are in) and version 7 function libraries (a record of
-//! each library's code, 0x08, before the keys). A save writes the lowest version that holds its data,
+//! the records after it are in), version 7 function libraries (a record of
+//! each library's code, 0x08, before the keys) and version 8 where the data is
+//! in a replication stream (a record, 0x09, of its ID and offset, first: a
+//! replica restarted from it, or a master's replicas, can continue from
+//! there). A save writes the lowest version that holds its data,
 //! so a build from before a kind existed can still read a snapshot without
 //! it (after a rollback, say), and loading reads every version.
 //!
@@ -43,7 +46,7 @@ use crate::stream::BigStream;
 use crate::{collection, hash};
 
 /// The header, with the version in its next-to-last byte.
-const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 7\n";
+const MAGIC: &[u8] = b"TANTALUM SNAPSHOT 8\n";
 const VERSION_AT: usize = MAGIC.len() - 2;
 const MAGIC_V1: &[u8] = b"TANTALUM SNAPSHOT 1\n";
 const MAGIC_V2: &[u8] = b"TANTALUM SNAPSHOT 2\n";
@@ -51,6 +54,7 @@ const MAGIC_V3: &[u8] = b"TANTALUM SNAPSHOT 3\n";
 const MAGIC_V4: &[u8] = b"TANTALUM SNAPSHOT 4\n";
 const MAGIC_V5: &[u8] = b"TANTALUM SNAPSHOT 5\n";
 const MAGIC_V6: &[u8] = b"TANTALUM SNAPSHOT 6\n";
+const MAGIC_V7: &[u8] = b"TANTALUM SNAPSHOT 7\n";
 const STRING: u8 = 1;
 const HASH: u8 = 2;
 const LIST: u8 = 3;
@@ -61,6 +65,8 @@ const STREAM: u8 = 6;
 const DB: u8 = 7;
 /// A function library's code (`FUNCTION LOAD`).
 const FUNCTION: u8 = 8;
+/// The replication stream's ID and offset the data is at.
+const REPL: u8 = 9;
 const END: u8 = 0;
 
 /// A record's tag and the first format version that has it.
@@ -115,8 +121,14 @@ impl<W: Write> Write for Checksummed<W> {
 
 /// Writes a snapshot of `store` to `path`. Returns how many keys it holds.
 pub fn save(store: &Store, path: &Path) -> io::Result<u64> {
+    save_at(store, path, None)
+}
+
+/// [`save`], saying the data is at offset `repl.1` of the replication stream
+/// with ID `repl.0` (no write may run meanwhile).
+pub(crate) fn save_at(store: &Store, path: &Path, repl: Option<(&str, u64)>) -> io::Result<u64> {
     let tmp = tmp_path(path);
-    let written = write_to(store, &tmp);
+    let written = write_to(store, &tmp, repl);
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -129,17 +141,53 @@ pub fn save(store: &Store, path: &Path) -> io::Result<u64> {
     Ok(keys)
 }
 
+/// [`save_at`] from copies of the data made at one point
+/// ([`crate::rdb_file::copy`], while no write ran), so writes go on as it's
+/// written.
+pub(crate) fn save_copied(
+    copied: crate::rdb_file::Copied,
+    path: &Path,
+    repl: (&str, u64),
+) -> io::Result<u64> {
+    let tmp = tmp_path(path);
+    let (now, unix_base) = (copied.now, copied.unix_base);
+    let written = write_file(
+        Source::Copied(copied),
+        &tmp,
+        now,
+        |deadline| unix_base.saturating_add(deadline as i64),
+        true,
+        Some(repl),
+    );
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    let keys = written?;
+    fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(keys)
+}
+
 fn tmp_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".tmp");
     PathBuf::from(name)
 }
 
-fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
+fn write_to(store: &Store, tmp: &Path, repl: Option<(&str, u64)>) -> io::Result<u64> {
     let now = store.now();
     // Store-clock deadlines become Unix times by the wall clock's offset.
     let offset = unix_ms() - now as i64;
-    write_file(store, tmp, now, |deadline| deadline as i64 + offset, true)
+    write_file(
+        Source::Live(store),
+        tmp,
+        now,
+        |deadline| deadline as i64 + offset,
+        true,
+        repl,
+    )
 }
 
 /// Writes the append-only log's base: the store as it is at `now`, which no
@@ -148,20 +196,29 @@ fn write_to(store: &Store, tmp: &Path) -> io::Result<u64> {
 /// synced: the caller does that, after letting writes go on.
 pub(crate) fn write_base(store: &Store, now: crate::store::Millis, tmp: &Path) -> io::Result<u64> {
     write_file(
-        store,
+        Source::Live(store),
         tmp,
         now,
         |deadline| store.deadline_to_unix_ms(now, deadline),
         false,
+        None,
     )
 }
 
+/// What a snapshot is written from: the store as it goes, a shard's lock at
+/// a time, or copies of it at one point ([`crate::rdb_file::copy`]).
+enum Source<'a> {
+    Live(&'a Store),
+    Copied(crate::rdb_file::Copied),
+}
+
 fn write_file(
-    store: &Store,
+    source: Source<'_>,
     tmp: &Path,
     now: crate::store::Millis,
     unix: impl Fn(crate::store::Millis) -> i64,
     sync: bool,
+    repl: Option<(&str, u64)>,
 ) -> io::Result<u64> {
     let file = File::create(tmp)?;
     let mut out = Checksummed {
@@ -174,7 +231,19 @@ fn write_file(
     out.inner.write_all(&magic)?;
     let mut keys = 0u64;
     let mut buf = Vec::new();
-    for code in store.function_codes().1 {
+    if let Some((id, offset)) = repl {
+        magic[VERSION_AT] = magic[VERSION_AT].max(b'8');
+        buf.push(REPL);
+        put_varint(&mut buf, id.len() as u64);
+        buf.extend_from_slice(id.as_bytes());
+        put_varint(&mut buf, offset);
+        out.write_all(&buf)?;
+    }
+    let functions = match &source {
+        Source::Live(store) => store.function_codes().1,
+        Source::Copied(copied) => copied.functions.clone(),
+    };
+    for code in functions {
         magic[VERSION_AT] = magic[VERSION_AT].max(b'7');
         buf.clear();
         buf.push(FUNCTION);
@@ -182,35 +251,70 @@ fn write_file(
         buf.extend_from_slice(&code);
         out.write_all(&buf)?;
     }
-    for db in store.live() {
-        if db.index() != 0 {
-            if db.is_empty() {
-                continue;
-            }
+    // A database's start (but 0's, which needs none), and an entry.
+    let start_db = |index: usize, magic: &mut Vec<u8>, buf: &mut Vec<u8>| {
+        if index != 0 {
             magic[VERSION_AT] = magic[VERSION_AT].max(b'6');
-            buf.clear();
             buf.push(DB);
-            put_varint(&mut buf, db.index() as u64);
-            out.write_all(&buf)?;
+            put_varint(buf, index as u64);
         }
-        for shard in 0..db.shard_count() {
-            buf.clear();
-            db.for_each_live(shard, now, |key, kind, value, deadline| {
-                let (tag, version) = tag_of(kind, value);
-                magic[VERSION_AT] = magic[VERSION_AT].max(version);
-                buf.push(tag);
-                put_varint(&mut buf, key.len() as u64);
-                buf.extend_from_slice(key);
-                put_varint(&mut buf, value.len() as u64);
-                buf.extend_from_slice(value);
-                let expires = match deadline {
-                    NO_EXPIRY => 0,
-                    deadline => unix(deadline).max(1) as u64,
-                };
-                put_varint(&mut buf, expires);
-                keys += 1;
-            });
-            out.write_all(&buf)?;
+    };
+    let mut entry =
+        |buf: &mut Vec<u8>, magic: &mut Vec<u8>, key: &[u8], kind, value: &[u8], deadline| {
+            let (tag, version) = tag_of(kind, value);
+            magic[VERSION_AT] = magic[VERSION_AT].max(version);
+            buf.push(tag);
+            put_varint(buf, key.len() as u64);
+            buf.extend_from_slice(key);
+            put_varint(buf, value.len() as u64);
+            buf.extend_from_slice(value);
+            let expires = match deadline {
+                NO_EXPIRY => 0,
+                deadline => unix(deadline).max(1) as u64,
+            };
+            put_varint(buf, expires);
+            keys += 1;
+        };
+    match source {
+        Source::Live(store) => {
+            for db in store.live() {
+                if db.index() != 0 && db.is_empty() {
+                    continue;
+                }
+                buf.clear();
+                start_db(db.index(), &mut magic, &mut buf);
+                out.write_all(&buf)?;
+                for shard in 0..db.shard_count() {
+                    buf.clear();
+                    db.for_each_live(shard, now, |key, kind, value, deadline| {
+                        entry(&mut buf, &mut magic, key, kind, value, deadline)
+                    });
+                    out.write_all(&buf)?;
+                }
+            }
+        }
+        Source::Copied(copied) => {
+            for db in copied.dbs {
+                if db.index != 0 && db.keys == 0 {
+                    // (Its shards made, or will make, copies that go unread.)
+                    for (i, slot) in db.slots.iter().enumerate() {
+                        drop(db.db.take_copy(i, slot));
+                    }
+                    continue;
+                }
+                buf.clear();
+                start_db(db.index, &mut magic, &mut buf);
+                out.write_all(&buf)?;
+                for (i, slot) in db.slots.iter().enumerate() {
+                    let shard = db.db.take_copy(i, slot);
+                    buf.clear();
+                    shard.for_each_live(now, |key, kind, value, deadline| {
+                        entry(&mut buf, &mut magic, key, kind, value, deadline)
+                    });
+                    drop(shard);
+                    out.write_all(&buf)?;
+                }
+            }
         }
     }
     out.write_all(&[END])?;
@@ -239,6 +343,8 @@ pub struct Loaded {
     pub expired: u64,
     /// Keys left out because `maxmemory` was reached with `noeviction`.
     pub dropped: u64,
+    /// The replication stream's ID and offset the data was at, if it says.
+    pub repl: Option<(String, u64)>,
 }
 
 /// Loads the snapshot at `path` into `store`: `Ok(None)` if there's none.
@@ -284,7 +390,8 @@ fn load_file(
         MAGIC_V4 => 4,
         MAGIC_V5 => 5,
         MAGIC_V6 => 6,
-        MAGIC => 7,
+        MAGIC_V7 => 7,
+        MAGIC => 8,
         _ if magic.starts_with(&MAGIC[..VERSION_AT]) => {
             return Err(invalid(
                 "a snapshot from a newer Tantalum: upgrade to load it",
@@ -305,6 +412,12 @@ fn load_file(
         let mut tag = [0];
         reader.read_exact(&mut tag)?;
         let kind = match tag[0] {
+            REPL if version >= 8 => {
+                read_bytes(&mut reader, &mut value)?;
+                let offset = read_varint(&mut reader)?;
+                loaded.repl = Some((String::from_utf8_lossy(&value).into_owned(), offset));
+                continue;
+            }
             FUNCTION if version >= 7 => {
                 read_bytes(&mut reader, &mut value)?;
                 functions.push(std::sync::Arc::<[u8]>::from(&value[..]));
@@ -431,6 +544,9 @@ pub struct Snapshots {
     saving: Mutex<()>,
     in_background: AtomicBool,
     status: Mutex<Status>,
+    /// The server's context, once it runs (`Context::adopt`): for where the
+    /// data is in a replication stream.
+    ctx: std::sync::OnceLock<std::sync::Weak<crate::context::Context>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -452,6 +568,7 @@ impl Snapshots {
             interval,
             store,
             saving: Mutex::new(()),
+            ctx: std::sync::OnceLock::new(),
             in_background: AtomicBool::new(false),
             status: Mutex::new(Status {
                 last_save: unix_ms() / 1000,
@@ -466,7 +583,7 @@ impl Snapshots {
         let _saving = self.saving.lock();
         let changes = self.store.changes();
         let started = Instant::now();
-        let result = save(&self.store, &self.path);
+        let result = self.save_where_in_stream();
         let mut status = self.status.lock();
         status.last_ok = result.is_ok();
         match &result {
@@ -483,6 +600,47 @@ impl Snapshots {
             Err(e) => eprintln!("snapshot: saving {} failed: {e}", self.path.display()),
         }
         result
+    }
+
+    /// The server's context, for where its data is in a replication stream.
+    pub(crate) fn attach(&self, ctx: std::sync::Weak<crate::context::Context>) {
+        let _ = self.ctx.set(ctx);
+    }
+
+    /// Saves, with where the data is in the replication stream once there's
+    /// one (a master's replicas, or a replica's master): from copies made at
+    /// one point, as a full sync's file is, so writes (or a replica's
+    /// master's commands) wait only while the copies are marked, and a
+    /// replica restarted from it, or a master that comes back as a replica
+    /// of the one that took over, can continue from there. Marking costs a
+    /// shard's lock at a time; the copies, as much memory again as the
+    /// shards written meanwhile hold, at worst (as Redis' fork costs). As it
+    /// shuts down, with no writes to wait for, it writes the data as it is.
+    /// Without a stream, it writes the data as it goes, a shard at a time.
+    fn save_where_in_stream(&self) -> io::Result<u64> {
+        let ctx = self.ctx.get().and_then(std::sync::Weak::upgrade);
+        if let Some(ctx) = &ctx
+            && let Some(log) = ctx.log()
+            && log.repl.is_some()
+        {
+            if ctx.is_shutting_down() {
+                return log.exclusive(|| {
+                    let id = ctx.repl.ids().id;
+                    save_at(&self.store, &self.path, Some((&id, ctx.repl.offset())))
+                });
+            }
+            let (id, offset, copied) = log.exclusive(|| {
+                let id = ctx.repl.ids().id;
+                let offset = ctx.repl.offset();
+                (
+                    id,
+                    offset,
+                    crate::rdb_file::copy(&self.store, self.store.now()),
+                )
+            });
+            return save_copied(copied, &self.path, (&id, offset));
+        }
+        save(&self.store, &self.path)
     }
 
     /// Starts a save on another thread, unless one is already running.
@@ -599,6 +757,57 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_from_copies_is_the_data_when_they_were_marked() {
+        let (live, copied) = (temp_path("live"), temp_path("copied"));
+        let s = Arc::new(filled());
+        s.db(2)
+            .set(
+                b"two",
+                b"2",
+                Condition::Always,
+                Expiry::Never,
+                s.now(),
+                false,
+            )
+            .unwrap();
+        save_at(&s, &live, Some(("i", 7))).unwrap();
+        let copies = crate::rdb_file::copy(&s, s.now());
+        // Written to after the copies were marked: the snapshot has it as it was.
+        let now = s.now();
+        s.set(
+            &0u32.to_le_bytes(),
+            b"changed",
+            Condition::Always,
+            Expiry::Never,
+            now,
+            false,
+        )
+        .unwrap();
+        s.set(b"new", b"1", Condition::Always, Expiry::Never, now, false)
+            .unwrap();
+        assert_eq!(save_copied(copies, &copied, ("i", 7)).unwrap(), 5_005);
+        let (a, b) = (Arc::new(Store::new(4)), Arc::new(Store::new(4)));
+        let la = load(&a, &live).unwrap().unwrap();
+        let lb = load(&b, &copied).unwrap().unwrap();
+        assert_eq!(la, lb);
+        assert_eq!(lb.repl, Some(("i".to_string(), 7)));
+        assert_eq!(get(&b, b"new"), None);
+        for db in [0, 2] {
+            let (a, b) = (a.db(db), b.db(db));
+            assert_eq!(a.len(), b.len());
+            for i in 0..5_000u32 {
+                let key = i.to_le_bytes();
+                assert_eq!(kind_and_value(a, &key), kind_and_value(b, &key), "key {i}");
+            }
+            for key in [&b"big"[..], b"", b"\0\r\n\xff", b"ttl", b"two"] {
+                assert_eq!(kind_and_value(a, key), kind_and_value(b, key));
+            }
+        }
+        fs::remove_dir_all(live.parent().unwrap()).unwrap();
+        let _ = fs::remove_dir_all(copied.parent().unwrap());
+    }
+
+    #[test]
     fn roundtrip() {
         let path = temp_path("roundtrip");
         let s = filled();
@@ -610,7 +819,8 @@ mod tests {
             Loaded {
                 keys: 5_004,
                 expired: 0,
-                dropped: 0
+                dropped: 0,
+                repl: None,
             }
         );
         assert_eq!(t.len(), 5_004);
@@ -1103,7 +1313,8 @@ mod tests {
             Loaded {
                 keys: 6,
                 expired: 0,
-                dropped: 0
+                dropped: 0,
+                repl: None,
             }
         );
         let string = |v: &[u8]| Some((Kind::String, v.to_vec()));
@@ -1159,8 +1370,8 @@ mod tests {
                 file_of(MAGIC, &record(HASH, b"\x02\x01a"), 1),
             ),
             ("an empty hash", file_of(MAGIC, &record(HASH, b"\x00"), 1)),
-            ("an unknown kind", file_of(MAGIC, &record(9, b"x"), 1)),
-            ("a newer version", file_of(b"TANTALUM SNAPSHOT 8\n", &[], 0)),
+            ("an unknown kind", file_of(MAGIC, &record(10, b"x"), 1)),
+            ("a newer version", file_of(b"TANTALUM SNAPSHOT 9\n", &[], 0)),
         ] {
             fs::write(&path, file).unwrap();
             let err = load(&Arc::new(Store::new(1)), &path).unwrap_err();
@@ -1299,6 +1510,37 @@ mod tests {
     }
 
     #[test]
+    fn where_in_a_stream_the_data_is_needs_version_8_only() {
+        let path = temp_path("repl");
+        let store = Arc::new(Store::new(4));
+        store
+            .set(
+                b"k",
+                b"v",
+                Condition::Always,
+                crate::store::Expiry::Never,
+                store.now(),
+                false,
+            )
+            .unwrap();
+        // Without it, the lowest version that holds the data, as before.
+        save(&store, &path).unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V1));
+        assert_eq!(
+            load(&Arc::new(Store::new(4)), &path).unwrap().unwrap().repl,
+            None
+        );
+        let id = "8b0ab4ed4d34a5a70ffbcaf8b5aa8e5fbb9ee70d";
+        save_at(&store, &path, Some((id, 12_345))).unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        let fresh = Arc::new(Store::new(4));
+        let loaded = load(&fresh, &path).unwrap().unwrap();
+        assert_eq!(loaded.repl, Some((id.to_string(), 12_345)));
+        assert_eq!(get(&fresh, b"k"), Some(b"v".to_vec()));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn saves_only_what_changed() {
         let path = temp_path("changes");
         let store = Arc::new(Store::new(2));
@@ -1334,7 +1576,7 @@ mod tests {
         );
         s.set_function_codes(vec![code.clone()]);
         assert_eq!(save(&s, &path).unwrap(), 1);
-        assert!(fs::read(&path).unwrap().starts_with(MAGIC));
+        assert!(fs::read(&path).unwrap().starts_with(MAGIC_V7));
         let t = Arc::new(Store::new(4));
         assert_eq!(load(&t, &path).unwrap().unwrap().keys, 1);
         assert_eq!(get(&t, b"k").unwrap(), b"v");

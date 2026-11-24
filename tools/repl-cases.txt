@@ -1,0 +1,706 @@
+# What write commands propagate to replicas: cases for tools/repl-diff.py.
+# A blank line ends a case; `!` lines are setup, not compared.
+
+SET k v
+
+SET k v EX 100
+
+SET k v PX 100000
+
+SET k v EXAT 4102444800
+
+SET k v PXAT 4102444800000
+
+SET k v NX EX 100
+
+!SET k v
+SET k v NX
+
+!SET k v
+SET k v2 XX GET
+
+SET k v KEEPTTL
+
+!SET k v EX 100
+SET k v2 KEEPTTL GET
+
+SET k v GET
+
+SETEX k 100 v
+
+PSETEX k 100000 v
+
+SETNX k v
+
+!SET k v
+SETNX k v
+
+MSET a 1 b 2
+
+MSETNX a 1 b 2
+
+!SET a 1
+MSETNX a 1 b 2
+
+GETSET k v
+
+!SET k v
+GETDEL k
+
+GETDEL missing
+
+!SET k v
+GETEX k EX 100
+
+!SET k v
+GETEX k PXAT 4102444800000
+
+!SET k v EX 100
+GETEX k PERSIST
+
+!SET k v
+GETEX k PERSIST
+
+!SET k v
+GETEX k
+
+!SET k 1
+INCR k
+
+INCRBY k 5
+
+DECR k
+
+DECRBY k 5
+
+INCRBYFLOAT k 1.5
+
+!SET k 10.5
+INCRBYFLOAT k 0.1
+
+!SET k v EX 100
+INCRBYFLOAT k 1
+
+APPEND k abc
+
+SETRANGE k 2 abc
+
+!SET k abc
+SETRANGE k 0 ""
+
+SETBIT k 7 1
+
+!SETBIT k 7 1
+SETBIT k 7 1
+
+BITFIELD k SET u8 0 255 GET u8 0
+
+!SET k a
+BITFIELD k GET u8 0
+
+BITOP AND d a b
+
+!SET a 1
+BITOP OR d a
+
+!SET k v
+DEL k missing
+
+DEL missing
+
+!SET k v
+UNLINK k
+
+!SET k v
+EXPIRE k 100
+
+!SET k v
+PEXPIRE k 100000
+
+!SET k v
+EXPIREAT k 4102444800
+
+!SET k v
+PEXPIREAT k 4102444800000
+
+!SET k v
+EXPIRE k 100 NX
+
+!SET k v EX 100
+EXPIRE k 200 NX
+
+!SET k v
+EXPIRE k 0
+
+!SET k v
+EXPIRE k -1
+
+!SET k v
+PEXPIREAT k 1000
+
+EXPIRE missing 100
+
+!SET k v EX 100
+PERSIST k
+
+!SET k v
+PERSIST k
+
+!SET k v
+RENAME k k2
+
+!SET k v
+RENAMENX k k2
+
+!SET k v
+!SET k2 v
+RENAMENX k k2
+
+!SET k v
+COPY k k2
+
+!SET k v EX 100
+COPY k k2 DB 1
+
+!SET k v
+MOVE k 1
+
+SWAPDB 0 1
+
+!SET k v
+FLUSHDB
+
+FLUSHALL
+
+!SET k v
+FLUSHALL ASYNC
+
+SELECT 1
+SET k v
+
+SELECT 1
+SET k v
+SELECT 0
+SET k v
+
+!SET k v
+TOUCH k
+
+HSET h f v
+
+HSET h f v f2 v2
+
+!HSET h f v
+HSET h f v
+
+HSETNX h f v
+
+!HSET h f v
+HSETNX h f v
+
+HMSET h f v
+
+!HSET h f v
+HDEL h f
+
+HDEL h f
+
+HINCRBY h f 1
+
+HINCRBYFLOAT h f 1.5
+
+!HSET h f 1.5
+HINCRBYFLOAT h f 0.1
+
+SADD s a b
+
+!SADD s a
+SADD s a
+
+!SADD s a b
+SREM s a
+
+SREM s a
+
+!SADD s a
+SPOP s
+
+!SADD s a b c
+SPOP s 5
+
+!SADD s a
+SPOP s 1
+
+SPOP s
+
+!SADD s a b
+SMOVE s d a
+
+!SADD a 1 2
+!SADD b 2 3
+SINTERSTORE d a b
+
+!SADD a 1 2
+!SADD b 2 3
+SUNIONSTORE d a b
+
+!SADD a 1 2
+!SADD b 2 3
+SDIFFSTORE d a b
+
+!SADD d x
+SINTERSTORE d a b
+
+LPUSH l a b
+
+RPUSH l a b
+
+LPUSHX l a
+
+!RPUSH l a
+LPUSHX l b
+
+!RPUSH l a b c
+LPOP l
+
+!RPUSH l a b c
+RPOP l 2
+
+LPOP l
+
+!RPUSH l a b
+LMPOP 1 l LEFT COUNT 5
+
+!RPUSH l a b
+BLPOP l 0
+
+!RPUSH l a b
+BRPOP l 1
+
+!RPUSH l a b
+BLMPOP 0 1 l RIGHT
+
+!RPUSH l a b
+BLMOVE l d LEFT RIGHT 0
+
+!RPUSH l a b
+BRPOPLPUSH l d 0
+
+BLPOP l 0.01
+
+!RPUSH l a b
+LMOVE l d LEFT RIGHT
+
+!RPUSH l a b
+RPOPLPUSH l d
+
+!RPUSH l a b
+LSET l 0 x
+
+!RPUSH l a b
+LINSERT l BEFORE b x
+
+!RPUSH l a b
+LINSERT l BEFORE z x
+
+!RPUSH l a b a
+LREM l 0 a
+
+!RPUSH l a b
+LREM l 0 z
+
+!RPUSH l a b c
+LTRIM l 0 1
+
+!RPUSH l a b
+LTRIM l 0 -1
+
+!RPUSH l a b
+LTRIM l 5 10
+
+ZADD z 1 a 2 b
+
+!ZADD z 1 a
+ZADD z 1 a
+
+!ZADD z 1 a
+ZADD z XX CH 2 a
+
+ZADD z INCR 1 a
+
+ZINCRBY z 1.5 a
+
+!ZADD z 1 a 2 b
+ZREM z a
+
+!ZADD z 1 a 2 b 3 c
+ZPOPMIN z
+
+!ZADD z 1 a 2 b 3 c
+ZPOPMAX z 2
+
+!ZADD z 1 a 2 b
+BZPOPMIN z 0
+
+!ZADD z 1 a 2 b
+BZMPOP 0 1 z MAX COUNT 2
+
+!ZADD z 1 a 2 b
+ZMPOP 1 z MIN
+
+!ZADD z 1 a 2 b 3 c
+ZREMRANGEBYRANK z 0 0
+
+!ZADD z 1 a 2 b 3 c
+ZREMRANGEBYSCORE z 1 2
+
+!ZADD z 0 a 0 b 0 c
+ZREMRANGEBYLEX z [a [b
+
+!ZADD a 1 x
+!ZADD b 2 x
+ZUNIONSTORE d 2 a b
+
+!ZADD a 1 x
+ZRANGESTORE d a 0 -1
+
+!ZADD a 1 x 2 y
+ZINTERSTORE d 1 a WEIGHTS 2
+
+!ZADD a 1 x
+ZDIFFSTORE d 1 a
+
+PFADD p a b
+
+!PFADD p a
+PFADD p a
+
+!PFADD a x
+!PFADD b y
+PFMERGE d a b
+
+!PFADD p a b
+PFCOUNT p
+
+GEOADD g 13.361389 38.115556 Palermo
+
+!GEOADD g 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
+GEOSEARCHSTORE d g FROMLONLAT 15 37 BYRADIUS 200 km
+
+!GEOADD g 13.361389 38.115556 Palermo
+GEORADIUS g 15 37 200 km STORE d
+
+XADD x * f v
+
+XADD x 1-1 f v
+
+XADD x 5-* f v
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+!XADD x 3-1 f v
+XADD x MAXLEN 2 4-1 f v
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+!XADD x 3-1 f v
+XADD x MAXLEN ~ 2 4-1 f v
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+XADD x MINID ~ 2 3-1 f v
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+!XADD x 3-1 f v
+XADD x MAXLEN ~ 1 LIMIT 10 4-1 f v
+
+XADD x NOMKSTREAM * f v
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+XTRIM x MAXLEN 1
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+XTRIM x MAXLEN ~ 1
+
+!XADD x 1-1 f v
+XTRIM x MAXLEN 5
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+XDEL x 1-1
+
+!XADD x 1-1 f v
+XDEL x 9-9
+
+!XADD x 1-1 f v
+XGROUP CREATE x g 0
+
+!XADD x 1-1 f v
+XGROUP CREATE x g $
+
+XGROUP CREATE y g $ MKSTREAM
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+XGROUP SETID x g $
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+XGROUP CREATECONSUMER x g c
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+XGROUP DESTROY x g
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XGROUP CREATECONSUMER x g c
+XGROUP DELCONSUMER x g c
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+!XGROUP CREATE x g 0
+XREADGROUP GROUP g c COUNT 1 STREAMS x >
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+XREADGROUP GROUP g c NOACK STREAMS x >
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XREADGROUP GROUP g c STREAMS x >
+XREADGROUP GROUP g c STREAMS x 0
+
+# Where Tantalum propagates more than Redis, so that replicas have what the
+# master has (Redis' don't): a consumer a group read made, that read nothing,
+# goes as XGROUP CREATECONSUMER (from Redis, nothing); so does one XCLAIM or
+# XAUTOCLAIM made that claimed nothing.
+#   XGROUP CREATE x g $ / XREADGROUP GROUP g c STREAMS x >
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XREADGROUP GROUP g c STREAMS x >
+XACK x g 1-1
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XREADGROUP GROUP g c STREAMS x >
+XCLAIM x g c2 0 1-1
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XREADGROUP GROUP g c STREAMS x >
+XCLAIM x g c2 0 1-1 JUSTID
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XREADGROUP GROUP g c STREAMS x >
+XAUTOCLAIM x g c2 0 0
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+!XGROUP CREATE x g 0
+!XREADGROUP GROUP g c STREAMS x >
+!XDEL x 1-1
+XAUTOCLAIM x g c2 0 0
+
+!XADD x 1-1 f v
+XSETID x 5-5
+
+!SET k v
+EVAL "redis.call('set', KEYS[1], 'x') return 1" 1 k
+
+EVAL "redis.call('set', KEYS[1], 'x') redis.call('incr', 'n') return 1" 1 k
+
+EVAL "return redis.call('get', KEYS[1])" 1 k
+
+EVAL "redis.call('set', KEYS[1], 'x', 'EX', 100) return 1" 1 k
+
+EVAL "redis.call('spop', KEYS[1]) return 1" 1 s
+
+!SADD s a
+EVAL "redis.call('spop', KEYS[1]) return 1" 1 s
+
+MULTI
+SET a 1
+INCR n
+EXEC
+
+MULTI
+SET a 1
+EXEC
+
+MULTI
+GET a
+EXEC
+
+MULTI
+SET a 1 EX 100
+EXEC
+
+FUNCTION LOAD "#!lua name=lib\nredis.register_function('f', function(keys, args) return redis.call('set', keys[1], args[1]) end)"
+
+!FUNCTION LOAD "#!lua name=lib\nredis.register_function('f', function(keys, args) return redis.call('set', keys[1], args[1]) end)"
+FCALL f 1 k v
+
+!FUNCTION LOAD "#!lua name=lib\nredis.register_function('f', function(keys, args) return redis.call('set', keys[1], args[1]) end)"
+FUNCTION DELETE lib
+
+!FUNCTION LOAD "#!lua name=lib\nredis.register_function('f', function(keys, args) return redis.call('set', keys[1], args[1]) end)"
+FUNCTION FLUSH
+
+SCRIPT LOAD "return 1"
+
+SCRIPT FLUSH
+
+PUBLISH ch hello
+
+!SET k v
+SORT k BY nosort STORE d
+
+!RPUSH l 3 1 2
+SORT l STORE d
+
+!SET k v
+RESTORE k2 0 "\x00\x01v\x0b\x00\xf8\xd7s\xc1\xe4\xa7cG"
+
+RESTORE k2 100000 "\x00\x01v\x0b\x00\xf8\xd7s\xc1\xe4\xa7cG"
+
+# Expired keys: deleted by whatever looks at them first, as DELs.
+!DEBUG SET-ACTIVE-EXPIRE 0
+!SET k v PX 1
+sleep 20
+GET k
+!DEBUG SET-ACTIVE-EXPIRE 1
+
+!DEBUG SET-ACTIVE-EXPIRE 0
+!SET k 1 PX 1
+sleep 20
+INCR k
+!DEBUG SET-ACTIVE-EXPIRE 1
+
+!DEBUG SET-ACTIVE-EXPIRE 0
+!SET k 1 PX 1
+sleep 20
+SET k 2 XX
+!DEBUG SET-ACTIVE-EXPIRE 1
+
+!DEBUG SET-ACTIVE-EXPIRE 0
+!SET k 1 PX 1
+sleep 20
+EXISTS k
+!DEBUG SET-ACTIVE-EXPIRE 1
+
+!DEBUG SET-ACTIVE-EXPIRE 0
+!SET k 1 PX 1
+sleep 20
+MULTI
+INCR k
+EXEC
+!DEBUG SET-ACTIVE-EXPIRE 1
+
+!DEBUG SET-ACTIVE-EXPIRE 0
+!SET k 1 PX 1
+sleep 20
+EVAL "return redis.call('incr', KEYS[1])" 1 k
+!DEBUG SET-ACTIVE-EXPIRE 1
+
+!DEBUG SET-ACTIVE-EXPIRE 1
+!SET k v PX 1
+sleep 300
+DBSIZE
+
+RESTORE k3 4102444800000 "\x00\x01v\x0b\x00\xf8\xd7s\xc1\xe4\xa7cG" ABSTTL
+
+!SET k3 x
+RESTORE k3 0 "\x00\x01v\x0b\x00\xf8\xd7s\xc1\xe4\xa7cG" REPLACE IDLETIME 10
+
+SET k v NX PXAT 4102444800000 GET
+
+SET k v XX EX 100
+
+!SET k v
+SET k v2 XX EX 100
+
+SET k v EX 100 GET
+
+GEOADD g NX CH 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
+
+!GEOADD g 13.361389 38.115556 Palermo
+GEOADD g 13.361389 38.115556 Palermo
+
+!SET k 5
+DECRBY k 0
+
+!HSET h f 1
+HINCRBY h f 0
+
+# (SPOP s 2 of three members is chance: which two differs.)
+
+!SADD s 1 2 3
+SINTERCARD 1 s
+
+!RPUSH l a
+LPOS l a
+
+!ZADD z 1 a
+ZADD z GT 0 a
+
+!ZADD z 1 a
+ZINCRBY z 0 a
+
+!ZADD z 1 a
+ZADD z INCR 0 a
+
+# Differs on purpose: XCLAIM made consumer c2 and claimed nothing. Redis
+# propagates nothing, and its replicas go without c2; Tantalum's get it.
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XREADGROUP GROUP g c STREAMS x >
+XCLAIM x g c2 1000000 1-1
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+XREADGROUP GROUP g c STREAMS x > 
+
+!XADD x 1-1 f v
+!XADD x 2-1 f v
+!XGROUP CREATE x g 0
+XREADGROUP GROUP g c COUNT 10 STREAMS x >
+
+!XADD x 1-1 f v
+!XGROUP CREATE x g 0
+!XGROUP CREATECONSUMER x g c
+XREADGROUP GROUP g c NOACK STREAMS x >
+
+!SET k v
+MIGRATE 127.0.0.1 1 k 0 10
+
+!SET a 1
+!SET b 2
+DEL a b c
+
+MULTI
+SET a 1
+SET b 2
+EXEC
+SET c 3
+
+!SET k v
+EVAL "redis.call('del', KEYS[1]) redis.call('set', KEYS[1], 'y') return 1" 1 k
+
+EVAL "redis.call('select', 1) redis.call('set', 'k', 'v') return 1" 0
+
+!FUNCTION LOAD "#!lua name=lib\nredis.register_function('f', function(keys, args) return redis.call('set', keys[1], args[1]) end)"
+FUNCTION LOAD REPLACE "#!lua name=lib\nredis.register_function('f', function(keys, args) return redis.call('set', keys[1], args[1]) end)"
+
+SPUBLISH ch hello
+
+!RPUSH b x y
+LMPOP 2 a b RIGHT COUNT 1
+
+!ZADD b 1 x 2 y
+BZMPOP 0 2 a b MIN

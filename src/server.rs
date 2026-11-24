@@ -43,7 +43,7 @@ use tokio::net::{TcpListener, TcpStream};
 pub use tokio_rustls::TlsAcceptor;
 
 use crate::cmd::{self, Args, Blocked, Reply};
-use crate::context::{Context, Session};
+use crate::context::{Context, IoThread, Session};
 use crate::pubsub::Subscriber;
 use crate::resp;
 use crate::store::{KeyHash, Millis, Store};
@@ -205,6 +205,15 @@ pub async fn serve_with(
     ctx: Arc<Context>,
     tls: Option<TlsAcceptor>,
 ) -> io::Result<()> {
+    ctx.adopt();
+    let handle = tokio::runtime::Handle::current();
+    ctx.register_io_thread(match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::CurrentThread => IoThread::Tokio(handle),
+        _ => {
+            let workers = handle.metrics().num_workers();
+            IoThread::Shared(handle, workers)
+        }
+    });
     loop {
         let socket = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -255,6 +264,7 @@ pub fn serve_per_thread_with(
     threads: usize,
 ) -> io::Result<()> {
     type Incoming = (std::net::TcpStream, Option<TlsAcceptor>);
+    ctx.adopt();
     let mut workers = Vec::with_capacity(threads);
     for i in 0..threads.max(1) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Incoming>();
@@ -262,6 +272,7 @@ pub fn serve_per_thread_with(
             .enable_all()
             .event_interval(EVENT_INTERVAL)
             .build()?;
+        ctx.register_io_thread(IoThread::Tokio(runtime.handle().clone()));
         let ctx = ctx.clone();
         std::thread::Builder::new()
             .name(format!("tantalum-io-{i}"))
@@ -360,6 +371,7 @@ pub fn serve_uring(
     ctx: Arc<Context>,
     threads: usize,
 ) -> io::Result<()> {
+    ctx.adopt();
     let mut handles = (0..threads.max(1))
         .map(|i| {
             let ctx = ctx.clone();
@@ -388,6 +400,7 @@ pub fn serve_uring(
                         .build();
                     let mut runtime = runtime?;
                     let (mailbox, bell) = Mailbox::new()?;
+                    ctx.register_io_thread(IoThread::Monoio(mailbox.clone()));
                     runtime.block_on(async move {
                         monoio::spawn(deliver_mail(
                             mailbox.clone(),
@@ -842,6 +855,7 @@ async fn handle_uring(
             }
         }
         ctx.publish(&mut session);
+        crate::repl::propagate::after_batch(ctx);
         rbuf.drain(..pos);
         // Messages that came meanwhile go with the replies.
         let subscriber = session.subscriber().cloned();
@@ -901,6 +915,15 @@ trait Stream: AsyncRead + AsyncWrite + Unpin {
     fn plain_socket(&self) -> std::os::fd::RawFd {
         -1
     }
+
+    /// The stream as a blocking one, for a replica's thread to go on with
+    /// (`PSYNC` over TLS: see `repl::master::sync`).
+    fn into_feed(self) -> Option<Box<dyn crate::repl::master::FeedConn>>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 impl Stream for TcpStream {
@@ -919,6 +942,13 @@ impl Stream for TcpStream {
 
 impl Stream for tokio_rustls::server::TlsStream<TcpStream> {
     const WAIT_FOR_DATA: bool = false;
+
+    fn into_feed(self) -> Option<Box<dyn crate::repl::master::FeedConn>> {
+        let (tcp, session) = self.into_inner();
+        let tcp = tcp.into_std().ok()?;
+        tcp.set_nonblocking(false).ok()?;
+        Some(Box::new(rustls::StreamOwned::new(session, tcp)))
+    }
 }
 
 /// Serves one connection, after a TLS handshake if `tls` is given.
@@ -1421,6 +1451,7 @@ async fn serve_stream(
             }
         }
         ctx.publish(&mut session);
+        crate::repl::propagate::after_batch(ctx);
         rbuf.drain(..pos);
         if defer_replies && !wbuf.is_empty() && ran <= HELD_BATCH {
             // (A connection closing waits to see its reply out.)
@@ -1448,6 +1479,12 @@ async fn serve_stream(
             wbuf.clear();
         }
         if close {
+            // A replica over TLS: its thread goes on with the stream.
+            if let Some(handoff) = crate::repl::master::take_handoff()
+                && let Some(conn) = socket.into_feed()
+            {
+                handoff(conn);
+            }
             return Ok(());
         }
         if rbuf.len() > MAX_QUERY_BUFFER {

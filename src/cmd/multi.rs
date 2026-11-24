@@ -17,7 +17,7 @@ pub(super) fn runs_in_multi(command: &str) -> bool {
 
 /// Commands Redis refuses inside a transaction.
 pub(super) fn refused_in_multi(command: &str) -> bool {
-    matches!(command, "save" | "monitor")
+    matches!(command, "save" | "monitor" | "sync" | "psync")
 }
 
 fn reply_error(out: &mut Vec<u8>, msg: &[u8]) -> Reply {

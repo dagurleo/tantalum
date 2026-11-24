@@ -37,8 +37,8 @@ come before any feature.
 - **Faster paths give identical results** to the code they replace. Prove it
   with tests and, for anything stateful, the randomized model test
   (`matches_a_model`) and the fuzzers.
-- **Snapshots stay readable.** `main` deploys to production holding real data
-  (ContentMod's settings), so a new build must load snapshots written by the
+- **Snapshots stay readable.** Production holds real data, and people run
+  releases with data of their own, so a new build must load snapshots written by the
   previous one. Change the format only with a new version number in its
   header, keep reading the old version, and test both.
 
@@ -51,7 +51,7 @@ come before any feature.
 3. For I/O changes, the end-to-end A/B.
 4. The README matches: commands table, design notes, "Not there yet".
 
-CI then runs the tests on Linux, two minutes of fuzzing and the
-deploy-image check (macOS is off while the repository is private, so the
-`cargo test` above, on a Mac, covers it). Railway deploys `main` to
-production only after CI passes.
+CI then runs the tests on Linux and macOS, two minutes of fuzzing and the
+deploy-image check. Railway deploys the `production` branch, not `main`, only
+after CI passes: bring it up to a release by fast-forwarding it to that tag.
+Releases are tags on `main` (README, Development).

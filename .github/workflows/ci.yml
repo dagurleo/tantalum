@@ -14,11 +14,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS is off while the repository is private: its runners bill
-        # 10x Linux minutes and often weren't available. Add macos-latest
-        # back once it's public (free runs). Run the tests on a Mac before
-        # committing meanwhile.
-        os: [ubuntu-latest]
+        # The repository is public, so macOS runs are free.
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

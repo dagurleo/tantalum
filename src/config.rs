@@ -149,8 +149,8 @@ impl ConfigTable {
             .collect()
     }
 
-    #[cfg(test)]
-    fn get(&self, name: &str) -> Option<String> {
+    /// A setting's value: as set, or its default.
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
         self.values.lock().get(name).cloned().or_else(|| {
             defaults()
                 .iter()

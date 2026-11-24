@@ -81,6 +81,12 @@ fn spawn_memory_returner() -> std::io::Result<std::thread::JoinHandle<()>> {
 
 const USAGE: &str = "\
 Usage: tantalum [OPTIONS]
+       tantalum --sentinel <FILE> [--port <PORT>]
+
+  --sentinel <FILE> Run a Sentinel, not a server: watch the masters FILE
+                    names (Redis' sentinel.conf directives) and fail them
+                    over, with Redis' Sentinels or on its own; it rewrites
+                    FILE as it learns.
 
 Options:
   --bind <ADDR>     Address to listen on [default: 127.0.0.1]
@@ -145,7 +151,24 @@ Options:
   --native-scripts <yes|no>
                     Run BullMQ's hottest scripts natively, with the same
                     results as their Lua [default: yes]
+  --replicaof <HOST:PORT>
+                    Follow this master (Redis or Tantalum), as REPLICAOF does
+                    (\"HOST PORT\" works too) [default: none, a master]
+  --masterauth <PASSWORD>
+  --masteruser <USER>
+                    What to AUTH to the master with. The TANTALUM_MASTERAUTH
+                    environment variable sets the password too [default: none]
+  --repl-backlog-size <SIZE>
+                    How much of the replication stream to keep for replicas
+                    that reconnect to continue [default: 1mb]
+  --tls-replication <yes|no>
+  --tls-ca-cert-file <FILE>
+                    Connect to the master over TLS, trusting the certificates
+                    in FILE (PEM): CAs, or the master's own, as it is (a
+                    self-signed one) [default: no]. A master serves replicas
+                    on its --tls-port too.
   -h, --help        Print this help
+  -v, --version     Print the version
 
 On SIGTERM or SIGINT, Tantalum stops accepting, lets each connection finish
 the commands it has read, waits until they've closed (at most 10 s), syncs
@@ -170,6 +193,14 @@ struct Config {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     notify_keyspace_events: Option<String>,
+    replicaof: Option<(String, u16)>,
+    masterauth: Option<Vec<u8>>,
+    masteruser: Option<Vec<u8>>,
+    repl_backlog_size: Option<usize>,
+    tls_replication: bool,
+    tls_ca_cert: Option<PathBuf>,
+    /// Cluster mode, if `--cluster-enabled yes`.
+    cluster: Option<tantalum::cluster::Options>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -177,6 +208,14 @@ enum Io {
     Shared,
     PerThread,
     Uring,
+}
+
+fn yes_no(value: &str) -> Option<bool> {
+    match value {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parses sizes the way Redis does: `1k` is 1000 bytes, `1kb` is 1024.
@@ -234,6 +273,43 @@ fn raise_open_file_limit(maxclients: usize) {
     }
 }
 
+/// `tantalum --sentinel FILE [--port N]`, or as Redis has it,
+/// `tantalum FILE --sentinel`.
+fn sentinel() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut file = None;
+    let mut port = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sentinel"
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") && file.is_none() =>
+            {
+                file = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--sentinel" => {}
+            "--port" if i + 1 < args.len() => {
+                port = args[i + 1].parse::<u16>().ok();
+                i += 1;
+            }
+            other if !other.starts_with("--") && file.is_none() => {
+                file = Some(other.to_string());
+            }
+            other => {
+                eprintln!("error: {other} isn't an option of a Sentinel\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(file) = file else {
+        eprintln!("error: a Sentinel needs its configuration file\n\n{USAGE}");
+        std::process::exit(2);
+    };
+    tantalum::sentinel::run(std::path::Path::new(&file), port)
+}
+
 fn parse_args() -> Result<Config, String> {
     let mut config = Config {
         bind: "127.0.0.1".into(),
@@ -255,7 +331,16 @@ fn parse_args() -> Result<Config, String> {
         tls_cert: None,
         tls_key: None,
         notify_keyspace_events: None,
+        replicaof: None,
+        masterauth: None,
+        masteruser: None,
+        repl_backlog_size: None,
+        tls_replication: false,
+        tls_ca_cert: None,
+        cluster: None,
     };
+    let mut cluster = tantalum::cluster::Options::default();
+    let mut cluster_enabled = false;
     let mut aof_options = aof::Options {
         dir: PathBuf::new(),
         fsync: aof::Fsync::EverySec,
@@ -266,6 +351,10 @@ fn parse_args() -> Result<Config, String> {
     while let Some(flag) = args.next() {
         if flag == "-h" || flag == "--help" {
             println!("{USAGE}");
+            std::process::exit(0);
+        }
+        if flag == "-v" || flag == "--version" {
+            println!("tantalum {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
@@ -335,6 +424,63 @@ fn parse_args() -> Result<Config, String> {
             "--aof-rewrite-min-size" => {
                 aof_options.rewrite_min_size = parse_size(&value).ok_or_else(|| bad(()))? as u64;
             }
+            "--replicaof" | "--slaveof" => {
+                let (host, port) = value
+                    .rsplit_once(' ')
+                    .or_else(|| value.rsplit_once(':'))
+                    .ok_or_else(|| bad(()))?;
+                let port = port.trim().parse().map_err(|_| bad(()))?;
+                config.replicaof = Some((host.trim().to_string(), port));
+            }
+            "--masterauth" => {
+                config.masterauth = Some(value.into_bytes()).filter(|p| !p.is_empty())
+            }
+            "--masteruser" => {
+                config.masteruser = Some(value.into_bytes()).filter(|u| !u.is_empty())
+            }
+            "--cluster-enabled" => cluster_enabled = yes_no(&value).ok_or_else(|| bad(()))?,
+            "--cluster-config-file" => cluster.config_file = PathBuf::from(&value),
+            "--cluster-node-timeout" => {
+                cluster.node_timeout = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|&t| t > 0)
+                    .ok_or_else(|| bad(()))?;
+            }
+            "--cluster-port" => cluster.cport = value.parse().map_err(|_| bad(()))?,
+            "--cluster-announce-ip" => {
+                cluster.announce_ip = Some(value.clone()).filter(|v| !v.is_empty())
+            }
+            "--cluster-announce-hostname" => {
+                cluster.announce_hostname = Some(value.clone()).filter(|v| !v.is_empty());
+            }
+            "--cluster-require-full-coverage" => {
+                cluster.require_full_coverage = yes_no(&value).ok_or_else(|| bad(()))?;
+            }
+            "--cluster-allow-reads-when-down" => {
+                cluster.allow_reads_when_down = yes_no(&value).ok_or_else(|| bad(()))?;
+            }
+            "--cluster-replica-no-failover" | "--cluster-slave-no-failover" => {
+                cluster.replica_no_failover = yes_no(&value).ok_or_else(|| bad(()))?;
+            }
+            "--cluster-replica-validity-factor" | "--cluster-slave-validity-factor" => {
+                cluster.replica_validity_factor = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|&f| f >= 0)
+                    .ok_or_else(|| bad(()))?;
+            }
+            "--tls-replication" => {
+                config.tls_replication = match value.as_str() {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Err(bad(())),
+                }
+            }
+            "--tls-ca-cert-file" => config.tls_ca_cert = Some(PathBuf::from(value)),
+            "--repl-backlog-size" => {
+                config.repl_backlog_size = Some(parse_size(&value).ok_or_else(|| bad(()))?);
+            }
             "--native-scripts" => {
                 config.settings.native_scripts = match value.as_str() {
                     "yes" => true,
@@ -349,6 +495,11 @@ fn parse_args() -> Result<Config, String> {
         // The log's commands run again at the times they ran at.
         config.store.unix_clock = true;
         config.aof = Some(aof_options);
+    }
+    if cluster_enabled {
+        cluster.port = config.port;
+        cluster.bind = vec![config.bind.clone()];
+        config.cluster = Some(cluster);
     }
     Ok(config)
 }
@@ -365,6 +516,9 @@ fn disable_transparent_huge_pages() {
 }
 
 fn main() -> std::io::Result<()> {
+    if std::env::args().any(|a| a == "--sentinel") {
+        return sentinel();
+    }
     #[cfg(target_os = "linux")]
     disable_transparent_huge_pages();
     let config = parse_args().unwrap_or_else(|e| {
@@ -400,11 +554,12 @@ fn main() -> std::io::Result<()> {
         .aof
         .as_ref()
         .is_some_and(|options| aof::exists(&options.dir));
+    let mut in_stream = None;
     if let Some(path) = &config.snapshot {
         if logged {
             eprintln!("loading from the append-only log, not {}", path.display());
         } else {
-            load_snapshot(&store, path);
+            in_stream = load_snapshot(&store, path);
         }
         let snapshots = Snapshots::new(store.clone(), path.clone(), config.snapshot_interval);
         snapshots.spawn_periodic()?;
@@ -422,7 +577,52 @@ fn main() -> std::io::Result<()> {
         eprintln!("error: --notify-keyspace-events: {why}\n\n{USAGE}");
         std::process::exit(1);
     }
+    let masterauth = config.masterauth.clone().or_else(|| {
+        std::env::var("TANTALUM_MASTERAUTH")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(String::into_bytes)
+    });
+    tantalum::repl::configure(
+        &ctx,
+        masterauth,
+        config.masteruser.clone(),
+        config.repl_backlog_size,
+    );
+    // Replicas (or this one's master) may continue from where it was.
+    if let Some((id, offset)) = in_stream {
+        tantalum::repl::resume(&ctx, id, offset);
+    }
+    if config.tls_replication {
+        let Some(ca) = &config.tls_ca_cert else {
+            eprintln!("error: --tls-replication needs --tls-ca-cert-file\n\n{USAGE}");
+            std::process::exit(2);
+        };
+        if let Err(e) = tantalum::repl::use_tls(&ctx, ca) {
+            eprintln!("error: --tls-ca-cert-file: {e}");
+            std::process::exit(2);
+        }
+    }
+    let cluster = match &config.cluster {
+        None => None,
+        Some(options) => {
+            let cluster = tantalum::cluster::Cluster::new(options).unwrap_or_else(|e| {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            });
+            ctx.config.set("cluster-enabled", "yes");
+            ctx = ctx.with_cluster(cluster.clone());
+            Some((cluster, options.bind.clone()))
+        }
+    };
     let ctx = Arc::new(ctx);
+    ctx.adopt();
+    if let Some((host, port)) = &config.replicaof {
+        tantalum::repl::follow(&ctx, host.clone(), *port);
+    }
+    if let Some((cluster, bind)) = cluster {
+        cluster.start(&ctx, bind)?;
+    }
     // After the log's commands ran again: they may still use keys that have
     // expired since.
     let _expirer = cmd::spawn_expirer(&ctx, Duration::from_millis(100));
@@ -622,10 +822,15 @@ fn start_aof(ctx: &Context, options: aof::Options) {
 
 /// Loads the snapshot at `path`, if there is one. A damaged one stops the
 /// server, as in Redis: starting empty would overwrite it at the next save.
-fn load_snapshot(store: &Arc<store::Store>, path: &std::path::Path) {
+/// Loads the snapshot at `path`: where its data is in a replication stream,
+/// if it says.
+fn load_snapshot(store: &Arc<store::Store>, path: &std::path::Path) -> Option<(String, u64)> {
     let started = Instant::now();
     match snapshot::load(store, path) {
-        Ok(None) => eprintln!("no snapshot at {} yet: starting empty", path.display()),
+        Ok(None) => {
+            eprintln!("no snapshot at {} yet: starting empty", path.display());
+            None
+        }
         Ok(Some(loaded)) => {
             let mut line = format!(
                 "loaded {} keys from {} in {} ms",
@@ -643,6 +848,7 @@ fn load_snapshot(store: &Arc<store::Store>, path: &std::path::Path) {
                 );
             }
             eprintln!("{line}");
+            loaded.repl
         }
         Err(e) => {
             eprintln!(

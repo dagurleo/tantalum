@@ -11,8 +11,11 @@ and RESP3). It does Redis's string commands for caching (`GET`/`SET`,
 lists, sorted sets, streams, blocking commands, pub/sub, transactions and
 Lua scripts (enough to run [BullMQ](https://bullmq.io), whose jobs cost
 the server about a third of the CPU they cost Redis), numbered databases, and
-`SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS, and optional snapshots
-and an append-only log on disk. The point: be a faster drop-in for the "Redis as
+`SCAN`, `KEYS` and `RENAME`, with TTLs, eviction, a password, TLS, optional snapshots
+and an append-only log on disk, replication over Redis' own protocol, so Redis and
+Tantalum can follow each other either way, a Sentinel that fails masters over
+alongside Redis' Sentinels or on its own, and cluster mode, in one cluster with Redis
+nodes or on its own. The point: be a faster drop-in for the "Redis as
 a cache" use case, using as little memory as possible.
 
 Named after the metal of tantalum capacitors, known for packing the most into
@@ -29,6 +32,10 @@ cargo run --release -- --snapshot data/tantalum.snapshot   # keep data across re
 cargo run --release -- --aof data/aof   # log every write too: a crash loses about a second
 cargo run --release -- --tls-port 6380 --tls-cert-file cert.pem --tls-key-file key.pem
 cargo run --release -- --notify-keyspace-events Egx   # keyspace notifications, as Redis' setting
+cargo run --release -- --port 6380 --replicaof 127.0.0.1:6379   # a replica (of Redis or Tantalum)
+cargo run --release -- --replicaof master.example:6380 --tls-replication yes --tls-ca-cert-file cert.pem
+cargo run --release -- --sentinel sentinel.conf   # a Sentinel: Redis' sentinel.conf directives
+cargo run --release -- --port 7000 --cluster-enabled yes --cluster-config-file nodes-7000.conf
 redis-cli SET greeting hello EX 60
 redis-cli GET greeting
 ```
@@ -57,6 +64,29 @@ Services on the private network use `redis://default:<password>@<service>.railwa
 (with ioredis, add `?family=0` for IPv6); outside clients use
 `rediss://` to the proxy, pinning the certificate (a self-signed one whose
 names include the proxy's hostname works, and no CA has to renew it).
+
+## Install
+
+Tantalum is in alpha: try it, and [open an issue](https://github.com/dagurleo/tantalum/issues)
+when something doesn't behave as Redis does, but don't trust it yet with data you can't lose.
+Each [release](https://github.com/dagurleo/tantalum/releases) has:
+
+- **Binaries** for Linux (x86_64 and arm64, glibc 2.28 or later: Debian 10, Ubuntu 18.10,
+  RHEL 8 and since) and macOS (Apple silicon and Intel), with `SHA256SUMS`:
+
+  ```sh
+  tar -xzf tantalum-<version>-x86_64-unknown-linux-gnu.tar.gz
+  ./tantalum-<version>-x86_64-unknown-linux-gnu/tantalum --port 6379
+  ```
+
+- **A Docker image** for amd64 and arm64:
+
+  ```sh
+  docker run -p 6379:6379 ghcr.io/dagurleo/tantalum:<version>
+  ```
+
+- **The source**, to build with a recent stable Rust:
+  `cargo install --locked --git https://github.com/dagurleo/tantalum --tag v<version>`.
 
 ## Commands
 
@@ -135,13 +165,16 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `CLIENT LIST [TYPE type\|ID id ...]`, `CLIENT INFO` | Redis 7.2's line per connection: id, addresses, name, age, database, library, protocol. What isn't tracked per connection (idle time, buffers, other connections' last command and how many subscriptions) reads as 0, `N` or `NULL` |
 | `CLIENT KILL addr:port`, `CLIENT KILL [ID id] [TYPE type] [USER name] [ADDR addr:port] [LADDR addr:port] [SKIPME yes\|no]` | Closes other connections at once, and the caller's own after its reply |
 | `COMMAND [COUNT\|INFO\|LIST\|DOCS\|GETKEYS\|GETKEYSANDFLAGS]` | Each entry is Redis 7.2.4's own, ACL categories, key specifications, tips and documentation included (`tools/command-table.py`). `COUNT` and `LIST` say what's here, not what Redis has |
-| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `acllog-max-len`, `acl-pubsub-default`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `latency-tracking`, `latency-tracking-info-percentiles`, `notify-keyspace-events`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`). The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started and `save` with `--snapshot`. `CONFIG REWRITE` says there's no config file |
+| `CONFIG GET pattern ...`, `CONFIG SET name value ...`, `CONFIG RESETSTAT` | Every Redis 7.2.4 setting reads as its default, and `CONFIG SET` refuses what Redis refuses, with its words (bounds, sizes and choices generated from a real Redis). These act: `maxmemory`, `maxmemory-policy`, `maxclients`, `timeout`, `tcp-keepalive`, `requirepass`, `acllog-max-len`, `acl-pubsub-default`, `slowlog-log-slower-than`, `slowlog-max-len`, `latency-monitor-threshold`, `latency-tracking`, `latency-tracking-info-percentiles`, `notify-keyspace-events`, `stream-node-max-entries` and `-bytes` (these two not with `--aof`), and replication's: `masterauth`, `masteruser`, `repl-backlog-size`, `repl-backlog-ttl`, `repl-timeout`, `repl-ping-replica-period`, `min-replicas-to-write`, `min-replicas-max-lag`, `replica-announce-ip` and `-port`, `replica-priority`, `replica-serve-stale-data`, `replica-read-only`. The rest are remembered and do nothing, except that what can't be done is refused rather than remembered: `appendonly` other than as started, and `save` with `--snapshot`. `CONFIG REWRITE` says there's no config file |
 | `MONITOR` | Every command run, as Redis' lines show them: what's secret `(redacted)`, a script's own commands as `lua`, admin commands left out. It costs commands nothing until someone runs it (see Design) |
 | `SLOWLOG GET [count]\|LEN\|RESET\|HELP` | As Redis', with what's secret `(redacted)`, and the commands inside `EXEC` and scripts too. At its default of 10 ms and above, durations are in 5 ms ticks, and commands Redis flags `fast` aren't timed (see Design); below that, a real clock as in Redis |
 | `LATENCY LATEST\|HISTORY\|RESET\|GRAPH\|DOCTOR\|HELP`, `LATENCY HISTOGRAM [command ...]` | With `latency-monitor-threshold`, spikes in `command` and `fast-command`, as Redis keeps them. `HISTOGRAM` is each command's latencies, in Redis' steps, counted from the first time something asks for command statistics (see "Command statistics") |
 | `MEMORY USAGE key [SAMPLES n]\|STATS\|DOCTOR\|PURGE\|MALLOC-STATS\|HELP` | `STATS` has Redis' fields; the allocator's are what's in use and the process's RSS |
-| `WAIT numreplicas timeout`, `WAITAOF numlocal numreplicas timeout` | There are no replicas: `WAIT` for any waits its time out and says 0, as Redis does. `WAITAOF 1` syncs the log at once with `--aof`, and is refused without |
-| `ROLE`, `REPLICAOF NO ONE`, `SLAVEOF NO ONE` | Always a master. Following another server is refused |
+| `WAIT numreplicas timeout`, `WAITAOF numlocal numreplicas timeout` | `WAIT` replies once that many replicas have acknowledged what was written before it, or at the timeout with how many have (asking them at once with `REPLCONF GETACK`), as Redis does; on a replica it's Redis' error. `WAITAOF 1` syncs the log at once with `--aof`, and is refused without; replicas don't count toward it |
+| `FAILOVER [TO host port [FORCE]] [TIMEOUT ms]`, `FAILOVER ABORT` | Hand over to a replica, Redis or Tantalum, without losing a write, as Redis 6.2 does: writes held, then, once the replica named (or the first) has acked the whole stream, this server follows it with `PSYNC id offset FAILOVER`, which makes it take over and continue the stream; `FORCE` hands over at the timeout anyway, and a timeout without it, or `ABORT`, leaves this server a master. Redis' errors, and `master_failover_state` in `INFO` |
+| `CLUSTER ...` (`MEET`, `NODES`, `SLOTS`, `SHARDS`, `INFO`, `MYID`, `MYSHARDID`, `ADDSLOTS`, `ADDSLOTSRANGE`, `DELSLOTS`, `DELSLOTSRANGE`, `FLUSHSLOTS`, `SETSLOT`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `REPLICATE`, `REPLICAS`, `FAILOVER [FORCE\|TAKEOVER]`, `FORGET`, `RESET`, `BUMPEPOCH`, `SET-CONFIG-EPOCH`, `COUNT-FAILURE-REPORTS`, `SAVECONFIG`, `LINKS`, `HELP`), `ASKING`, `READONLY`, `READWRITE`, `RESTORE-ASKING` | With `--cluster-enabled yes`: Redis 7.2's cluster (see "Cluster" in the design notes), replies and errors as its (32 of 34 compared byte for byte, the other two fixed). Without, Redis' `ERR This instance has cluster support disabled` |
+| `REPLICAOF host port`, `REPLICAOF NO ONE`, `SLAVEOF`, `ROLE` | Follow a master, Redis or Tantalum, over Redis' protocol (see "Replication" in the design notes), or stop following and keep the data, which then goes on under a new replication ID with the old one kept, so the other replicas can continue from here. `ROLE` as Redis 7.2 replies it, either side |
+| `SYNC`, `PSYNC replid offset`, `REPLCONF listening-port\|ip-address\|capa\|ack\|getack ...` | What a replica sends its master (Redis' or Tantalum's): this server sends the data as a Redis RDB file and the stream after it, or only what came since, if its backlog still has that. On the plain port or the TLS one; a replica connects over TLS with `--tls-replication yes` and `--tls-ca-cert-file` (the master's CA, or its self-signed certificate, pinned). Replicas are in `CLIENT LIST` (flag `S`, `cmd=psync`) and `CLIENT KILL TYPE replica` closes them |
 | `DEBUG POPULATE\|SLEEP\|ERROR\|OBJECT\|SET-ACTIVE-EXPIRE` | With `--enable-debug-command yes` or `local`, as in Redis |
 | `LOLWUT`, `MODULE LIST` | No modules |
 | `CLIENT PAUSE timeout [WRITE\|ALL]`, `CLIENT UNPAUSE` | Holds back what Redis holds back, for as long, and those it holds run after in order. Nothing expires by itself meanwhile |
@@ -149,8 +182,8 @@ check (`tests/server.rs`, and suites such as `tests/hashes.rs` and
 | `CLIENT TRACKING ON\|OFF [REDIRECT id] [PREFIX prefix ...] [BCAST] [OPTIN] [OPTOUT] [NOLOOP]`, `CLIENT CACHING YES\|NO`, `CLIENT GETREDIR`, `CLIENT TRACKINGINFO` | Client-side caching, as Redis 7.2 has it: invalidations as RESP3 pushes, or as messages on `__redis__:invalidate` to the connection a RESP2 client redirects to; `BCAST` prefixes, `OPTIN`, `OPTOUT`, `NOLOOP`, a null after a flush, `tracking-table-max-keys`, and the `t`, `R` and `B` flags and `redir=` in the client list. The table is by database (see the design notes) |
 | `SAVE`, `BGSAVE`, `LASTSAVE` | With `--snapshot`: save now (blocking the caller), save on another thread, and when the last save succeeded |
 | `BGREWRITEAOF` | With `--aof`: rewrites the log on another thread (a new base of the data as it is, and a new, empty log after it). Without `--aof` it's an error, where Redis would write a log anyway |
-| `INFO [section ...]`, `DBSIZE` | `INFO` gives the sections asked for, as Redis does, with the fields clients and monitoring tools read: `arch_bits`, `run_id`, `role`, `cluster_enabled`, `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `tracking_clients`,
-`tracking_total_keys`, `tracking_total_items`, `tracking_total_prefixes`, `total_error_replies`, `evicted_keys`, `evicted_clients` (0: clients aren't evicted), `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line; `commandstats`, `errorstats` and `latencystats` as Redis has them, counted from the first time something asks (see "Command statistics") |
+| `INFO [section ...]`, `DBSIZE` | `INFO` gives the sections asked for, as Redis does, with the fields clients and monitoring tools read: `arch_bits`, `run_id`, `role`, `cluster_enabled`, `redis_version` (7.2.4, the replies' compatibility level), `uptime_in_seconds`, `connected_clients`, `maxclients`, `blocked_clients`, `used_memory` (with a breakdown: `segment_bytes`, `segment_live_bytes`, `external_bytes`, `table_bytes`, `mem_clients_normal`), `used_memory_rss` (Linux), `maxmemory`, `maxmemory_policy`, `total_connections_received`, `total_commands_processed`, `rejected_connections`, `sync_full`, `sync_partial_ok`, `sync_partial_err`, `keyspace_hits` and `keyspace_misses` (from `GET`, `MGET`, `GETEX`, `GETDEL` and the hash reads), `pubsub_channels`, `pubsub_patterns`, `pubsubshard_channels`, `tracking_clients`,
+`tracking_total_keys`, `tracking_total_items`, `tracking_total_prefixes`, `total_error_replies`, `evicted_keys`, `evicted_clients` (0: clients aren't evicted), `expired_keys`, `native_scripts` and `native_script_fallbacks` (BullMQ script calls run natively, and handed back to Lua), a Replication section as Redis 7.2's (`role`, the master's link and offsets, `connected_slaves` and a `slaveN` line each, `master_replid` and `master_replid2`, the backlog's extent), a Persistence section (`rdb_changes_since_last_save`, `rdb_last_save_time`, `rdb_last_bgsave_status`, ..., and `aof_enabled`, with `--aof` also `aof_rewrite_in_progress`, `aof_last_bgrewrite_status`, `aof_last_write_status`, `aof_current_size`, `aof_base_size`) and the keyspace line; `commandstats`, `errorstats` and `latencystats` as Redis has them, counted from the first time something asks (see "Command statistics") |
 | `SUBSCRIBE`, `PSUBSCRIBE`, `SSUBSCRIBE channel\|pattern [...]`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `SUNSUBSCRIBE [...]` | Messages are pushes in RESP3. Subscribed in RESP2, a client may only run these, `PING`, `QUIT` and `RESET`, as in Redis. Shard channels are a namespace of their own (one server is one shard) |
 | `PUBLISH channel message`, `SPUBLISH` | Replies how many got it; a client subscribed both by channel and by pattern gets it twice. One publishing to its own channel gets the reply, then the message, as from Redis 7.2 |
 | `PUBSUB CHANNELS [pattern]\|NUMSUB [channel ...]\|NUMPAT\|SHARDCHANNELS\|SHARDNUMSUB\|HELP` | |
@@ -224,7 +257,7 @@ was lost, by what it needs (`results.txt` has the details), against one server:
 |---|---|
 | `OBJECT ENCODING` as Redis reports it, and the `*-max-listpack-*` settings acting (50 of these are `SORT` tests that never ran: their file stops at an encoding check outside any test) | 101 |
 | `unit/scripting`'s tests after its busy-script ones, which didn't run | 42 |
-| Replication (most read what a command propagates, connected as a replica) | 35 |
+| Replication (most read what a command propagates, connected as a replica): none lost since 0.33.0, run again on its own machine, external mode | 35 |
 | `CONFIG SET appendonly` at runtime | 29 |
 | RDB files: `SAVE` without `--snapshot`, `DEBUG RELOAD` | 22 |
 | Keyspace notifications (14 pass since 0.32.0, which also sends what subscribing says to a client with `CLIENT REPLY OFF`, as Redis does) | 15 |
@@ -847,8 +880,17 @@ was lost, by what it needs (`results.txt` has the details), against one server:
   expired while the server was down are dropped at startup. The format has a
   version in its header: 2 has hashes, 3 the other collections, 4 streams
   (with their chunks as they are, so `~` trims the same after a restart), 5
-  streams' consumer groups, kept after their chunks, 6 numbered databases, and 7
-  function libraries' code. A
+  streams' consumer groups, kept after their chunks, 6 numbered databases, 7
+  function libraries' code, and 8 where the data is in a replication stream (its ID and
+  offset), saved once the server is in one (a master's replicas, or a replica's master),
+  so that a replica restarted from its snapshot, a restarted master's replicas, or a
+  master that comes back as a replica of the one that took over, continue where they
+  were instead of syncing in full. Such a save marks every shard as owing a copy of
+  itself while no write runs, as a full sync does, and writes from the copies, so
+  writes wait only while they're marked, and the file is the data at one point; the
+  copies cost as much memory again as the shards written to meanwhile (as Redis' fork
+  does). As it shuts down, it writes the data as it is. A master's place lapses if
+  anything is written before its first replica asks. A
   save writes the lowest version that holds its data (without hashes still
   1, which builds from before hashes, 0.7, can read), and every build reads
   all versions up to its own (`tests/data/v1.snapshot` was written by 0.7.0). Each shard is copied out
@@ -890,6 +932,153 @@ was lost, by what it needs (`results.txt` has the details), against one server:
   first start with `--aof` writes what the snapshot loaded as the base. To
   stop using the log, delete DIR too: if `--aof` comes back with an old log
   still there, that log loads and anything written since is gone.
+- **Replication** (`src/repl/`): Redis 7.2's protocol, both sides, so a Redis replica
+  follows Tantalum and Tantalum follows Redis (or each other, in chains). A replica sends
+  `PING`, `AUTH` with `masterauth` and `masteruser`, `REPLCONF listening-port` and `capa eof
+  psync2`, then `PSYNC replid offset`: if the master's backlog (`repl-backlog-size`, 1 MB)
+  still holds what came after `offset` in the stream with that ID (or with the ID it had
+  before a promotion, up to where that one ends), it sends just that (`+CONTINUE`);
+  otherwise the whole data as a Redis RDB file (`src/rdb_file.rs`, which reads and writes
+  every type as `DUMP` does, functions and numbered databases included) and the stream
+  from the offset that file is at (`+FULLRESYNC`). Each replica has a thread of its own,
+  which sends from the backlog where that replica is and reads its acks; a replica more
+  than 256 MB behind is dropped, as by Redis' `client-output-buffer-limit replica`.
+  - *What's propagated is what Redis propagates*, byte for byte where
+    `tools/repl-diff.py` holds the two side by side (228 cases, from every write command
+    to scripts, transactions, expiry and consumer groups; all the same but the one below): a command only if it changed
+    something, rewritten where running it again could do otherwise (`SET ... EX` and
+    `SETEX` as `SET ... PXAT`, `EXPIRE` as `PEXPIREAT`, or `DEL` if the time has passed,
+    `SPOP` as `SREM` of what it popped, `INCRBYFLOAT` as `SET ... KEEPTTL`, a blocking pop
+    as the pop it made, `XADD *` with its ID and `~` trimming as `=` what it left,
+    `XREADGROUP` as the `XCLAIM ... FORCE JUSTID LASTID` of each entry it delivered,
+    `GEOADD` as `ZADD`, a relative `RESTORE` with `ABSTTL`), an expired or evicted key
+    as a `DEL`, and what one command, script or `EXEC` did as one unit, between `MULTI`
+    and `EXEC` if it's more than one command, each after a `SELECT` when its database
+    changes. Whether a command changed anything comes from the store's notices of
+    changed keys, which commands that change nothing don't make. Where Tantalum
+    propagates more than Redis: a consumer that a group read or claim made and nothing
+    else implies goes as `XGROUP CREATECONSUMER`, so its replicas have it (Redis' don't).
+  - *It costs nothing until a replica first asks* (or this server is told to follow a
+    master). Then, as with the append-only log, every write takes a turn (the log's, if
+    it's on: one turn for both), so the stream has writes in the order they ran, each
+    unit appended to the backlog in its turn. The change is made where every write
+    looks already (one pointer every write reads), and takes hold once every I/O thread
+    has finished what it was running (a task sent to each, or a waker through a monoio
+    thread's mailbox), so no write that started before is missed. From then on, reads
+    leave expired keys they find (a read that removed one couldn't propagate it in
+    order) and remove them after their batch in a turn, as `DEL`s; active expiry runs
+    in a turn too, each key's `DEL` on its own, as from Redis. With replicas, writes
+    scale as they do with the log on (see Benchmarks); without, nothing changes. After
+    `repl-backlog-ttl` (an hour) without replicas, the stream is freed, as Redis frees its
+    backlog: writes stop taking turns, and the replication ID changes, so a replica that
+    comes back syncs in full.
+  - *The full sync's file is the data at one point of the stream*, the offset the
+    replica's reading starts from. Redis forks for that, and the kernel copies a page
+    before a write changes it; here, each shard does. While no write runs, every shard is
+    marked as owing a copy of itself (a shard's lock at a time: well under a
+    millisecond), and then writes go on. A shard makes its copy (its segments' bytes,
+    big collections cloned, big values shared) the next time anything locks it, before
+    anything can change it, or when the file's writing gets to it, and the file is
+    written from the copies, each dropped once written. Every way to a shard's data goes
+    through one guard, which looks at one count of copies owed, 0 but during a sync. On
+    a 4-vCPU VM, with 1M small keys and two collections of 100,000, a client writing
+    throughout saw its longest write take 1 ms (107 when writes waited for the whole
+    file; 11 when they waited for a copy of it all); with 4M, 7 ms. To a replica that
+    says it can (`capa eof`, as Redis' and Tantalum's do), the file is streamed as it's
+    written, between a mark it ends with, and the stream starts once the replica has
+    acked; to one that can't, it's written to memory first, to send with its length.
+    A replica loads the file as it comes (Redis' `repl-diskless-load`), a record at a
+    time, so it never holds the file: emptied first, `LOADING` until it's done, and
+    emptied again if the connection drops partway, for the next sync. A replica of
+    Redis 7.2.4 with 1M keys and a 118 MB file peaked at 166-184 MB, where it
+    peaked at 283-290 MB holding the file whole.
+  - *A replica runs what its master sends as its master ran it*: on a thread of its own,
+    in a write's turn (so its own replicas get the same bytes, at the same offsets, and
+    a full sync of one is consistent), past `maxmemory`, and with no key expiring by its
+    own clock: the master says when one goes. A key whose time had passed by the time
+    it got there stays (logically expired: reads don't see it) until the master's `DEL`,
+    as Redis' `checkAlreadyExpired` has it. A transaction counts as run, toward the
+    offset it acks and what it passes on, once its `EXEC` has, so a link that drops in
+    the middle gets it again whole; the database the stream is in carries over a
+    reconnect. Other clients get `-READONLY` for writes (scripts' too) unless it's
+    writable, `-LOADING` while the master's file loads, and see keys expire by its clock;
+    keyspace notifications, `MONITOR` and command statistics see the master's commands,
+    which take the same checked path theirs do (passing its checks).
+    `REPLICAOF NO ONE` keeps the data and goes on under a new replication ID, keeping the
+    master's as the one before with the offset it ends at, so the old master and its
+    other replicas can `PSYNC` here and continue (Redis' PSYNC2).
+  - *A writable replica* (`replica-read-only no`) runs its own clients' writes as a
+    master would, but they stay on it: they take a write's turn (so they're in its
+    append-only log), and its replicas get its master's stream, as Redis' do. The keys
+    they give a TTL are noted, after the batch, and expire by the replica's clock (the
+    master doesn't know of them); the master's keys still go only when it says, and a
+    full sync forgets the lot (Redis' `slaveKeysWithExpire`).
+  - *`FAILOVER`* holds writes as `CLIENT PAUSE WRITE` does, with nothing expiring and no
+    pings meanwhile, so the stream stands still; once a replica has acked all of it
+    (one that has acked since it synced: one that was only sent the file doesn't count),
+    this server follows it, its `PSYNC` saying `FAILOVER`, and the replica, if the
+    replication ID is its master's, takes over before it answers; the old master
+    continues from there. Checked both ways with Redis 7.2.4, each continuing the
+    other's stream (`sync_partial_ok`), and with a client writing throughout: what it
+    was told was written was there, and nothing else.
+  - `WAIT` asks replicas for their acks (`REPLCONF GETACK *`, through the stream) and
+    replies when enough have the writes made before it; `min-replicas-to-write` refuses
+    writes with `-NOREPLICAS` while too few have acked within `min-replicas-max-lag`.
+- **Sentinel** (`src/sentinel/`, `tantalum --sentinel FILE`): Redis 7.2's Sentinel, the
+  same protocol and the same steps, so Tantalum's and Redis' Sentinels watch the same
+  masters together (Redis or Tantalum), and clients find the master as they do with
+  Redis' (`SENTINEL get-master-addr-by-name`, the `+switch-master` event). FILE has Redis'
+  `sentinel.conf` directives, and is rewritten as it learns (the replicas and Sentinels
+  it found, `known-replica`/`known-sentinel`, the epochs), as Redis rewrites it. It's a
+  server of its own, which costs the data server nothing: one task owns all the state,
+  ten times a second (at a rate that varies, as Redis' does, so Sentinels don't keep
+  asking for votes at the same moment); links to each master, replica and Sentinel
+  (`PING` every second, `INFO` every ten or every second while a master is down, a
+  hello on `__sentinel__:hello` every two) hand it what they hear. A master that
+  doesn't answer for `down-after-milliseconds` is down by its account (`+sdown`); asked
+  (`SENTINEL is-master-down-by-addr`), `quorum` Sentinels agreeing make it down
+  (`+odown`); one with a majority of the votes in a new epoch picks the replica (by
+  priority, offset, run ID), sends it `SLAVEOF NO ONE` (with `CONFIG REWRITE` and
+  `CLIENT KILL TYPE normal`, in a transaction, as Redis does), points the others at it
+  `parallel-syncs` at a time, and announces it; the others take it up from its hellos,
+  and an old master that comes back is made a replica. TILT, `SENTINEL FAILOVER`,
+  `MONITOR`/`REMOVE`/`SET`/`RESET`/`CKQUORUM`/`CONFIG`/`DEBUG`/`INFO-CACHE`,
+  notification and client-reconfig scripts, `rename-command`, `requirepass`, and the
+  replies' fields and errors as Redis 7.2.4's (34 of 35 commands compared byte for byte,
+  the other fixed). Checked: three Tantalum Sentinels, and mixed with Redis' (one of
+  three and two of three), each through three failovers in a row, leaders of both
+  kinds: every Sentinel named the same new master within about a second of the 1 s
+  `down-after`, every replica had the write after, and the old master came back as a
+  replica; Redis' Sentinels manage Tantalum servers the same (`SENTINEL FAILOVER`
+  too).
+- **Cluster** (`src/cluster/`, `--cluster-enabled yes`): Redis 7.2's cluster, ported from
+  `cluster.c` step for step, over its bus's binary messages byte for byte (`wire.rs`:
+  the 2256-byte header, gossip, the extensions), so Redis and Tantalum nodes are one
+  cluster, and `redis-cli --cluster` and cluster clients work as with Redis'. Keys hash
+  to 16384 slots (CRC16, `{hash tags}`); a command whose keys aren't in this node's
+  slots gets `-MOVED slot host:port`, `-ASK` while its slot moves and the key's gone,
+  `-TRYAGAIN`, `-CROSSSLOT` or `-CLUSTERDOWN`, as `getNodeByQuery` answers, a
+  transaction's checked as it's queued and at `EXEC`; replicas answer reads after
+  `READONLY`; only database 0. Nodes gossip (`PING`/`PONG`/`MEET`), mark a node that
+  doesn't answer for `cluster-node-timeout` `PFAIL`, and `FAIL` once most masters say
+  so; a failed master's replicas hold an election (delayed by rank, by replication
+  offset), and the one with most masters' votes in a new epoch takes its slots;
+  `CLUSTER FAILOVER` hands over with writes paused until the replica has it all
+  (`FORCE`, `TAKEOVER` as Redis has them). Slots belong to whoever claims them in
+  the highest config epoch (`UPDATE` messages, epoch collisions settled by node ID); a
+  node that loses a slot with keys deletes them. `PUBLISH` reaches every node,
+  `SPUBLISH` its shard. `MIGRATE` sends `RESTORE-ASKING`. The state's kept in the
+  config file (`nodes.conf`, as Redis writes it), and a node restarted from it rejoins
+  (an old master as its successor's replica). The store isn't laid out by
+  slot: putting a key's slot in its hash cost every key's lookup, cluster or not
+  (7-8% at pipeline 16 end to end, against the same build without it), so
+  `GETKEYSINSLOT` and `COUNTKEYSINSLOT` look at every key, and outside cluster mode
+  nothing of this runs: commands take the fast path as before. Checked with `redis-cli --cluster create` (6
+  Tantalum nodes, and 3 Redis with 3 Tantalum), `reshard` (1000 slots with their keys),
+  `check`, a master killed (its replica took over in about 3 s with a 2 s node
+  timeout, either kind voting for either kind, every key there after), `CLUSTER
+  FAILOVER` with a client writing (20,000 `INCR`s, the last 20,000), and pub/sub both
+  ways between Redis and Tantalum nodes.
 - **Lock hygiene**: hashing and big-value allocations happen before locking.
   Values ≤ 16 KB are copied out under the lock; larger ones are shared by
   refcount and written with `writev` after unlocking. Freed big values are
@@ -1452,7 +1641,7 @@ hit rates share the seeding flaw described above.
   `IDLETIME`), and Unix sockets,
   without which redis-rb's tests won't start. Answers that differ: `SAVE`, `BGSAVE` and `BGREWRITEAOF`
   refuse without `--snapshot` or `--aof`, where Redis saves to its default (3), and `COMMAND LIST` has
-  the 231 commands that are here (1, which expects over 300).
+  the 240 commands that are here (1, which expects over 300).
 - **io_uring extras untried**: multishot receive and registered or provided
   buffers, which could also let idle connections hold no read buffer.
 - **Beyond 8 threads is unmeasured**: on one 32-core machine, memtier runs out
@@ -1516,7 +1705,32 @@ hit rates share the seeding flaw described above.
   set packed in its entry is decoded, changed and packed again on every
   write (`ZADD` on a 20-member sorted set ~1.5 µs). Redis edits its
   listpacks in place.
-- Replication.
+- **Consumer groups, pipelined, about 3-4% slower since 0.33.0's copy-on-write full
+  sync** in the in-process benchmark (`group_p16_ns`: `XADD`, `XREADGROUP`, `XACK`), in
+  three runs of the speed guard, where every other workload was level or faster. A
+  build without the one check that change puts on shard locks was as slow, so it's
+  where the stream code landed in the binary rather than work done; kept, as agreed,
+  for full syncs that hold writes 1 ms where they held them 107 (1M keys).
+- **Cluster gaps**: `CLUSTER GETKEYSINSLOT` and `COUNTKEYSINSLOT` look at all of a
+  node's keys (Redis keeps a list per slot): 4 and 8 ms on a node of 333,000 keys,
+  where `redis-cli --cluster reshard` moved 100 slots (6,131 keys) in 4 s; on much
+  bigger nodes moving slots slows with their size. No replica migration (a master left without replicas doesn't
+  get one from a master with more), no `cluster-port` TLS (the bus is plain), no
+  `cluster-preferred-endpoint-type` but `ip`, blocked clients (`BLPOP`, ...) aren't
+  redirected when their slot moves, and module messages are dropped.
+- **Replication gaps**: a Sentinel over TLS isn't there (its links and its
+  port are plain), nor ACL users for its own clients (`requirepass` only), and a
+  notification or client-reconfig script runs once (Redis retries one that exits 1). A replica over TLS checks its master's
+  certificate against `--tls-ca-cert-file` only (no `tls-ca-cert-dir`, no client
+  certificate of its own). A replica loads its master's file
+  as it comes, whatever `repl-diskless-load` says, so it serves `LOADING`, not its old
+  data, while a full sync's file comes (Redis' default, `disabled`, writes the file to
+  disk first and serves the old data meanwhile; `swapdb` keeps it loaded beside the new).
+  A full sync copies the master's data, shard by shard, as writes come (memory
+  up to about the data's size again, at worst, as with Redis' fork).
+  `repl-diskless-sync` and its delay are accepted and do nothing: a master streams the
+  file at once. `repl-diskless-load` and `replica-lazy-flush` take anything and do
+  nothing.
 - **`DUMP` in Redis' order but for hash tables**: a big hash or set (past 128 members)
   comes out in Tantalum's order, a list made otherwise than by appending (`LPUSH`,
   `LINSERT`, ...) with its nodes split where an appended one's would be, and a stream
@@ -1597,6 +1811,10 @@ cargo clippy --all-targets
 RUSTFLAGS=-Zsanitizer=address cargo +nightly test --lib --tests --target aarch64-apple-darwin --target-dir target/asan
 # Coverage-guided fuzzing of the parser and every command (cargo install cargo-fuzz):
 cd fuzz && cargo +nightly fuzz run commands corpus/commands seeds/commands -- -max_total_time=600
+# Replication against a real Redis: what each sends its replicas, and a master's and
+# replica's data compared key by key (either may be Redis):
+python3 tools/repl-diff.py tools/repl-cases.txt --redis 6390 --tantalum 6391
+python3 tools/repl-compare.py MASTER_PORT REPLICA_PORT
 # Speed and memory against the last commit (see CLAUDE.md), and replies against a real Redis:
 tools/speed-guard.sh
 tools/redis-diff.py commands.txt   # with redis-server on 6390 and tantalum on 6391
@@ -1621,3 +1839,15 @@ role from `ROLE`:
 
 On Railway, create a service, set its variables, and run `railway up --service <name>`.
 The results appear in the service logs.
+
+To release: set the version in `Cargo.toml` (`0.36.0`, or `0.36.0-alpha.1` for a
+pre-release), commit, and push the tag `v<version>`. `.github/workflows/release.yml` builds
+the binaries (Linux in a glibc 2.28 container, as fast as a native build; a static musl build
+was 25-70% slower), smoke-tests them, publishes the GitHub release with `SHA256SUMS` and the
+licenses of everything built in, and pushes the image to `ghcr.io`. A pull request that
+changes the release files runs the same builds without publishing.
+
+## License
+
+MIT (`LICENSE`). The C code built in from Redis 7.2.4, Lua and others keeps its own
+licenses, all permissive: `THIRD-PARTY-NOTICES.md`. Security reports: `SECURITY.md`.

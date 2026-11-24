@@ -132,13 +132,43 @@ thread_local! {
 }
 
 /// Server-wide state that connections and commands use besides the store.
+/// A thread that runs connections ([`Context::register_io_thread`]).
+#[derive(Clone)]
+pub(crate) enum IoThread {
+    /// A single-threaded tokio runtime's.
+    Tokio(tokio::runtime::Handle),
+    /// A monoio thread's, woken through its mailbox.
+    Monoio(Arc<crate::wake::Mailbox>),
+    /// A multi-threaded tokio runtime, with its number of workers.
+    Shared(tokio::runtime::Handle, usize),
+}
+
 pub struct Context {
     pub store: Arc<Store>,
     pub settings: Settings,
     /// Set when the server saves snapshots (`--snapshot`).
     pub snapshots: Option<Arc<Snapshots>>,
+    /// Cluster mode (`--cluster-enabled yes`).
+    pub cluster: Option<Arc<crate::cluster::Cluster>>,
     /// The append-only log (`--aof`), once it's taking writes.
     aof: std::sync::OnceLock<Arc<crate::aof::Aof>>,
+    /// What writes are logged to, while there's anything (the log, replicas):
+    /// a leaked `Log`, replaced when replication starts, read with one load
+    /// by every write. Null while there's nothing.
+    log: std::sync::atomic::AtomicPtr<crate::aof::Log>,
+    /// Replication: this server's IDs, the stream replicas follow, the master
+    /// it follows.
+    pub(crate) repl: crate::repl::Replication,
+    /// This context, for threads that outlive a command (replicas'): set by
+    /// the server's loops (`Context::adopt`).
+    me: OnceLock<Weak<Context>>,
+    /// The threads that run connections, to wait for until each has finished
+    /// what it was running (`Context::wait_for_io_threads`).
+    io_threads: Mutex<Vec<IoThread>>,
+    /// Held while active expiry runs, for that wait too.
+    pub(crate) expiring: Mutex<()>,
+    /// A replica is loading its master's data: commands get `-LOADING`.
+    loading: AtomicBool,
     /// Who is subscribed to what.
     pub pubsub: Arc<PubSub>,
     /// The most memory seen in use, as `INFO` reports it.
@@ -180,6 +210,8 @@ pub struct Context {
     pause: Mutex<Option<Pause>>,
     /// Whether `pause` holds one, so that the checked path's commands needn't lock it.
     paused: AtomicBool,
+    /// A `FAILOVER` holds writes back (`pause_for_failover`).
+    failover_paused: AtomicBool,
     /// `notify-keyspace-events`, as flags (see `notify.rs`).
     keyspace_events: AtomicU32,
     /// What `CONFIG SET` can change of [`Settings`].
@@ -233,6 +265,7 @@ impl Context {
             monitors: Mutex::new(Vec::new()),
             pause: Mutex::new(None),
             paused: AtomicBool::new(false),
+            failover_paused: AtomicBool::new(false),
             keyspace_events: AtomicU32::new(0),
             maxclients: AtomicUsize::new(settings.maxclients),
             timeout: AtomicU64::new(settings.timeout.map_or(0, |t| t.as_millis() as u64)),
@@ -245,7 +278,14 @@ impl Context {
             store,
             settings,
             snapshots: None,
+            cluster: None,
             aof: std::sync::OnceLock::new(),
+            log: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            repl: crate::repl::Replication::default(),
+            me: OnceLock::new(),
+            io_threads: Mutex::new(Vec::new()),
+            expiring: Mutex::new(()),
+            loading: AtomicBool::new(false),
             started: Instant::now(),
             next_client_id: AtomicU64::new(1),
             clients: Mutex::new(HashMap::new()),
@@ -409,7 +449,12 @@ impl Context {
     /// After what `special` goes by changed.
     pub(crate) fn update_special(&self) {
         let on = !self.monitors.lock().is_empty()
+            || self.repl.following()
+            || self.loading()
+            || self.repl.settings.min_replicas_to_write.load(Relaxed) > 0
             || self.pause.lock().is_some()
+            || self.failover_paused.load(Relaxed)
+            || self.cluster.is_some()
             || self.slowlog.needs_precise()
             || self.latency.threshold() != 0
             || self.stats.is_on()
@@ -560,7 +605,19 @@ impl Context {
 
     pub(crate) fn unpause_clients(&self) {
         *self.pause.lock() = None;
-        self.paused.store(false, Relaxed);
+        self.paused
+            .store(self.failover_paused.load(Relaxed), Relaxed);
+        self.update_special();
+    }
+
+    /// A `FAILOVER` holds writes back (as `CLIENT PAUSE WRITE`, but until it's
+    /// over), or lets them go.
+    pub(crate) fn pause_for_failover(&self, on: bool) {
+        let pause = self.pause.lock();
+        self.failover_paused.store(on, Relaxed);
+        self.paused
+            .store(on || pause.is_some(), std::sync::atomic::Ordering::Release);
+        drop(pause);
         self.update_special();
     }
 
@@ -621,11 +678,16 @@ impl Context {
             return None;
         }
         let mut pause = self.pause.lock();
-        let current = (*pause)?;
-        if Instant::now() < current.until {
-            return Some(current.all);
+        let failover = self.failover_paused.load(Relaxed);
+        if let Some(current) = *pause {
+            if Instant::now() < current.until {
+                return Some(current.all);
+            }
+            *pause = None;
         }
-        *pause = None;
+        if failover {
+            return Some(false);
+        }
         self.paused.store(false, Relaxed);
         drop(pause);
         self.update_special();
@@ -721,11 +783,142 @@ impl Context {
     /// Logs writes to `aof` from now on (see `aof::start`).
     pub fn set_aof(&self, aof: Arc<crate::aof::Aof>) {
         let _ = self.aof.set(aof);
+        let repl = self.log().and_then(|log| log.repl.clone());
+        self.publish_log(crate::aof::Log::new(self.aof.get().cloned(), repl));
+    }
+
+    /// What writes are logged to, if anything: every write takes a turn then.
+    #[inline]
+    pub(crate) fn log(&self) -> Option<&crate::aof::Log> {
+        let log = self.log.load(std::sync::atomic::Ordering::Acquire);
+        // SAFETY: a published log is leaked: it lives as long as the process.
+        unsafe { log.as_ref() }
+    }
+
+    /// From now on, writes go to replicas through `master` too.
+    pub(crate) fn log_to_replicas(&self, master: Arc<crate::repl::Master>) {
+        self.publish_log(crate::aof::Log::new(self.aof.get().cloned(), Some(master)));
+    }
+
+    /// Writes no longer go to replicas (the stream was freed): only to the
+    /// log, if it's on, or nowhere, so they stop taking turns.
+    pub(crate) fn stop_logging_to_replicas(&self) {
+        match self.aof.get() {
+            Some(aof) => self.publish_log(crate::aof::Log::new(Some(aof.clone()), None)),
+            None => self
+                .log
+                .store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release),
+        }
+    }
+
+    fn publish_log(&self, log: crate::aof::Log) {
+        // Leaked: commands hold it by reference without counting.
+        let log = Box::into_raw(Box::new(log));
+        self.log.store(log, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Lets threads that outlive a command have this context: called by the
+    /// server's loops, which hold it in an `Arc`.
+    pub fn adopt(self: &Arc<Self>) {
+        let _ = self.me.set(Arc::downgrade(self));
+        if let Some(snapshots) = &self.snapshots {
+            snapshots.attach(Arc::downgrade(self));
+        }
+    }
+
+    /// This context, if a server's loop runs it (see [`Context::adopt`]).
+    pub(crate) fn arc(&self) -> Option<Arc<Context>> {
+        self.me.get().and_then(Weak::upgrade)
+    }
+
+    /// A thread that runs connections, so that [`Context::wait_for_io_threads`]
+    /// waits for it.
+    pub(crate) fn register_io_thread(&self, thread: IoThread) {
+        self.io_threads.lock().push(thread);
+    }
+
+    /// Returns once every thread that runs connections, and active expiry,
+    /// has finished what it was running when this was called: once a write
+    /// that started then has ended. For a change every write must see (writes
+    /// taking turns), made just before. Not from such a thread.
+    pub(crate) fn wait_for_io_threads(&self) {
+        let threads: Vec<IoThread> = self.io_threads.lock().clone();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut expected = 0;
+        for thread in &threads {
+            match thread {
+                IoThread::Tokio(handle) => {
+                    let tx = tx.clone();
+                    handle.spawn(async move {
+                        let _ = tx.send(());
+                    });
+                    expected += 1;
+                }
+                IoThread::Monoio(mailbox) => {
+                    mailbox.call_back(tx.clone());
+                    expected += 1;
+                }
+                IoThread::Shared(handle, workers) => {
+                    // Each worker holds one of these until all have one: then
+                    // none is running anything else.
+                    let gate = Arc::new((
+                        std::sync::Mutex::new((0usize, false)),
+                        std::sync::Condvar::new(),
+                    ));
+                    for _ in 0..*workers {
+                        let (gate, tx) = (gate.clone(), tx.clone());
+                        handle.spawn(async move {
+                            let (lock, cvar) = &*gate;
+                            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            state.0 += 1;
+                            cvar.notify_all();
+                            let _ =
+                                cvar.wait_timeout_while(state, Duration::from_secs(2), |s| !s.1);
+                            let _ = tx.send(());
+                        });
+                    }
+                    let (lock, cvar) = &*gate;
+                    let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut state = cvar
+                        .wait_timeout_while(state, Duration::from_secs(2), |s| s.0 < *workers)
+                        .map_or_else(|e| e.into_inner().0, |r| r.0);
+                    state.1 = true;
+                    cvar.notify_all();
+                    expected += *workers;
+                }
+            }
+        }
+        drop(tx);
+        for _ in 0..expected {
+            if rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                break;
+            }
+        }
+        drop(self.expiring.lock());
+    }
+
+    /// A replica is loading its master's data (`true`), or done.
+    pub(crate) fn set_loading(&self, loading: bool) {
+        self.loading.store(loading, Relaxed);
+        self.update_special();
+    }
+
+    /// Whether commands get `-LOADING`.
+    #[inline]
+    pub(crate) fn loading(&self) -> bool {
+        self.loading.load(Relaxed)
     }
 
     /// The append-only log, if it's on.
     pub fn aof(&self) -> Option<&Arc<crate::aof::Aof>> {
         self.aof.get()
+    }
+
+    /// In cluster mode, this node's part (its bus started by `Cluster::start`).
+    pub fn with_cluster(mut self, cluster: Arc<crate::cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self.update_special();
+        self
     }
 
     /// Saves snapshots with `snapshots` (for `SAVE`, `BGSAVE` and `INFO`).
@@ -775,6 +968,7 @@ impl Context {
                     outbox: std::sync::Weak::new(),
                     kept: None,
                     tracker: None,
+                    replica: false,
                 },
             );
         }
@@ -826,11 +1020,42 @@ impl Context {
             .clients
             .lock()
             .iter()
-            .filter(|(_, client)| client.pubsub == pubsub)
+            .filter(|(_, client)| client.pubsub == pubsub && !client.replica)
             .map(|(&id, _)| id)
             .collect();
         ids.sort_unstable();
         ids
+    }
+
+    /// The replicas' client ids, for `CLIENT LIST TYPE replica`.
+    pub(crate) fn replica_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .clients
+            .lock()
+            .iter()
+            .filter(|(_, client)| client.replica)
+            .map(|(&id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Connection `id` is a replica's from now on (`SYNC`, `PSYNC`): its
+    /// thread has the socket, and the connection stays listed until
+    /// [`Context::forget_replica`].
+    pub(crate) fn hand_to_replica(&self, id: u64, command: &'static str) {
+        if let Some(client) = self.clients.lock().get_mut(&id) {
+            client.replica = true;
+            client.last_command = Some(command);
+        }
+    }
+
+    /// A replica's thread has ended.
+    pub(crate) fn forget_replica(&self, id: u64) {
+        let gone = self.clients.lock().remove(&id);
+        if let Some(client) = gone {
+            close(client.dup);
+        }
     }
 
     /// `CLIENT KILL`: closes the connections it picks, but for `me`'s own,
@@ -960,6 +1185,7 @@ impl Context {
             laddr: None,
             id: 0,
             pubsub: None,
+            replica: None,
             none: false,
             skip_me: true,
             user: Some(name),
@@ -995,6 +1221,7 @@ impl Context {
                     laddr: None,
                     id,
                     pubsub: None,
+                    replica: None,
                     none: false,
                     skip_me: true,
                     user: None,
@@ -1115,6 +1342,7 @@ impl Client<'_> {
             reply: ReplyMode::On,
             no_evict: false,
             no_touch: false,
+            cluster: 0,
             monitor: None,
             peer: None,
             commands: 0,
@@ -1151,7 +1379,15 @@ impl Client<'_> {
 impl Drop for Client<'_> {
     fn drop(&mut self) {
         self.report(0);
-        let gone = self.ctx.clients.lock().remove(&self.id);
+        let gone = {
+            let mut clients = self.ctx.clients.lock();
+            // A replica's thread has it now (`Context::forget_replica`).
+            if clients.get(&self.id).is_some_and(|c| c.replica) {
+                None
+            } else {
+                clients.remove(&self.id)
+            }
+        };
         if let Some(client) = gone {
             close(client.dup);
             if let Some(tracker) = &client.tracker {
@@ -1190,6 +1426,9 @@ pub(crate) struct Registered {
     kept: Option<Arc<Subscriber>>,
     /// Its tracking, once it has turned it on, for `CLIENT LIST`.
     pub(crate) tracker: Option<Arc<crate::tracking::Tracker>>,
+    /// A replica, whose socket a thread of its own has now (`PSYNC`): it stays
+    /// listed after its connection's task ends, until that thread's does.
+    pub(crate) replica: bool,
 }
 
 fn new_run_id() -> String {
@@ -1237,6 +1476,8 @@ pub(crate) struct KillFilter<'a> {
     pub(crate) id: u64,
     /// Subscribed or not; `None` for either.
     pub(crate) pubsub: Option<bool>,
+    /// A replica or not; `None` for either.
+    pub(crate) replica: Option<bool>,
     /// A kind of client there's none of here: replicas, a master.
     pub(crate) none: bool,
     pub(crate) skip_me: bool,
@@ -1249,7 +1490,11 @@ impl KillFilter<'_> {
         if self.none || (self.skip_me && id == me) || (self.id != 0 && self.id != id) {
             return false;
         }
-        if self.pubsub.is_some_and(|pubsub| pubsub != client.pubsub) {
+        if self.pubsub.is_some_and(|pubsub| pubsub != client.pubsub)
+            || self
+                .replica
+                .is_some_and(|replica| replica != client.replica)
+        {
             return false;
         }
         if self
@@ -1313,6 +1558,9 @@ fn client_line(
     let subscriptions = session.and_then(|s| s.pubsub.as_deref());
     let count = |to| subscriptions.map_or(0, |s| s.count_of(to));
     let mut flags = String::new();
+    if client.replica {
+        flags.push('S');
+    }
     if client.pubsub {
         flags.push('P');
     }
@@ -1399,6 +1647,8 @@ pub struct Session {
     pub(crate) reply: ReplyMode,
     pub(crate) no_evict: bool,
     pub(crate) no_touch: bool,
+    /// Cluster mode's `ASKING` and `READONLY` (`cluster::ASKING`, ...).
+    pub(crate) cluster: u8,
     /// Its outbox, if it's run `MONITOR`.
     pub(crate) monitor: Option<Arc<Subscriber>>,
     /// Its address, once something's wanted it.
@@ -1455,6 +1705,7 @@ impl Session {
             reply: ReplyMode::On,
             no_evict: false,
             no_touch: false,
+            cluster: 0,
             monitor: None,
             peer: None,
             commands: 0,

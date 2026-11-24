@@ -3,7 +3,7 @@
 mod acl;
 mod admin;
 mod bit;
-mod dump;
+pub(crate) mod dump;
 pub(crate) use dump::MigrateSockets;
 mod eval;
 mod function;
@@ -256,6 +256,10 @@ static COMMANDS: &[Command] = &[
     Command { name: "role", arity: 1, flags: &["noscript", "loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: admin::role },
     Command { name: "replicaof", arity: 3, flags: &["admin", "noscript", "stale", "no_async_loading"], fast: false, keys: NO_KEYS, run: admin::replicaof },
     Command { name: "slaveof", arity: 3, flags: &["admin", "noscript", "stale", "no_async_loading"], fast: false, keys: NO_KEYS, run: admin::replicaof },
+    Command { name: "failover", arity: -1, flags: &["admin", "noscript", "stale"], fast: false, keys: NO_KEYS, run: admin::failover },
+    Command { name: "sync", arity: 1, flags: &["admin", "noscript", "no_async_loading", "no_multi"], fast: false, keys: NO_KEYS, run: crate::repl::master::sync },
+    Command { name: "psync", arity: -3, flags: &["admin", "noscript", "no_async_loading", "no_multi"], fast: false, keys: NO_KEYS, run: crate::repl::master::sync },
+    Command { name: "replconf", arity: -1, flags: &["admin", "noscript", "loading", "stale", "allow_busy"], fast: false, keys: NO_KEYS, run: crate::repl::master::replconf },
     Command { name: "lolwut", arity: -1, flags: &["readonly", "fast"], fast: true, keys: NO_KEYS, run: admin::lolwut },
     Command { name: "module", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::module },
     Command { name: "latency", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: admin::latency },
@@ -265,6 +269,11 @@ static COMMANDS: &[Command] = &[
     Command { name: "object", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: keys::object },
     Command { name: "dump", arity: 2, flags: &["readonly"], fast: false, keys: ONE_KEY, run: dump::dump },
     Command { name: "restore", arity: -4, flags: &["write", "denyoom"], fast: false, keys: ONE_KEY, run: dump::restore },
+    Command { name: "restore-asking", arity: -4, flags: &["write", "denyoom", "asking"], fast: false, keys: ONE_KEY, run: dump::restore },
+    Command { name: "cluster", arity: -2, flags: &[], fast: false, keys: NO_KEYS, run: cluster_command },
+    Command { name: "asking", arity: 1, flags: &["fast"], fast: true, keys: NO_KEYS, run: asking },
+    Command { name: "readonly", arity: 1, flags: &["loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: readonly },
+    Command { name: "readwrite", arity: 1, flags: &["loading", "stale", "fast"], fast: true, keys: NO_KEYS, run: readwrite },
     Command { name: "migrate", arity: -6, flags: &["write", "movablekeys"], fast: false, keys: (3, 3, 1), run: dump::migrate },
     Command { name: "hget", arity: 3, flags: &["readonly", "fast"], fast: true, keys: ONE_KEY, run: hash::hget },
     Command { name: "hset", arity: -4, flags: &["write", "denyoom", "fast"], fast: true, keys: ONE_KEY, run: hash::hset },
@@ -407,7 +416,7 @@ pub fn execute(
             return get(ctx, session, now, args, out);
         }
         if args.len() >= 3 && name.eq_ignore_ascii_case(b"SET") {
-            return match ctx.aof() {
+            return match ctx.log() {
                 None => set(ctx, session, now, args, out),
                 Some(_) => set_logged(ctx, session, now, args, out),
             };
@@ -416,7 +425,7 @@ pub fn execute(
     execute_checked(ctx, session, now, args, out)
 }
 
-/// `SET` on the fast path, with the log on.
+/// `SET` on the fast path, with the log on or replicas following.
 #[inline(never)]
 fn set_logged(
     ctx: &Context,
@@ -425,8 +434,8 @@ fn set_logged(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    match ctx.aof() {
-        Some(aof) if !aof.failing() => logged(ctx, session, aof, set_command(), args, out),
+    match ctx.log() {
+        Some(log) if !log.failing() => logged(ctx, session, log, set_command(), args, out),
         _ => execute_checked(ctx, session, now, args, out),
     }
 }
@@ -490,7 +499,22 @@ fn execute_checked(
         return Reply::Written;
     }
     if !session.unrestricted {
-        if session.special && held_back(ctx, session, command) {
+        if session.special
+            && let Some(cluster) = &ctx.cluster
+            && !crate::repl::applying()
+            && !cluster_serves(ctx, cluster, session, command, args, out)
+        {
+            refuse_in_multi(session);
+            return Reply::Written;
+        }
+        if session.special
+            && let Some(error) = refused_on_replica(ctx, session, command)
+        {
+            resp::write_error(out, error);
+            refuse_in_multi(session);
+            return Reply::Written;
+        }
+        if session.special && held_back(ctx, session, command) && !crate::repl::applying() {
             session.commands -= 1;
             return Reply::Paused;
         }
@@ -508,6 +532,7 @@ fn execute_checked(
         if session.special
             && let Some(busy) = ctx.scripting.busy_error(ctx)
             && !allowed_when_busy(command, args)
+            && !crate::repl::applying()
         {
             resp::write_error(out, busy);
             refuse_in_multi(session);
@@ -571,6 +596,193 @@ fn checked_first(
     None
 }
 
+/// Cluster mode: whether this node serves the command's keys (a
+/// transaction's, for `EXEC`); if not, writes where to go (`-MOVED`, ...).
+#[cold]
+#[inline(never)]
+fn cluster_serves(
+    ctx: &Context,
+    cluster: &crate::cluster::Cluster,
+    session: &mut Session,
+    command: &Command,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> bool {
+    let asking_cmd = command.name == "asking";
+    let served = if command.name == "exec" {
+        match &session.multi {
+            None => true,
+            Some(queue) => {
+                let commands: Vec<Args<'_>> = (0..queue.len()).map(|i| queue.command(i)).collect();
+                let queries: Vec<crate::cluster::Query<'_>> = commands
+                    .iter()
+                    .filter_map(|a| find_command(a.get(0)).map(|c| cluster_query(c, a)))
+                    .collect();
+                route_queries(ctx, cluster, session, &queries, out)
+            }
+        }
+    } else if command.keys == NO_KEYS && !command.flags.contains(&"movablekeys") {
+        true
+    } else {
+        // (Queued in a transaction too: checked as it's queued, as Redis
+        // does, and again at EXEC.)
+        let queries = [cluster_query(command, args)];
+        route_queries(ctx, cluster, session, &queries, out)
+    };
+    if !asking_cmd && session.multi.is_none() {
+        session.cluster &= !crate::cluster::ASKING;
+    }
+    served
+}
+
+fn route_queries(
+    ctx: &Context,
+    cluster: &crate::cluster::Cluster,
+    session: &Session,
+    queries: &[crate::cluster::Query<'_>],
+    out: &mut Vec<u8>,
+) -> bool {
+    let store = &ctx.store;
+    let now = store.now();
+    crate::cluster::route(
+        cluster,
+        session,
+        queries,
+        |key| update(store, store.key(key), now, |c| (Update::Peek, c.is_some())),
+        out,
+    )
+}
+
+/// A command's keys, as the cluster sees them.
+fn cluster_query<'a>(command: &Command, args: &Args<'a>) -> crate::cluster::Query<'a> {
+    let n = args.len() as i32;
+    let mut keys = Vec::new();
+    if command.flags.contains(&"movablekeys") {
+        let argv: Vec<&[u8]> = (0..args.len()).map(|i| args.get(i)).collect();
+        if let Ok(found) = crate::command_table::keys_of(&argv) {
+            for (pos, _) in found {
+                if pos < args.len() {
+                    keys.push(args.get(pos));
+                }
+            }
+        }
+    } else {
+        let (first, last, step) = command.keys;
+        if first > 0 && step > 0 {
+            let last = if last < 0 { n + last } else { last.min(n - 1) };
+            let mut i = first;
+            while i <= last && i < n {
+                keys.push(args.get(i as usize));
+                i += step;
+            }
+        }
+    }
+    crate::cluster::Query {
+        writes: command.writes(),
+        keys,
+        migrate: command.name == "migrate",
+        pubsub_shard: matches!(command.name, "ssubscribe" | "sunsubscribe" | "spublish"),
+        asking: command.name == "restore-asking",
+    }
+}
+
+fn cluster_command(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    args: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::cluster(ctx, session, args, out)
+}
+
+fn asking(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::asking(ctx, session, out)
+}
+
+fn readonly(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::readonly(ctx, session, out)
+}
+
+fn readwrite(
+    ctx: &Context,
+    session: &mut Session,
+    _: Millis,
+    _: &Args<'_>,
+    out: &mut Vec<u8>,
+) -> Reply {
+    crate::cluster::command::readwrite(ctx, session, out)
+}
+
+/// On a replica: what Redis refuses there, while it loads its master's data
+/// (`-LOADING`), and writes (`-READONLY`), from any client but its master.
+/// And on a master with `min-replicas-to-write`: writes while fewer replicas
+/// than that have acknowledged within `min-replicas-max-lag` (`-NOREPLICAS`).
+#[cold]
+fn refused_on_replica(
+    ctx: &Context,
+    session: &Session,
+    command: &Command,
+) -> Option<&'static [u8]> {
+    // A replica's master runs anything, whatever else waits.
+    if crate::repl::applying() {
+        return None;
+    }
+    if ctx.loading() && !command.flags.contains(&"loading") {
+        return Some(b"LOADING Redis is loading the dataset in memory");
+    }
+    let following = ctx.repl.following();
+    let needed = ctx
+        .repl
+        .settings
+        .min_replicas_to_write
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if !following && needed == 0 {
+        return None;
+    }
+    let writes = command.writes()
+        || (command.name == "exec"
+            && session.multi.as_ref().is_some_and(|queue| {
+                (0..queue.len()).any(|i| find_write_command(queue.command(i).get(0)).is_some())
+            }));
+    if !writes {
+        return None;
+    }
+    if following {
+        if !ctx
+            .repl
+            .settings
+            .read_only
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
+        return Some(b"READONLY You can't write against a read only replica.");
+    }
+    let lag = ctx
+        .repl
+        .settings
+        .min_replicas_max_lag
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let good = ctx
+        .repl
+        .master()
+        .map_or(0, |master| master.good_replicas(lag));
+    (good < needed).then_some(b"NOREPLICAS Not enough good replicas to write.")
+}
+
 /// What runs while a script has run too long (Redis' `allow_busy` flag).
 fn allowed_when_busy(command: &Command, args: &Args<'_>) -> bool {
     let sub = |name: &[u8]| args.len() > 1 && args.get(1).eq_ignore_ascii_case(name);
@@ -593,15 +805,16 @@ fn dispatch(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
-    if let Some(aof) = ctx.aof()
+    if let Some(log) = ctx.log()
         && (command.writes()
             || matches!(
                 command.name,
                 "eval" | "evalsha" | "exec" | "fcall" | "fcall_ro"
             )
-            || (command.name == "function" && function::writes(args)))
+            || (command.name == "function" && function::writes(args))
+            || (log.repl.is_some() && crate::repl::propagate::takes_turn(command.name)))
     {
-        return logged(ctx, session, aof, command, args, out);
+        return logged(ctx, session, log, command, args, out);
     }
     let reply = timed(ctx, session, now, command, args, out);
     if ctx.store.has_ready() {
@@ -947,9 +1160,37 @@ pub fn spawn_expirer(
                 let Some(ctx) = ctx.upgrade() else { break };
                 let now = ctx.store.now();
                 // As in Redis, what's paused doesn't change by itself meanwhile.
-                if ctx.pause_mode().is_none() && ctx.active_expire() && !ctx.cron_paused() {
-                    for db in ctx.store.live() {
-                        db.expire_cycle(now);
+                // A replica's keys go when its master says.
+                // But for a writable replica's own (Redis' `expireSlaveKeys`).
+                if ctx.repl.following()
+                    && ctx.pause_mode().is_none()
+                    && !ctx.cron_paused()
+                    && ctx.repl.any_written_here()
+                {
+                    let _expiring = ctx.expiring.lock();
+                    ctx.repl.expire_written_here(&ctx);
+                }
+                if ctx.pause_mode().is_none()
+                    && ctx.active_expire()
+                    && !ctx.cron_paused()
+                    && !ctx.repl.following()
+                {
+                    let _expiring = ctx.expiring.lock();
+                    match ctx.log() {
+                        // While replicas follow, what expires is propagated, each
+                        // key on its own, as from Redis' active expiry.
+                        Some(log) if log.repl.is_some() => {
+                            let turn = log.turn(&ctx.store, false, 0);
+                            crate::repl::propagate::alone();
+                            for db in ctx.store.live() {
+                                db.expire_cycle(turn.now);
+                            }
+                        }
+                        _ => {
+                            for db in ctx.store.live() {
+                                db.expire_cycle(now);
+                            }
+                        }
                     }
                 }
                 ctx.note_memory_peak();
@@ -968,9 +1209,10 @@ pub fn spawn_expirer(
 /// a write (a write serves them in its turn). Their commands write: with
 /// the append-only log on, they take a turn too, so they're logged, in order.
 fn serve_ready(ctx: &Context, now: Millis) {
-    match ctx.aof() {
-        Some(aof) => {
-            let turn = aof.turn(false, 0);
+    match ctx.log() {
+        Some(_) if crate::aof::logging() => crate::blocking::serve_ready(ctx, now),
+        Some(log) => {
+            let turn = log.turn(&ctx.store, false, 0);
             crate::blocking::serve_ready(ctx, turn.now);
         }
         None => crate::blocking::serve_ready(ctx, now),
@@ -1014,13 +1256,15 @@ fn refused_unlogged(
     true
 }
 
-/// [`execute`] for a command that may write, with the append-only log on:
-/// in a write turn, at the time the turn comes, logging what it did (a
-/// script's or transaction's writes as a group).
+/// [`execute`] for a command that may write, with the append-only log on or
+/// replicas following: in a write turn, at the time the turn comes, logging
+/// what it did (a script's or transaction's writes as a group) and
+/// propagating it. A replica applying its master's commands takes the turn
+/// itself, around each (`repl/replica.rs`), so it runs in that one.
 fn logged(
     ctx: &Context,
     session: &mut Session,
-    aof: &crate::aof::Aof,
+    log: &crate::aof::Log,
     command: &Command,
     args: &Args<'_>,
     out: &mut Vec<u8>,
@@ -1028,23 +1272,30 @@ fn logged(
     // Scripts and transactions log their commands' writes, and MSET its
     // pairs, as a group.
     let grouped = !command.writes() || matches!(command.name, "mset" | "msetnx");
-    let mut turn = aof.turn(grouped, session.db);
-    let now = turn.now;
+    let mut turn = (!crate::aof::logging()).then(|| log.turn(&ctx.store, grouped, session.db));
+    let now = match &turn {
+        Some(turn) => turn.now,
+        None => crate::aof::turn_now().unwrap_or_else(|| ctx.store.now()),
+    };
     let start = out.len();
     let reply = timed(ctx, session, now, command, args, out);
+    let bulk;
+    let written = match &reply {
+        Reply::Bulk(value) => {
+            bulk = value.as_bytes();
+            bulk
+        }
+        _ => &out[start..],
+    };
     // A blocked command is logged when it's served.
     if !grouped && !matches!(reply, Reply::Block(_)) {
-        let bulk;
-        let written = match &reply {
-            Reply::Bulk(value) => {
-                bulk = value.as_bytes();
-                bulk
-            }
-            _ => &out[start..],
-        };
         crate::aof::record(command.name, args, written);
+    } else if log.repl.is_some() && !matches!(reply, Reply::Block(_)) {
+        crate::repl::propagate::grouped(command.name, args, written);
     }
-    turn.end_group();
+    if let Some(turn) = &mut turn {
+        turn.end_group();
+    }
     if ctx.store.has_ready() {
         crate::blocking::serve_ready(ctx, now);
     }
@@ -1449,7 +1700,7 @@ fn mset(
         .step_by(2)
         .map(|i| args.key_at(store, i))
         .collect();
-    let logged = ctx.aof().is_some();
+    let logged = crate::aof::logging();
     for (i, &key) in keys.iter().enumerate() {
         if keys.len() > 1 {
             store.prefetch_ahead(i, |j| keys.get(j).map(Key::hash));
@@ -2033,6 +2284,13 @@ fn select(
     args: &Args<'_>,
     out: &mut Vec<u8>,
 ) -> Reply {
+    if ctx.cluster.is_some()
+        && let Some(index) = resp::parse_int(args.get(1))
+        && index != 0
+    {
+        resp::write_error(out, b"ERR SELECT is not allowed in cluster mode");
+        return Reply::Written;
+    }
     if let Some(index) = db_index(ctx, args.get(1), out) {
         session.select(ctx, index);
         crate::aof::select(index as usize);
@@ -2202,7 +2460,12 @@ fn hello(
     resp::write_integer(out, if resp3 { 3 } else { 2 });
     resp::write_bulk(out, b"id");
     resp::write_integer(out, session.id as i64);
-    for (field, value) in [("mode", "standalone"), ("role", "master")] {
+    let role = if ctx.repl.following() {
+        "replica"
+    } else {
+        "master"
+    };
+    for (field, value) in [("mode", "standalone"), ("role", role)] {
         resp::write_bulk(out, field.as_bytes());
         resp::write_bulk(out, value.as_bytes());
     }
@@ -2452,6 +2715,7 @@ fn client_kill(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
         laddr: None,
         id: 0,
         pubsub: None,
+        replica: None,
         none: false,
         skip_me: true,
         user: None,
@@ -2489,9 +2753,12 @@ fn client_kill(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
                 let kind = |name: &[u8]| value.eq_ignore_ascii_case(name);
                 if kind(b"NORMAL") {
                     filter.pubsub = Some(false);
+                    filter.replica = Some(false);
                 } else if kind(b"PUBSUB") {
                     filter.pubsub = Some(true);
-                } else if kind(b"MASTER") || kind(b"REPLICA") || kind(b"SLAVE") {
+                } else if kind(b"REPLICA") || kind(b"SLAVE") {
+                    filter.replica = Some(true);
+                } else if kind(b"MASTER") {
                     filter.none = true;
                 } else {
                     let mut msg = b"ERR Unknown client type '".to_vec();
@@ -2554,7 +2821,14 @@ fn client_list(ctx: &Context, session: &Session, args: &Args<'_>, out: &mut Vec<
             } else {
                 ctx.client_lines(session, &ids, "client|list")
             }
-        } else if is(b"MASTER") || is(b"REPLICA") || is(b"SLAVE") {
+        } else if is(b"REPLICA") || is(b"SLAVE") {
+            let ids = ctx.replica_ids();
+            if ids.is_empty() {
+                Vec::new()
+            } else {
+                ctx.client_lines(session, &ids, "client|list")
+            }
+        } else if is(b"MASTER") {
             Vec::new()
         } else {
             let mut msg = b"ERR Unknown client type '".to_vec();
@@ -3041,7 +3315,8 @@ fn info(
         let _ = write!(
             s,
             "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\n\
-             rejected_connections:{}\r\nexpired_keys:{}\r\nevicted_keys:{}\r\nevicted_clients:0\r\n\
+             rejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\n\
+             expired_keys:{}\r\nevicted_keys:{}\r\nevicted_clients:0\r\n\
              keyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\n\
              pubsubshard_channels:{}\r\nmigrate_cached_sockets:{}\r\n\
              tracking_total_keys:{}\r\ntracking_total_items:{}\r\ntracking_total_prefixes:{}\r\n\
@@ -3051,6 +3326,18 @@ fn info(
             server.total_connections,
             server.total_commands,
             server.rejected_connections,
+            ctx.repl
+                .syncs
+                .full
+                .load(std::sync::atomic::Ordering::Relaxed),
+            ctx.repl
+                .syncs
+                .partial_ok
+                .load(std::sync::atomic::Ordering::Relaxed),
+            ctx.repl
+                .syncs
+                .partial_err
+                .load(std::sync::atomic::Ordering::Relaxed),
             stats.expired_keys,
             stats.evicted_keys,
             server.keyspace_hits,
@@ -3072,14 +3359,7 @@ fn info(
         );
     }
     if wants("replication", true) {
-        let _ = write!(
-            s,
-            "# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_failover_state:no-failover\r\n\
-             master_replid:{}\r\nmaster_replid2:0000000000000000000000000000000000000000\r\n\
-             master_repl_offset:0\r\nsecond_repl_offset:-1\r\nrepl_backlog_active:0\r\n\
-             repl_backlog_size:1048576\r\nrepl_backlog_first_byte_offset:0\r\nrepl_backlog_histlen:0\r\n\r\n",
-            ctx.run_id(),
-        );
+        s.push_str(&crate::repl::info(ctx));
     }
     if wants("cpu", true) {
         let (user, system) = cpu_seconds();
@@ -3108,7 +3388,11 @@ fn info(
         s.push_str("\r\n");
     }
     if wants("cluster", true) {
-        s.push_str("# Cluster\r\ncluster_enabled:0\r\n\r\n");
+        s.push_str(if ctx.cluster.is_some() {
+            "# Cluster\r\ncluster_enabled:1\r\n\r\n"
+        } else {
+            "# Cluster\r\ncluster_enabled:0\r\n\r\n"
+        });
     }
     if wants("keyspace", true) {
         s.push_str("# Keyspace\r\n");
@@ -3197,8 +3481,8 @@ fn rss_bytes() -> Option<usize> {
 }
 
 const OOM: &[u8] = b"OOM command not allowed when used memory > 'maxmemory'.";
-const NOT_AN_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
-const SYNTAX_ERROR: &[u8] = b"ERR syntax error";
+pub(crate) const NOT_AN_INTEGER: &[u8] = b"ERR value is not an integer or out of range";
+pub(crate) const SYNTAX_ERROR: &[u8] = b"ERR syntax error";
 const WRONGTYPE: &[u8] = b"WRONGTYPE Operation against a key holding the wrong kind of value";
 const INVALID_CURSOR: &[u8] = b"ERR invalid cursor";
 const WRONGPASS: &[u8] = b"WRONGPASS invalid username-password pair or user is disabled.";

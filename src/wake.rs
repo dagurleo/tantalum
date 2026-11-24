@@ -63,6 +63,20 @@ impl Mailbox {
         }
     }
 
+    /// Sends on `done` from its own thread, once it gets to it: between its
+    /// tasks' runs, so that what any was running has finished.
+    pub(crate) fn call_back(&self, done: std::sync::mpsc::Sender<()>) {
+        struct Done(Mutex<Option<std::sync::mpsc::Sender<()>>>);
+        impl std::task::Wake for Done {
+            fn wake(self: Arc<Self>) {
+                if let Some(done) = self.0.lock().take() {
+                    let _ = done.send(());
+                }
+            }
+        }
+        self.send(Waker::from(Arc::new(Done(Mutex::new(Some(done))))));
+    }
+
     /// On its own thread, after the bell rang: wakes what was sent.
     pub fn deliver(&self) {
         let wakers = std::mem::take(&mut *self.wakers.lock());

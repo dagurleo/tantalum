@@ -242,7 +242,7 @@ impl Header {
     }
 
     pub fn is_expired(&self, now: Millis) -> bool {
-        self.deadline != 0 && self.deadline <= now
+        self.deadline != 0 && self.deadline <= now && !expiry_suspended()
     }
 
     pub fn usage(&self) -> u8 {
@@ -530,4 +530,24 @@ mod tests {
         assert_eq!(usage(with_usage(flags, 9)), MAX_USAGE);
         assert_eq!(usage(flags | DEAD), 2);
     }
+}
+
+thread_local! {
+    /// On a replica's thread applying its master's commands: no key expires by
+    /// this server's clock, as the master says when a key goes (with a `DEL`),
+    /// and a key its clock had expired is one the master may still be using.
+    static EXPIRY_SUSPENDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether keys don't expire on this thread (see [`suspend_expiry`]). Read only
+/// once a deadline has passed.
+#[cold]
+pub(crate) fn expiry_suspended() -> bool {
+    EXPIRY_SUSPENDED.get()
+}
+
+/// For the thread that applies a master's commands on a replica: from now on,
+/// no key expires on it (see `EXPIRY_SUSPENDED`).
+pub(crate) fn suspend_expiry() {
+    EXPIRY_SUSPENDED.set(true);
 }

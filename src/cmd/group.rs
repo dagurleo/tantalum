@@ -147,14 +147,52 @@ fn serve_stream(
         let (consumer, created) = group.consumer(request.consumer, request.now);
         group.consumer_mut(consumer).seen_time = request.now;
         if after == StreamId::MAX {
+            let propagating = crate::repl::propagate::active();
+            let mut delivered = Vec::new();
             let n = stream.deliver(
                 group,
                 consumer,
                 request.count,
                 request.noack,
                 request.now,
-                |entry| write_entry(&mut entries, entry),
+                |entry| {
+                    if propagating {
+                        delivered.push(entry.id);
+                    }
+                    write_entry(&mut entries, entry)
+                },
             );
+            if propagating && n > 0 {
+                // As Redis propagates a read: each entry it delivered as its
+                // claim, or with NOACK, where the group has read to.
+                if request.noack {
+                    if created {
+                        crate::repl::propagate::xgroup_createconsumer(
+                            key,
+                            request.group,
+                            request.consumer,
+                        );
+                    }
+                    crate::repl::propagate::xgroup_setid(
+                        key,
+                        request.group,
+                        group.last_id,
+                        group.entries_read,
+                    );
+                } else {
+                    for id in delivered {
+                        crate::repl::propagate::xclaim(
+                            key,
+                            request.group,
+                            request.consumer,
+                            id,
+                            request.now,
+                            1,
+                            id,
+                        );
+                    }
+                }
+            }
             return (n, n > 0, created);
         }
         // Its own history. (Only the largest ID has no next: it's taken for `>`.)
@@ -355,6 +393,7 @@ fn xreadgroup_attempt(
         return Attempt::Done;
     }
     // Nothing is logged for this read, so a consumer it made is by itself.
+    // (Redis propagates nothing for it, and its replicas go without.)
     for at in created {
         aof::record_parts(
             [
@@ -898,10 +937,46 @@ fn parse_claim(args: &Args<'_>, now: i64) -> Result<Claim, Vec<u8>> {
 }
 
 /// The consumer `name`, made if need be, as just seen.
-fn seen_consumer(group: &mut Group, name: &[u8], now: i64) -> ConsumerId {
-    let (consumer, _) = group.consumer(name, now);
+/// A pending entry gone from the stream, which a claim takes out of the
+/// pending lists: propagated as Redis does, as its claim by its owner.
+fn propagate_gone(
+    key: &[u8],
+    group: &Group,
+    group_name: &[u8],
+    id: StreamId,
+    delivered: i64,
+    deliveries: i64,
+) {
+    if crate::repl::propagate::active()
+        && let Some(pending) = group.pending().get(id)
+    {
+        crate::repl::propagate::xclaim(
+            key,
+            group_name,
+            group.owner(pending),
+            id,
+            delivered,
+            deliveries,
+            group.last_id,
+        );
+    }
+}
+
+/// The consumer named, made if there's none, as just seen. And whether it
+/// was made.
+fn seen_consumer(group: &mut Group, name: &[u8], now: i64) -> (ConsumerId, bool) {
+    let (consumer, created) = group.consumer(name, now);
     group.consumer_mut(consumer).seen_time = now;
-    consumer
+    (consumer, created)
+}
+
+/// A consumer a claim made, if it claimed nothing (else its claims make it):
+/// propagated, so that replicas have it. (Redis propagates nothing for it,
+/// and its replicas go without.)
+fn propagate_made(key: &[u8], group: &[u8], consumer: &[u8], created: bool, claimed: usize) {
+    if created && claimed == 0 {
+        crate::repl::propagate::xgroup_createconsumer(key, group, consumer);
+    }
 }
 
 /// Adds entry `id` to a claim's reply.
@@ -944,7 +1019,7 @@ pub(super) fn xclaim(
             if claim.last_id > group.last_id {
                 group.last_id = claim.last_id;
             }
-            let consumer = seen_consumer(group, args.get(3), time);
+            let (consumer, created) = seen_consumer(group, args.get(3), time);
             let mut body = Vec::new();
             let mut n = 0;
             for &id in &claim.ids {
@@ -954,7 +1029,8 @@ pub(super) fn xclaim(
                     .map(|p| (p.delivery_time, p.delivery_count));
                 // Gone from the stream: gone from the pending lists too.
                 if !stream.has_entry(id) {
-                    if pending.is_some() {
+                    if let Some((delivered, deliveries)) = pending {
+                        propagate_gone(key_name, group, group_name, id, delivered, deliveries);
                         group.acknowledge(id);
                     }
                     continue;
@@ -978,10 +1054,20 @@ pub(super) fn xclaim(
                     deliveries.wrapping_add(1)
                 };
                 group.reassign(id, consumer, claim.delivery, deliveries);
+                crate::repl::propagate::xclaim(
+                    key_name,
+                    group_name,
+                    args.get(3),
+                    id,
+                    claim.delivery,
+                    deliveries,
+                    group.last_id,
+                );
                 write_claimed(&mut body, stream, id, claim.just_id);
                 n += 1;
                 group.consumer_mut(consumer).active_time = time;
             }
+            propagate_made(key_name, group_name, args.get(3), created, n);
             let mut reply = Vec::with_capacity(body.len() + 16);
             resp::write_array_header(&mut reply, n);
             reply.extend_from_slice(&body);
@@ -1061,7 +1147,7 @@ pub(super) fn xautoclaim(
             );
         }
         let reply = stream.with_group(group_name, |stream, group| {
-            let consumer = seen_consumer(group, args.get(3), time);
+            let (consumer, created) = seen_consumer(group, args.get(3), time);
             let mut left = count;
             let mut attempts = count.saturating_mul(10);
             let mut from = Some(start);
@@ -1079,6 +1165,7 @@ pub(super) fn xautoclaim(
                 from = id.next();
                 // Gone from the stream: gone from the pending lists too.
                 if !stream.has_entry(id) {
+                    propagate_gone(key_name, group, group_name, id, delivered, deliveries);
                     group.acknowledge(id);
                     deleted.push(id);
                     left -= 1;
@@ -1093,11 +1180,21 @@ pub(super) fn xautoclaim(
                     deliveries.wrapping_add(1)
                 };
                 group.reassign(id, consumer, time, deliveries);
+                crate::repl::propagate::xclaim(
+                    key_name,
+                    group_name,
+                    args.get(3),
+                    id,
+                    time,
+                    deliveries,
+                    group.last_id,
+                );
                 write_claimed(&mut body, stream, id, just_id);
                 n += 1;
                 left -= 1;
                 group.consumer_mut(consumer).active_time = time;
             }
+            propagate_made(key_name, group_name, args.get(3), created, n);
             let next = from
                 .and_then(|at| group.pending().first_from(at))
                 .map(|(id, _)| id)
