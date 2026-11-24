@@ -2,6 +2,12 @@
 name = "tantalum"
 version = "0.35.0"
 edition = "2024"
+description = "A small, fast key/value server that speaks the Redis protocol"
+license = "MIT"
+repository = "https://github.com/dagurleo/tantalum"
+readme = "README.md"
+# Installed from GitHub releases, Docker or `cargo install --git`, not crates.io.
+publish = false
 
 [dependencies]
 foldhash = "0.2.0"

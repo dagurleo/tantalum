@@ -65,6 +65,29 @@ Services on the private network use `redis://default:<password>@<service>.railwa
 `rediss://` to the proxy, pinning the certificate (a self-signed one whose
 names include the proxy's hostname works, and no CA has to renew it).
 
+## Install
+
+Tantalum is in alpha: try it, and [open an issue](https://github.com/dagurleo/tantalum/issues)
+when something doesn't behave as Redis does, but don't trust it yet with data you can't lose.
+Each [release](https://github.com/dagurleo/tantalum/releases) has:
+
+- **Binaries** for Linux (x86_64 and arm64, glibc 2.28 or later: Debian 10, Ubuntu 18.10,
+  RHEL 8 and since) and macOS (Apple silicon and Intel), with `SHA256SUMS`:
+
+  ```sh
+  tar -xzf tantalum-<version>-x86_64-unknown-linux-gnu.tar.gz
+  ./tantalum-<version>-x86_64-unknown-linux-gnu/tantalum --port 6379
+  ```
+
+- **A Docker image** for amd64 and arm64:
+
+  ```sh
+  docker run -p 6379:6379 ghcr.io/dagurleo/tantalum:<version>
+  ```
+
+- **The source**, to build with a recent stable Rust:
+  `cargo install --locked --git https://github.com/dagurleo/tantalum --tag v<version>`.
+
 ## Commands
 
 Replies match Redis 7 byte for byte, errors included, as far as the tests
@@ -1816,3 +1839,15 @@ role from `ROLE`:
 
 On Railway, create a service, set its variables, and run `railway up --service <name>`.
 The results appear in the service logs.
+
+To release: set the version in `Cargo.toml` (`0.36.0`, or `0.36.0-alpha.1` for a
+pre-release), commit, and push the tag `v<version>`. `.github/workflows/release.yml` builds
+the binaries (Linux in a glibc 2.28 container, as fast as a native build; a static musl build
+was 25-70% slower), smoke-tests them, publishes the GitHub release with `SHA256SUMS` and the
+licenses of everything built in, and pushes the image to `ghcr.io`. A pull request that
+changes the release files runs the same builds without publishing.
+
+## License
+
+MIT (`LICENSE`). The C code built in from Redis 7.2.4, Lua and others keeps its own
+licenses, all permissive: `THIRD-PARTY-NOTICES.md`. Security reports: `SECURITY.md`.

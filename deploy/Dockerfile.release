@@ -1,0 +1,14 @@
+# The published image (ghcr.io/dagurleo/tantalum), made by .github/workflows/release.yml
+# from the release's Linux binaries: dist/amd64/tantalum and dist/arm64/tantalum. Nothing
+# is compiled here, so each platform's image is just Debian and the binary.
+# (deploy/Dockerfile builds from source, for Railway.)
+#
+#   docker run -p 6379:6379 -e TANTALUM_REQUIREPASS=... ghcr.io/dagurleo/tantalum
+
+FROM debian:bookworm-slim
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/tantalum /usr/local/bin/tantalum
+COPY LICENSE THIRD-PARTY-NOTICES.md /usr/share/doc/tantalum/
+EXPOSE 6379
+# `::` accepts IPv4 and IPv6.
+CMD ["tantalum", "--bind", "::", "--port", "6379"]
