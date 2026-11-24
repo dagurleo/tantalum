@@ -168,6 +168,7 @@ Options:
                     self-signed one) [default: no]. A master serves replicas
                     on its --tls-port too.
   -h, --help        Print this help
+  -v, --version     Print the version
 
 On SIGTERM or SIGINT, Tantalum stops accepting, lets each connection finish
 the commands it has read, waits until they've closed (at most 10 s), syncs
@@ -350,6 +351,10 @@ fn parse_args() -> Result<Config, String> {
     while let Some(flag) = args.next() {
         if flag == "-h" || flag == "--help" {
             println!("{USAGE}");
+            std::process::exit(0);
+        }
+        if flag == "-v" || flag == "--version" {
+            println!("tantalum {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;

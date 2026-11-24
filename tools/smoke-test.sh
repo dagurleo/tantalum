@@ -6,6 +6,7 @@ bin=$1
 port=${2:-6399}
 
 "$bin" --help >/dev/null
+"$bin" --version
 "$bin" --port "$port" &
 pid=$!
 trap 'kill $pid 2>/dev/null || true' EXIT
@@ -29,4 +30,4 @@ expect '+PONG'
 expect '+OK'
 expect '$3'
 expect 'yes'
-echo "smoke test ok: $("$bin" --help | head -1)"
+echo "smoke test ok: $("$bin" --version)"
